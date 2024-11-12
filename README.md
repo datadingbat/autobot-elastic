@@ -85,10 +85,10 @@ aws cloudformation create-stack \
 ```
 
 4. Generate inventory.ini:
+* If your cluster was built with Cloudformation in steps 2&3 above, run the provided script to generate inventory.ini based on EC2 tags
+* If you created your cluster manually, you can copy playbook/utils/sample-inventory.ini to playbook/inventory.ini and customize it
+* You'll need to replace "your-project" in inventory.ini with the project name you used in the CloudFormation template
 ```bash
-# If your cluster was built with Cloudformation in steps 2&3 above, run the provided script to generate inventory.ini based on EC2 tags
-# If you created your cluster manually, you can copy playbook/utils/sample-inventory.ini to playbook/inventory.ini and customize it
-# You'll need to replace "your-project" in inventory.ini with the project name you used in the CloudFormation template
 ./generate-inventory.sh
 ```
 
