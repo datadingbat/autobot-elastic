@@ -54,7 +54,7 @@ git clone https://github.com/yourusername/autobot.git
 cd autobot
 ```
 
-2. Customize the CloudFormation template:
+2. (Optional - if using CloudFormation) Customize the CloudFormation template:
 * Find/Replace all $username$ $project$ values as per your environment.
 * Update/Remove all Tag Keys as per your environment
 ```bash
@@ -74,7 +74,7 @@ Tags:
           Value: $username$-$project$
 ```
 
-3. Deploy the CloudFormation stack:
+3. (Optional - if using CloudFormation)  Deploy the CloudFormation stack:
 ```bash
 aws cloudformation create-stack \
   --stack-name autobot-elastic \
@@ -86,7 +86,8 @@ aws cloudformation create-stack \
 
 4. Generate inventory.ini:
 ```bash
-# If your cluster is Run the provided script to generate inventory.ini based on EC2 tags
+# If your cluster was built with Cloudformation in steps 2&3 above, run the provided script to generate inventory.ini based on EC2 tags
+# If you created your cluster manually, you can copy playbook/utils/sample-inventory.ini to playbook/inventory.ini and customize it
 # You'll need to replace "your-project" in inventory.ini with the project name you used in the CloudFormation template
 ./generate-inventory.sh
 ```
