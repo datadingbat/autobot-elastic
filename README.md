@@ -54,7 +54,27 @@ git clone https://github.com/yourusername/autobot.git
 cd autobot
 ```
 
-2. Deploy the CloudFormation stack:
+2. Customize the CloudFormation template:
+* Find/Replace all $username$ $project$ values as per your environment.
+* Update/Remove all Tag Keys as per your environment
+```bash
+UserData sections of EC2 Instance Configurations:
+--filters "Name=tag:Name,Values=$username$-$project$-kibana-node"
+
+Tags:
+        - Key: Name
+          Value: $username$-$project$-vpc
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+```
+
+3. Deploy the CloudFormation stack:
 ```bash
 aws cloudformation create-stack \
   --stack-name autobot-elastic \
@@ -64,20 +84,20 @@ aws cloudformation create-stack \
   --capabilities CAPABILITY_IAM
 ```
 
-3. Generate inventory.ini:
+4. Generate inventory.ini:
 ```bash
 # Run the provided script to generate inventory.ini based on EC2 tags
 ./generate-inventory.sh
 ```
 
-4. Set up SSH access on helper node:
+5. Set up SSH access on helper node:
 ```bash
 # Copy SSH config and key to helper node
-scp -rp config jessem-pp.pem ubuntu@<HELPER_NODE_IP>:/home/ubuntu/.ssh/
-chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/jessem-pp.pem
+scp -rp config your-key.pem ubuntu@<HELPER_NODE_IP>:/home/ubuntu/.ssh/
+chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/your-key.pem
 ```
 
-5. Deploy with Ansible:
+6. Deploy with Ansible:
 ```bash
 cd playbook
 ansible-playbook -i inventory.ini playbook.yml
@@ -149,11 +169,14 @@ autobot/
 ├── playbook/
 │   ├── inventory.ini      # Ansible inventory
 │   ├── playbook.yml       # Main playbook
-│   ├── remove-es.yml      # Cleanup playbook
 │   └── roles/
 │       ├── common/        # Common configurations
 │       ├── elasticsearch/ # Elasticsearch setup
 │       └── kibana/        # Kibana setup
+├── utils/
+│   ├── config             # .ssh/config example
+│   ├── remove-es.yml      # Cleanup playbook
+│   ├── tuning.yml         # OS Tuning playbook
 ```
 
 ## Contributing
