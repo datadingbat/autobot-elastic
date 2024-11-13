@@ -143,7 +143,24 @@ ssh -i your-key.pem ubuntu@<HELPER_NODE_IP>  <---- replace "your-key" and <HELPE
 ssh ubuntu@<MASTER_NODE_INTERNAL_IP>  <---- replace <MASTER_NODE__IP>
 ```
 
-7. Deploy with Ansible:
+7. (Optional) Customize the location where Elastic will store its data
+* By default, and as specified in /etc/elasticsearch/elasticsearch.yml, Elastic will store data in: /var/lib/elasticsearch/
+* * If you have a different location in mind (like a dedicated data array), you should modify playbook/roles/elasticsearch/tasks/main.yml:
+  * 
+```bash
+# playbook/roles/elasticsearch/tasks/main.yml:
+
+    - name: Create initial elasticsearch settings
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        content: |
+          # Elasticsearch configuration
+          path.data: /var/lib/elasticsearch   <------ Change this value to the folder you want Elastic to store its data in
+          path.logs: /var/log/elasticsearch
+```
+
+
+8. Deploy with Ansible:
 ```bash
 cd playbook
 ansible-playbook -i inventory.ini playbook.yml
