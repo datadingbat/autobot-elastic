@@ -61,11 +61,11 @@ cd autobot
 * Update/Remove all Tag Keys as per your environment
 ```bash
 UserData sections of EC2 Instance Configurations:
---filters "Name=tag:Name,Values=$username$-$project$-kibana-node"
+--filters "Name=tag:Name,Values=$username$-$project$-kibana-node"  <---- UPDATE THIS
 
 Tags:
         - Key: Name
-          Value: $username$-$project$-vpc
+          Value: $username$-$project$-vpc  <---- UPDATE THIS
         - Key: division
           Value: field
         - Key: org
@@ -73,7 +73,7 @@ Tags:
         - Key: team
           Value: amer-strat
         - Key: project
-          Value: $username$-$project$
+          Value: $username$-$project$  <---- UPDATE THIS
 ```
 
 3. (Optional - if using CloudFormation)  Deploy the CloudFormation stack:
@@ -99,11 +99,11 @@ aws cloudformation create-stack \
         
     - name: Set s3 secret key fact
       set_fact:
-        s3_client_secret_key: "sample_secret_key"
+        s3_client_secret_key: "sample_secret_key"  <---- UPDATE THIS
 
     - name: Set s3 access key fact
       set_fact:
-        s3_client_access_key: "sample_access_key"
+        s3_client_access_key: "sample_access_key"  <---- UPDATE THIS
 ```
 
 5. Generate or modify inventory.ini:
@@ -118,10 +118,25 @@ ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
 ```
 
 6. Set up SSH access on helper node:
+* Update the util/config with your private key file name and inventory hostnames/IP-ranges
+* Copy the config file and priate key to the Ansible (helper) node, and set permissions
 ```bash
+# ~/.ssh/config
+# This is a ssh config file that's used to allow Ansible to perform automation tasks to the cluster
+
+Host *.elastic.internal
+    IdentityFile ~/.ssh/jessem-pp.pem <---- UPDATE THIS
+    User ubuntu
+    StrictHostKeyChecking no
+
+Host *.amazonaws.com *.compute.internal ec2-* 10.* 3.* 18.*  <---- UPDATE THIS
+    IdentityFile ~/.ssh/jessem-pp.pem   <---- UPDATE THIS
+    User ubuntu
+
 # Copy SSH config and key to helper node
-scp -rp config your-key.pem ubuntu@<HELPER_NODE_IP>:/home/ubuntu/.ssh/
-chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/your-key.pem
+# From the "utils" subdirectory of the playbook:
+scp -rp config your-key.pem ubuntu@<HELPER_NODE_IP>:/home/ubuntu/.ssh/  <---- replace "your-key" and <HELPER_NODE_IP>
+chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/your-key.pem  <---- replace "your-key"
 ```
 
 7. Deploy with Ansible:
