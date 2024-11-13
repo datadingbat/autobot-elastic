@@ -107,7 +107,7 @@ aws cloudformation create-stack \
 ```
 
 5. Generate or modify inventory.ini:
-* If you created your cluster manually, you can copy playbook/utils/sample-inventory.ini to playbook/inventory.ini and customize it
+* If you created your cluster manually, you should customize playbook/inventory.ini with your cluster hostnames & private key file at the bottom
 * If your cluster was built with Cloudformation in steps 2&3 above, run the provided script utils/gen-inventory.sh to generate inventory.ini based on EC2 tags
 * * You'll need to replace "your-project" in gen-inventory.sh with the project name you used in the CloudFormation template
 * * You may need to chmod it to be executable
