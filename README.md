@@ -109,8 +109,8 @@ aws cloudformation create-stack \
 5. Generate or modify inventory.ini:
 * If you created your cluster manually, you should customize playbook/inventory.ini with your cluster hostnames & private key file at the bottom
 * If your cluster was built with Cloudformation in steps 2&3 above, run the provided script utils/gen-inventory.sh to generate inventory.ini based on EC2 tags
-* * You'll need to replace "your-project" in gen-inventory.sh with the project name you used in the CloudFormation template
-* * You may need to chmod it to be executable
+  * You'll need to replace "your-project" in gen-inventory.sh with the project name you used in the CloudFormation template
+  * You may need to chmod it to be executable
 ```bash
 Modify this line in inventory.ini with the full path to your private key file:
 
@@ -145,8 +145,7 @@ ssh ubuntu@<MASTER_NODE_INTERNAL_IP>  <---- replace <MASTER_NODE__IP>
 
 7. (Optional) Customize the location where Elastic will store its data
 * By default, and as specified in /etc/elasticsearch/elasticsearch.yml, Elastic will store data in: /var/lib/elasticsearch/
-* * If you have a different location in mind (like a dedicated data array), you should modify playbook/roles/elasticsearch/tasks/main.yml:
-  * 
+  * If you have a different location in mind (like a dedicated data array), you should modify playbook/roles/elasticsearch/tasks/main.yml:
 ```bash
 # playbook/roles/elasticsearch/tasks/main.yml:
 
