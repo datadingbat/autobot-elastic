@@ -22,6 +22,14 @@
     - name: Set certificate password fact
       set_fact:
         es_cert_pass: "elastic2024"
+        
+    - name: Set s3 secret key fact
+      set_fact:
+        s3_client_secret_key: "sample_secret_key"
+
+    - name: Set s3 access key fact
+      set_fact:
+        s3_client_access_key: "sample_access_key"
 
     # Certificate generation tasks - first master only
     - name: Create certs directory
@@ -123,13 +131,15 @@
         owner: root
         group: elasticsearch
 
-    - name: Update transport SSL passwords in keystore
+    - name: Update keystore with cert passwords & s3 keys
       shell: |
        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password    
        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.truststore.secure_password
-
+       echo "{{ s3_client_secret_key }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f s3.client.default.secret_key
+       echo "{{ s3_client_access_key }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f s3.client.default.access_key
+       
     - name: Create initial elasticsearch settings
       copy:
         dest: /etc/elasticsearch/elasticsearch.yml
@@ -141,8 +151,8 @@
           # Prevent heap memory from being swapped out
           bootstrap.memory_lock: true
           
-          #
-          indices.recovery.max_bytes_per_sec
+          # We will need to set this once we do some benchmarks. For now keep it commented out
+          #indices.recovery.max_bytes_per_sec
           
           # Cluster name
           cluster.name: elastic-cluster
