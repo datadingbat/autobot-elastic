@@ -11,7 +11,7 @@ AUTOBOT automates the deployment of a complete Elasticsearch cluster with:
 * (4) hot nodes for active data
 * (2) frozen nodes for historical data
 * Helper node running:
-  * MinIO for S3-compatible storage
+  * (TO DO) MinIO for S3-compatible storage
   * Kibana for visualization
   * Ansible control node
 * Load balancer for cluster access
