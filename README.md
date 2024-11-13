@@ -118,6 +118,7 @@ ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
 ```
 
 6. Set up SSH access on helper node:
+
 * Update the util/config with your private key file name and inventory hostnames/IP-ranges
 * Copy the config file and priate key to the Ansible (helper) node, and set permissions
 ```bash
