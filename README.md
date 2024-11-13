@@ -85,10 +85,10 @@ aws cloudformation create-stack \
 ```
 
 4. (Optional) Update playbook/roles/elasticsearch/tasks/main.yml with custom values as needed
-* (Optional) Find the stanza "Set certificate password fact" and change es_cert_pass if you want a custom value
+ Find the stanza "Set certificate password fact" and change es_cert_pass if you want a custom value
 * * Note if you change es_cert_pass here, you also must change it in playbook/roles/kibana/tasks/main.yml with the same value
-* (Optional) Find the stanza "Set s3 secret key fact" and change s3_client_secret_key to match your s3 provider (minIO, others) spec
-* (Optional) Find the stanza "Set s3 access key fact" and change s3_client_access_key to match your s3 provider (minIO, others) spec
+* Find the stanza "Set s3 secret key fact" and change s3_client_secret_key to match your s3 provider (minIO, others) spec
+* Find the stanza "Set s3 access key fact" and change s3_client_access_key to match your s3 provider (minIO, others) spec
 
 ```bash
     - name: Set certificate password fact
@@ -104,11 +104,14 @@ aws cloudformation create-stack \
         s3_client_access_key: "sample_access_key"
 ```
 
-5. Generate inventory.ini:
-* If your cluster was built with Cloudformation in steps 2&3 above, run the provided script to generate inventory.ini based on EC2 tags
+5. Generate or modify inventory.ini:
 * If you created your cluster manually, you can copy playbook/utils/sample-inventory.ini to playbook/inventory.ini and customize it
-* You'll need to replace "your-project" in inventory.ini with the project name you used in the CloudFormation template
+* If your cluster was built with Cloudformation in steps 2&3 above, run the provided script utils/gen-inventory.sh to generate inventory.ini based on EC2 tags
+* * You'll need to replace "your-project" in gen-inventory.sh with the project name you used in the CloudFormation template
 ```bash
+Modify this line in inventory.ini with the full path to your private key file:
+ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
+
 ./generate-inventory.sh
 ```
 
