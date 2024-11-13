@@ -40,11 +40,13 @@ Note: Number of nodes is customizable, these are just the default values.
 
 ## Prerequisites
 
-* AWS CLI configured with appropriate credentials
 * Python 3.x
 * Ansible 2.9+
-* A valid EC2 key pair
-* Your IP address for security group configuration
+* SSH Keypair authentication support (See Step 6 in Quick Start below)
+* For CloudFormation automation, you'll also need:
+* * A valid EC2 key pair
+* * AWS CLI configured with appropriate credentials
+* * Your IP address for security group configuration
 
 ## Quick Start
 
@@ -108,11 +110,11 @@ aws cloudformation create-stack \
 * If you created your cluster manually, you can copy playbook/utils/sample-inventory.ini to playbook/inventory.ini and customize it
 * If your cluster was built with Cloudformation in steps 2&3 above, run the provided script utils/gen-inventory.sh to generate inventory.ini based on EC2 tags
 * * You'll need to replace "your-project" in gen-inventory.sh with the project name you used in the CloudFormation template
+* * You may need to chmod it to be executable
 ```bash
 Modify this line in inventory.ini with the full path to your private key file:
-ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
 
-./generate-inventory.sh
+ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
 ```
 
 6. Set up SSH access on helper node:
