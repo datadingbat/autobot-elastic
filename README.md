@@ -124,7 +124,6 @@ ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
 ```bash
 # ~/.ssh/config
 # This is a ssh config file that's used to allow Ansible to perform automation tasks to the cluster
-
 Host *.elastic.internal
     IdentityFile ~/.ssh/jessem-pp.pem <---- UPDATE THIS
     User ubuntu
@@ -140,7 +139,6 @@ scp -rp config your-key.pem ubuntu@<HELPER_NODE_IP>:/home/ubuntu/.ssh/  <---- re
 chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/your-key.pem  <---- replace "your-key"
 
 # Test SSH Keypair authentication from your client machine to the Anisble helper node:
-
 ssh -i your-key.pem ubuntu@<HELPER_NODE_IP>  <---- replace "your-key" and <HELPER_NODE_IP>
 ssh ubuntu@<MASTER_NODE_INTERNAL_IP>  <---- replace <MASTER_NODE__IP>
 ```
