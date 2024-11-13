@@ -87,8 +87,8 @@ aws cloudformation create-stack \
 ```
 
 4. (Optional) Update playbook/roles/elasticsearch/tasks/main.yml with custom values as needed
- Find the stanza "Set certificate password fact" and change es_cert_pass if you want a custom value
-* * Note if you change es_cert_pass here, you also must change it in playbook/roles/kibana/tasks/main.yml with the same value
+* Find the stanza "Set certificate password fact" and change es_cert_pass if you want a custom value
+  * Note if you change es_cert_pass here, you also must change it in playbook/roles/kibana/tasks/main.yml with the same value
 * Find the stanza "Set s3 secret key fact" and change s3_client_secret_key to match your s3 provider (minIO, others) spec
 * Find the stanza "Set s3 access key fact" and change s3_client_access_key to match your s3 provider (minIO, others) spec
 
