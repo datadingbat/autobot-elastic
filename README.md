@@ -104,7 +104,7 @@ aws cloudformation create-stack \
         s3_client_access_key: "sample_access_key"
 ```
 
-4. Generate inventory.ini:
+5. Generate inventory.ini:
 * If your cluster was built with Cloudformation in steps 2&3 above, run the provided script to generate inventory.ini based on EC2 tags
 * If you created your cluster manually, you can copy playbook/utils/sample-inventory.ini to playbook/inventory.ini and customize it
 * You'll need to replace "your-project" in inventory.ini with the project name you used in the CloudFormation template
@@ -112,14 +112,14 @@ aws cloudformation create-stack \
 ./generate-inventory.sh
 ```
 
-5. Set up SSH access on helper node:
+6. Set up SSH access on helper node:
 ```bash
 # Copy SSH config and key to helper node
 scp -rp config your-key.pem ubuntu@<HELPER_NODE_IP>:/home/ubuntu/.ssh/
 chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/your-key.pem
 ```
 
-6. Deploy with Ansible:
+7. Deploy with Ansible:
 ```bash
 cd playbook
 ansible-playbook -i inventory.ini playbook.yml
