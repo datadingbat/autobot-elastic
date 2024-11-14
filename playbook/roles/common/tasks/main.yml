@@ -90,7 +90,13 @@
    #     src: /path/to/elasticsearch-8.15.4-amd64.deb
    #     dest: /tmp/elasticsearch.deb
    #     mode: '0644'
-    
+
+   # - name: Copy Elasticsearch deb package from Ansible control node
+   #   copy:
+   #     src: /path/to/kibana-8.15.4-amd64.deb
+   #     dest: /tmp/kibana.deb
+   #     mode: '0644'
+   
      - name: Force apt update
           apt:
             update_cache: yes
