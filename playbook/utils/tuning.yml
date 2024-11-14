@@ -1,4 +1,9 @@
 ---
+# OS Tuning for Elasticsearch
+# Make sure to set your JVM heap size appropriately based on Elastic's official guidance:
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/advanced-configuration.html#set-jvm-heap-size
+# Search for "-Xms128g" and "-Xmx128g" in this file and replace with values appropriate for your environment.
+# Additionally, this assumes systemd is being used. If not, search for "systemd" here and update as per your environment.
 - name: Configure OS Settings for Elasticsearch
   hosts: master_nodes, hot_nodes, frozen_nodes
   gather_facts: yes
