@@ -62,6 +62,12 @@
         dest: /tmp/elasticsearch.asc
         mode: '0644'
 
+    # - name: Copy Elasticsearch GPG key from Ansible control node
+    #   copy:
+    #     src: /tmp/elasticsearch.asc
+    #     dest: /tmp/elasticsearch.asc
+    #     mode: '0644'
+
     - name: Import the Elasticsearch GPG key
       shell: |
         cat /tmp/elasticsearch.asc | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg
