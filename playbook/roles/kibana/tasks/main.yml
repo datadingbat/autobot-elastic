@@ -12,6 +12,16 @@
       environment:
         DEBIAN_FRONTEND: noninteractive
 
+ # Install Kibana from local .deb package
+ # - name: Install Kibana from deb package
+ #   apt:
+ #     deb: /tmp/kibana.deb
+ #     state: present
+ #     allow_unauthenticated: no
+ #   become_method: sudo
+ #   environment:
+ #     DEBIAN_FRONTEND: noninteractive
+
     - name: Set certificate password fact
       set_fact:
         es_cert_pass: "elastic2024"
