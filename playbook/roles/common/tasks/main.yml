@@ -91,7 +91,7 @@
    #     dest: /tmp/elasticsearch-8.15.4-amd64.deb
    #     mode: '0644'
 
-   # - name: Copy Elasticsearch deb package from Ansible control node
+   # - name: Copy Kibana deb package from Ansible control node
    #   copy:
    #     src: /path/to/kibana-8.15.4-amd64.deb
    #     dest: /tmp/kibana-8.15.4-amd64.deb
