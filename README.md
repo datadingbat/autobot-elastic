@@ -50,9 +50,9 @@ Note: Number of nodes is customizable, these are just the default values.
 * Ansible 2.9+
 * SSH Keypair authentication support (See Step 6 in Quick Start below)
 * For CloudFormation automation, you'll also need:
-* * A valid EC2 key pair
-* * AWS CLI configured with appropriate credentials
-* * Your IP address for security group configuration
+  * A valid EC2 key pair
+  * AWS CLI configured with appropriate credentials
+  * Your IP address for security group configuration
 
 ## Quick Start
 
