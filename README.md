@@ -33,6 +33,12 @@ Note: Number of nodes is customizable, these are just the default values.
 
 ### Configuration: Ansible
 * Automated Elasticsearch installation and configuration
+  * The playbook is designed for Debian/Ubuntu with internet connectivity to enable adding the Elastic repo & 'apt install'
+  * The common/elasticsearch/kibana tasks have commented-out sections for local package installation in restricted environments
+  * If you are using a non-Debian/Ubuntu flavor, search for "apt" and "systemd" and update those functions are per your non-debian OS
+    * roles/common/tasks/main.yml
+    * roles/elasticsearch/tasks/main.yml
+    * roles/kibana/tasks/main.yml
 * SSL/TLS certificate management
 * Cluster bootstrap and node enrollment
 * Kibana setup and integration
@@ -107,14 +113,15 @@ aws cloudformation create-stack \
 ```
 
 5. Generate or modify inventory.ini:
-* If you created your cluster manually, you should customize playbook/inventory.ini with your cluster hostnames & private key file at the bottom
+* If you created your cluster manually, you should customize the sample playbook/inventory.ini with your cluster hostnames & private key file at the bottom
+* You must include the "ansible_host=" prefix as specified in the sample playbook/inventory.ini
 * If your cluster was built with Cloudformation in steps 2&3 above, run the provided script utils/gen-inventory.sh to generate inventory.ini based on EC2 tags
   * You'll need to replace "your-project" in gen-inventory.sh with the project name you used in the CloudFormation template
   * You may need to chmod it to be executable
 ```bash
 Modify this line in inventory.ini with the full path to your private key file:
 
-ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
+ansible_ssh_private_key_file=/home/ubuntu/.ssh/your-key.pem   <---- UPDATE THIS
 ```
 
 6. Set up SSH access on helper node:
@@ -125,12 +132,12 @@ ansible_ssh_private_key_file=/home/ubuntu/.ssh/jessem-pp.pem
 # ~/.ssh/config
 # This is a ssh config file that's used to allow Ansible to perform automation tasks to the cluster
 Host *.elastic.internal
-    IdentityFile ~/.ssh/jessem-pp.pem <---- UPDATE THIS
+    IdentityFile ~/.ssh/your-key.pem <---- UPDATE THIS
     User ubuntu
     StrictHostKeyChecking no
 
 Host *.amazonaws.com *.compute.internal ec2-* 10.* 3.* 18.*  <---- UPDATE THIS
-    IdentityFile ~/.ssh/jessem-pp.pem   <---- UPDATE THIS
+    IdentityFile ~/.ssh/your-key.pem   <---- UPDATE THIS
     User ubuntu
 
 # Copy SSH config and key to helper node
