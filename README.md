@@ -1,6 +1,8 @@
 # AUTOBOT (Automated Bootstrap Orchestration Tool)
 
-An automated deployment solution for Elasticsearch clusters on AWS, combining CloudFormation infrastructure provisioning with Ansible configuration management. The Ansible playbook is designed to be used independently from CloudFormation: you are welcome to ignore the CloudFormation aspects of this project without any consequence. The Ansible Playbook was written for Debian/Ubuntu linux, but the Configuration: Ansible section of the readme below explains what to modify to support other linux flavors, as well as environments with restricted network access (local package installs). 
+AUTOBOT is an automated deployment solution for Elasticsearch clusters combining Anisible for Elastic installation & configuration, and CloudFormation for AWS infrastructure provisioning. 
+
+The Ansible playbook is designed to be used independently from CloudFormation: you are welcome to ignore the CloudFormation aspects of this project without any consequence. Additionally, the Ansible playbook is written for Debian/Ubuntu linux, but the "Configuration: Ansible" section of the readme below explains what to modify to support other linux flavors, as well as environments with restricted network access (local package installs). 
 
 ⚠️ **Note:** This project is intended for development, testing, and demonstration purposes. Not recommended for production deployments.
 
