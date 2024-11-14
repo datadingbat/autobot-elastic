@@ -21,7 +21,7 @@ AUTOBOT automates the deployment of a complete Elasticsearch cluster with:
 ## Architecture
 
 ### Configuration: Ansible
-*** The elastic user password is dropped into ~/.elasticsearch/elastic_password.txt on the Ansible controller**
+Note: The elastic user password is dropped into ~/.elasticsearch/elastic_password.txt on the Ansible controller
 * Automated Elasticsearch installation and configuration
   * The playbook is designed for Debian/Ubuntu with internet connectivity to enable adding the Elastic repo & 'apt install'
     * The 8.x version of Elastic/Kibana that is installed can be modified in the elasticsearch & kibana task main.ymls 
