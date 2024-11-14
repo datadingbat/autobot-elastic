@@ -14,6 +14,16 @@
       become_method: sudo
       environment:
         DEBIAN_FRONTEND: noninteractive        
+        
+   # Install Elasticsearch from local .deb package
+   # - name: Install Elasticsearch from deb package
+   #   apt:
+   #     deb: /tmp/elasticsearch-8.15.4-amd64.deb
+   #     state: present
+   #     allow_unauthenticated: no
+   #   become_method: sudo
+   #   environment:
+   #     DEBIAN_FRONTEND: noninteractive
 
     - name: Wait for package installation to settle
       wait_for:
