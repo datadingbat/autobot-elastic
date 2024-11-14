@@ -30,6 +30,7 @@ AUTOBOT automates the deployment of a complete Elasticsearch cluster with:
     * roles/common/tasks/main.yml
     * roles/elasticsearch/tasks/main.yml
     * roles/kibana/tasks/main.yml
+* The elastic user password is dropped into ~/.elasticsearch/elastic_password.txt on the Ansible controller
 * HTTP & Transport certificate management (Self-Signed by the initial master node)
 * Cluster bootstrap and node enrollment
 * Kibana setup and integration
