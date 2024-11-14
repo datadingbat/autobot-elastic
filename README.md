@@ -45,6 +45,15 @@ AUTOBOT automates the deployment of a complete Elasticsearch cluster with:
 * S3 bucket for frozen indices
 * Security groups and IAM roles
 
+### Utilities: Tuning & Removal
+* playbook/utils/remove-es.yml can be used to remove all elastic components from the cluster. It does not undo OS changes made by tuning.yml
+  * remove-es.yml assumes debian/ubuntu and installation/removal via apt, as well as systemd. If your environment doesn't match this, you'll need to update this file
+* playbook/utils/tuning.yml is not executed as part of the default playbook.yml - it should be run AFTER playbook.xml is complted
+  * tuning.yml should also be updated as per your specific environment - it has guidance in the comments at the top of the file, like:
+    * Make sure to set your JVM heap size appropriately based on Elastic's official guidance: https://www.elastic.co/guide/en/elasticsearch/reference/current/advanced-configuration.html#set-jvm-heap-size
+    * Search for "-Xms128g" and "-Xmx128g" in this file and replace with values appropriate for your environment.
+    * Additionally, this assumes systemd is being used. If not, search for "systemd" here and update as per your environment.
+
 ## Prerequisites
 
 * Python 3.x
