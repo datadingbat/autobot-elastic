@@ -182,6 +182,22 @@ cd playbook
 ansible-playbook -i inventory.ini playbook.yml
 ```
 
+9. (Recommended) Environment Tuning:
+* tuning.yml was written for Linux OS with systemd usage, and uses very large (128GB) Heap Size values
+  * You should verify and modify references to "heap", "apt", and "systemd" in this file, as per your environment
+```bash
+cd playbook
+ansible-playbook -i inventory.ini utils/tuning.yml
+```
+
+9. (Optional) Remove Elastic Components:
+* Remove-es.yml was written for Debian/Ubuntu OS with apt & systemd usage
+  * You may need to modify as per your environment
+```bash
+cd playbook
+ansible-playbook -i inventory.ini utils/remove-es.yml
+```
+
 ## Components
 
 ### Helper Node
