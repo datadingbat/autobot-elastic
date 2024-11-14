@@ -15,7 +15,7 @@
  # Install Kibana from local .deb package
  # - name: Install Kibana from deb package
  #   apt:
- #     deb: /tmp/kibana.deb
+ #     deb: /tmp/kibana-8.15.4-amd64.deb
  #     state: present
  #     allow_unauthenticated: no
  #   become_method: sudo
