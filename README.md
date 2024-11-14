@@ -34,6 +34,8 @@ Note: Number of nodes is customizable, these are just the default values.
 ### Configuration: Ansible
 * Automated Elasticsearch installation and configuration
   * The playbook is designed for Debian/Ubuntu with internet connectivity to enable adding the Elastic repo & 'apt install'
+    * The 8.x version of Elastic/Kibana that is installed can be modified in the elasticsearch & kibana task main.ymls 
+    * In order to install a non-8.x version, you'll need to modify the common task's main.yml (search for "8.x")
   * The common/elasticsearch/kibana tasks have commented-out sections for local package installation in restricted environments
   * If you are using a non-Debian/Ubuntu flavor, search for "apt" and "systemd" and update those functions are per your non-debian OS
     * roles/common/tasks/main.yml
