@@ -5,6 +5,11 @@
   tasks:
     - name: OS Tuning for Data Nodes
       block:
+        - name: Create elasticsearch group
+          group:
+            name: elasticsearch
+            state: present
+            
         - name: Disable swap
           command: swapoff -a
           changed_when: false
