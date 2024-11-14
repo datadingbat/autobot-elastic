@@ -5,7 +5,7 @@
   block:
     - name: Install Kibana
       apt:
-        name: kibana=8.15.3
+        name: kibana=8.15.4
         state: present
         allow_unauthenticated: no
         update_cache: yes
