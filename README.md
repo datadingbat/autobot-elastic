@@ -30,10 +30,10 @@ AUTOBOT automates the deployment of a complete Elasticsearch cluster with:
     * roles/common/tasks/main.yml
     * roles/elasticsearch/tasks/main.yml
     * roles/kibana/tasks/main.yml
-* SSL/TLS certificate management
+* HTTP & Transport certificate management (Self-Signed by the initial master node)
 * Cluster bootstrap and node enrollment
 * Kibana setup and integration
-* MinIO deployment and configuration
+* MinIO deployment and configuration (TO DO)
 
 ### Infrastructure: AWS CloudFormation
 * VPC with public subnets
