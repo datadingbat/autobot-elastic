@@ -91,11 +91,6 @@
    #     dest: /tmp/elasticsearch.deb
    #     mode: '0644'
     
-   # - name: Install Elasticsearch from deb package
-   #   apt:
-   #     deb: /tmp/elasticsearch.deb
-   #     state: present
-    
      - name: Force apt update
           apt:
             update_cache: yes
