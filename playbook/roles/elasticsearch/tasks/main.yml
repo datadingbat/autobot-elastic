@@ -7,7 +7,7 @@
     # Initial Installation
     - name: Install Elasticsearch
       apt:
-        name: elasticsearch=8.15.3
+        name: elasticsearch=8.15.4
         state: present
         allow_unauthenticated: no
         update_cache: yes
