@@ -1,35 +1,22 @@
 # AUTOBOT (Automated Bootstrap Orchestration Tool)
 
-An automated deployment solution for Elasticsearch clusters on AWS, combining CloudFormation infrastructure provisioning with Ansible configuration management.
+An automated deployment solution for Elasticsearch clusters on AWS, combining CloudFormation infrastructure provisioning with Ansible configuration management. The Ansible playbook is designed to be used independently from CloudFormation: you are welcome to ignore the CloudFormation aspects of this project without any consequence. The Ansible Playbook was written for Debian/Ubuntu linux, but the Configuration: Ansible section of the readme below explains what to modify to support other linux flavors, as well as environments with restricted network access (local package installs). 
 
 ⚠️ **Note:** This project is intended for development, testing, and demonstration purposes. Not recommended for production deployments.
 
 ## Overview
 
 AUTOBOT automates the deployment of a complete Elasticsearch cluster with:
-* (3) dedicated master nodes
-* (4) hot nodes for active data
-* (2) frozen nodes for historical data
-* Helper node running:
-  * (TO DO) MinIO for S3-compatible storage
+* dedicated master nodes
+* hot nodes for active data
+* frozen nodes for historical data
+* Helper node (also Ansible controller) running:
   * Kibana for visualization
-  * Ansible control node
-* Load balancer for cluster access
-* Private DNS zone for service discovery
-
-Note: Number of nodes is customizable, these are just the default values.
+  * (TO DO) MinIO for S3-compatible storage
+* Load balancer for cluster access (CloudFormation only)
+* Private DNS zone for service discovery (CloudFormation only)
 
 ## Architecture
-
-### Infrastructure: AWS CloudFormation
-* VPC with public subnets
-* EC2 instances:
-  * Master/Data nodes: m6i.16xlarge
-  * Helper node: t3.xlarge (runs Ansible, Kibana, MinIO)
-* Application Load Balancer
-* Route 53 private hosted zone
-* S3 bucket for frozen indices
-* Security groups and IAM roles
 
 ### Configuration: Ansible
 * Automated Elasticsearch installation and configuration
@@ -45,6 +32,16 @@ Note: Number of nodes is customizable, these are just the default values.
 * Cluster bootstrap and node enrollment
 * Kibana setup and integration
 * MinIO deployment and configuration
+
+### Infrastructure: AWS CloudFormation
+* VPC with public subnets
+* EC2 instances:
+  * Master/Data nodes: m6i.16xlarge
+  * Helper node: t3.xlarge (runs Ansible, Kibana, MinIO)
+* Application Load Balancer
+* Route 53 private hosted zone
+* S3 bucket for frozen indices
+* Security groups and IAM roles
 
 ## Prerequisites
 
