@@ -22,7 +22,13 @@
       become_method: sudo
       environment:
         DEBIAN_FRONTEND: noninteractive
-
+        
+    # - name: Copy Filebeat deb package from Ansible control node
+    #   copy:
+    #     src: /path/to/filebeat-8.15.4-amd64.deb
+    #     dest: /tmp/filebeat-8.15.4-amd64.deb
+    #     mode: '0644'
+    
     # - name: Install Filebeat from local .deb package
     #   apt:
     #     deb: /tmp/filebeat-8.15.4-amd64.deb
