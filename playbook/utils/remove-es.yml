@@ -24,34 +24,34 @@
       become: yes
 
     # Kibana cleanup
-    - name: Remove Kibana package
-      apt:
-        name: kibana
-        state: absent
-        purge: yes
-        autoremove: yes
-        autoclean: yes
-      become: yes
-      when: inventory_hostname in groups['kibana']
+    #- name: Remove Kibana package
+    #  apt:
+    #    name: kibana
+    #    state: absent
+    #    purge: yes
+    #    autoremove: yes
+    #   autoclean: yes
+    #  become: yes
+    #  when: inventory_hostname in groups['kibana']
 
-    - name: Remove Kibana directories
-      file:
-        path: "{{ item }}"
-        state: absent
-      with_items:
-        - /etc/kibana
-        - /var/lib/kibana
-        - /var/log/kibana
-        - /usr/share/kibana
-      become: yes
-      when: inventory_hostname in groups['kibana']
+    #- name: Remove Kibana directories
+    #  file:
+    #    path: "{{ item }}"
+    #    state: absent
+    #  with_items:
+    #    - /etc/kibana
+    #    - /var/lib/kibana
+    #    - /var/log/kibana
+    #    - /usr/share/kibana
+    #  become: yes
+    #  when: inventory_hostname in groups['kibana']
 
     # Common cleanup
-    - name: Remove local credentials directory
-      file:
-        path: /home/ubuntu/.elasticsearch
-        state: absent
-      become: yes
+    #- name: Remove local credentials directory
+    #  file:
+    #    path: /home/ubuntu/.elasticsearch
+    #    state: absent
+    #  become: yes
 
     # Clean systemd
     - name: Reload systemd

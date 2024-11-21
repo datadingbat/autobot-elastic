@@ -1,0 +1,258 @@
+---
+- name: Install and Configure Metricbeat
+  hosts: all
+  become: yes
+  vars:
+    elastic_password_file: "{{ lookup('env', 'HOME') }}/.elasticsearch/elastic_password.txt"
+    elastic_password: "{{ lookup('file', elastic_password_file) }}"
+    kibana_host: "{{ hostvars[groups['kibana'][0]]['ansible_host'] }}"
+    monitoring_instance: "{{ hostvars[groups['monitoring_instance'][0]]['ansible_host'] }}"
+    hot_nodes: "{{ groups['hot_nodes'] | map('extract', hostvars, ['ansible_host']) | map('regex_replace', '^(.*)$', '\\1:9200') | list }}"
+    first_master: "{{ groups['master_nodes'][0] }}"
+    cert_files:
+      - elastic-http-ca.pem
+      - elastic-http-ca.crt
+      - elastic-http.key
+      - elastic-http.pem
+      - elastic-http.p12
+      - elastic-certificates.p12
+      # - elastic-stack-ca.p12
+      # - elastic-http-ca.p12
+
+  tasks:
+    - name: Get cluster UUID
+      uri:
+        url: "https://hot1.elastic.internal:9200/_cluster/state/metadata?filter_path=metadata.cluster_uuid"
+        method: GET
+        headers:
+          Authorization: "ApiKey {{ lookup('pipe', 'echo -n \"LtzHSJMBb84Vy2JSJh1u:Pwk9CikdQaumlc5b-Tti8g\" | base64') }}"
+        validate_certs: no
+        return_content: yes
+      register: cluster_uuid_response
+
+    - name: Set cluster UUID fact
+      set_fact:
+        cluster_uuid: "{{ cluster_uuid_response.json.metadata.cluster_uuid }}"
+      
+    - name: Load API key file
+      set_fact:
+        api_key_json: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/metricbeat_collector_apikey.txt') | from_json }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Format API key and set variable
+      set_fact:
+        metricbeat_collector_apikey: "{{ api_key_json.id }}:{{ api_key_json.api_key }}"
+      delegate_to: localhost
+      run_once: true
+
+# Now you can use {{ cluster_uuid }} in subsequent tasks
+    - name: Fetch certificates from first master node
+      ansible.builtin.fetch:
+        src: "/etc/elasticsearch/certs/{{ item }}"
+        dest: "/tmp/elastic-certs/{{ item }}"
+        flat: yes
+      with_items: "{{ cert_files }}"
+      run_once: true
+      delegate_to: "{{ first_master }}"
+
+    - name: Check if monitoring cluster API key file exists
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/monitoring_cluster_metricbeat_output_apikey.txt"
+      register: api_key_file
+      delegate_to: localhost
+      run_once: true
+
+    - name: Generate and save monitoring cluster API key
+      block:
+        - name: Generate API key
+          uri:
+            url: "https://{{ hostvars[groups['kibana'][0]]['ansible_host'] }}:9200/_security/api_key"
+            method: POST
+            body_format: json
+            body: |
+              {
+                "name": "metricbeat-test",
+                "role_descriptors": {
+                  "metricbeat_full_access": {
+                    "cluster": [
+                      "monitor",
+                      "manage_ingest_pipelines",
+                      "manage_ilm",
+                      "read_ilm",
+                      "manage_index_templates"
+                    ],
+                    "index": [
+                      {
+                        "names": [".monitoring-beats-*"],
+                        "privileges": ["create_index", "create", "write"]
+                      },
+                      {
+                        "names": ["metricbeat-*"],
+                        "privileges": ["create_index", "create", "write", "manage", "read"]
+                      }
+                    ]
+                  }
+                }
+              }
+            user: "elastic"
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+            headers:
+              Content-Type: "application/json"
+          register: api_key_response
+          delegate_to: localhost
+
+        - name: Save monitoring cluster API key
+          copy:
+            content: "{{ api_key_response.json.id }}:{{ api_key_response.json.api_key }}"
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/monitoring_cluster_metricbeat_output_apikey.txt"
+            mode: '0600'
+          delegate_to: localhost
+      become: no
+      when: not api_key_file.stat.exists
+
+    - name: Install Metricbeat from apt repository
+      apt:
+        name: metricbeat=8.15.4
+        state: present
+        update_cache: yes
+      become_method: sudo
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    # - name: Install Metricbeat from local .deb package
+    #   apt:
+    #     deb: /tmp/metricbeat-8.15.4-amd64.deb
+    #     state: present
+    #     allow_unauthenticated: no
+    #   become_method: sudo
+    #   environment:
+    #     DEBIAN_FRONTEND: noninteractive
+
+    - name: Enable Metricbeat service
+      systemd:
+        name: metricbeat
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Distribute certificates to metricbeat hosts
+      copy:
+        src: "/tmp/elastic-certs/{{ item }}"
+        dest: "/etc/metricbeat/{{ item }}"
+        mode: '0644'
+        owner: root
+        group: root
+      with_items: "{{ cert_files }}"
+
+    - name: Load monitoring cluster API key
+      set_fact:
+        monitoring_cluster_api_key: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/monitoring_cluster_metricbeat_output_apikey.txt') | trim }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Configure Metricbeat
+      copy:
+        dest: /etc/metricbeat/metricbeat.yml
+        content: |
+          logging.level: warning
+          logging.to_files: true
+
+          logging.files:
+            path: /var/log/metricbeat
+            name: metricbeat
+            keepfiles: 10
+            permissions: 0644
+
+          metricbeat.config.modules:
+            path: /etc/metricbeat/modules.d/*.yml
+            reload.enabled: false
+
+          monitoring.cluster_uuid: "{{ cluster_uuid }}"
+
+          output.elasticsearch:
+            hosts: {{ hostvars[groups['monitoring_instance'][0]]['ansible_host'] }}
+            protocol: "https"
+            api_key: "{{ monitoring_cluster_api_key }}"
+            ssl.verification_mode: certificate
+            ssl.certificate_authorities: ["/etc/metricbeat/elastic-http-ca.pem"]
+            ssl.certificate: "/etc/metricbeat/elastic-http.pem"
+            ssl.key: "/etc/metricbeat/elastic-http.key"
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: Enable Elasticsearch module
+      command: metricbeat modules enable elasticsearch-xpack
+      register: module_enable
+      changed_when: module_enable.rc == 0
+
+    - name: Enable System module
+      command: metricbeat modules enable system
+      register: module_enable
+      changed_when: module_enable.rc == 0
+
+    - name: Configure Elasticsearch module
+      copy:
+        dest: /etc/metricbeat/modules.d/elasticsearch-xpack.yml
+        content: |
+          - module: elasticsearch
+            xpack.enabled: true
+            period: 10s
+            hosts: ["https://{{ hostvars[inventory_hostname]['ansible_host'] }}:9200"]
+            api_key: "{{ metricbeat_collector_apikey }}"
+            ssl.certificate_authorities: ["/etc/metricbeat/elastic-http-ca.pem"]
+            ssl.certificate: "/etc/metricbeat/elastic-http.pem"
+            ssl.key: "/etc/metricbeat/elastic-http.key"
+            ssl.verification_mode: certificate
+        mode: '0644'
+
+    - name: Configure System module
+      copy:
+        dest: /etc/metricbeat/modules.d/system.yml
+        content: |
+          # Module: system
+          # Docs: https://www.elastic.co/guide/en/beats/metricbeat/8.15/metricbeat-module-system.html
+          - module: system
+            period: 10s
+            metricsets:
+              - cpu
+              - load
+              - memory
+              - network
+              - process
+              - process_summary
+              - socket_summary
+              #- entropy
+              #- core
+              #- diskio
+              #- socket
+              #- service
+              #- users
+            process.include_top_n:
+              by_cpu: 5      # include top 5 processes by CPU
+              by_memory: 5   # include top 5 processes by memory
+            cpu.metrics:  ["percentages","normalized_percentages"]  # The other available option is ticks.
+            core.metrics: ["percentages"]  # The other available option is ticks.
+
+          - module: system
+            period: 1m
+            metricsets:
+              - filesystem
+              - fsstat
+            processors:
+            - drop_event.when.regexp:
+                system.filesystem.mount_point: '^/(sys|cgroup|proc|dev|etc|host|lib|snap)($|/)'
+
+          - module: system
+            period: 15m
+            metricsets:
+              - uptime
+        mode: '0644'
+
+    - name: Start Metricbeat service
+      systemd:
+        name: metricbeat
+        state: started
