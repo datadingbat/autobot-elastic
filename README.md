@@ -276,6 +276,193 @@ autobot/
 │   ├── tuning.yml         # OS Tuning playbook
 ```
 
+#V2 Info
+
+## Core Architecture
+* Two-play system in es-toolkit.yml:
+  * Play 1: Variable setup and target selection (localhost)
+  * Play 2: Utility execution (on target hosts)
+* Menu-driven utility selection with three-level mapping:
+  * Main menu → utility type
+  * Utility type → utility file
+  * Special case for installations with sub-mapping
+* Uses task inclusion for utilities rather than roles
+* Centralized variable passing via `selected_play_vars`
+* Each utility maintains its own variable requirements and validation
+
+## Main Menu Structure
+1. Get Service State
+2. Change Service State
+3. Install Service
+   * Sub-options:
+     - Elasticsearch
+     - Kibana
+     - Filebeat
+     - Metricbeat
+     - Monitoring Instance
+   * Installation method:
+     - APT repository (with version selection)
+     - Manual .deb package (with path input)
+4. Upgrade Service
+5. Remove Service
+6. Tune Service
+
+## Host Targeting System
+* Supports three targeting methods:
+  * All hosts (with safety confirmations)
+  * Host groups (with inventory display)
+  * Single host (by name or inventory browser)
+* Handles both simple hostnames and FQDNs
+* Displays host details in format: hostname (FQDN)
+* Validates targets against inventory before execution
+* Requires explicit confirmation after displaying target hosts
+* Supports cancellation at confirmation prompts
+
+## Enhanced Host Management
+* Comprehensive host status tracking:
+  * Package installation state detection
+  * Service state verification
+  * Configuration presence checking
+  * State aggregation across host groups
+* Multi-host operation handling:
+  * Parallel status collection
+  * Centralized status aggregation via hostvars
+  * Status-based execution control
+  * Group-wide operation coordination
+* Installation eligibility management:
+  * Pre-flight status verification
+  * Skip conditions for existing installations
+  * Clear reinstallation pathways
+  * Group-based installation confirmation
+* Status reporting enhancements:
+  * Detailed per-host state information
+  * Group-wide status summaries
+  * Installation pathway recommendations
+  * Clear upgrade/reinstall guidance
+
+## Service Management
+* Service selection for utilities 1, 2, and 5
+* Comprehensive service state detection:
+  * Standard states: active, inactive
+  * Edge cases: not installed, active but improperly installed, failed
+  * Detection includes both systemctl output and package installation status
+  * Metadata capture: memory usage, active time, loaded state
+  * Journal log integration for failed states
+* Service operations validate pre and post states
+* Installation method handling:
+  * APT repository with version selection (latest/specific)
+  * Manual .deb package installation for airgapped environments
+  * Pre-flight validation for both methods
+
+## Report Management
+* Centralized on localhost for consistency and reliability
+* Uses delegation pattern (`delegate_to: localhost` + `run_once: true`)
+* Reports generated for all targeted hosts regardless of operation success
+* Pre-execution status reports for destructive operations
+* Post-execution status reports with detailed state information
+* Standardized report formatting:
+  * Clear section delineation
+  * Host-specific status blocks
+  * Installation state summaries
+  * Action recommendations
+* Key benefits:
+  * Atomic file operations
+  * Reliable cleanup
+  * Consistent report aggregation
+  * Resource efficiency on target hosts
+
+## Implementation Patterns
+* Standard utility structure:
+  * Input validation block (required variables, state validation)
+  * Status detection and reporting
+  * Main execution block
+  * Report generation block
+* Host status management:
+  * Initial status collection
+  * Status aggregation on localhost
+  * Status-based execution control
+  * Status-driven reporting
+* Certificate standardization:
+  * Consistent /etc/service/certs structure
+  * Centralized validation
+  * Standard deployment methods
+  * Permission standardization
+* Temporary file management:
+  * Central directory (/tmp/service_reports)
+  * Cleanup in 'always' blocks
+  * Error handling for failed cleanups
+* Default variables where appropriate
+* Clear separation between setup, execution, and reporting phases
+* Certificate management for secure services
+* Consistent confirmation patterns before destructive operations
+
+## Error Handling
+* Comprehensive pre-flight validation:
+  * Required variables
+  * Package prerequisites
+  * System requirements
+  * Network access (for APT installations)
+  * File access (for manual installations)
+* Multi-host validation:
+  * Group-wide status verification
+  * Installation eligibility checks
+  * Status-based execution gates
+  * Group operation validation
+* Skip condition handling:
+  * Graceful execution termination
+  * Clear status messaging
+  * Proper resource cleanup
+  * Alternative action guidance
+* Clear error messages for missing requirements
+* Graceful handling of missing services/packages
+* Support for force operations where appropriate
+* Detailed status reporting for failed operations
+* Clean rollback capabilities for failed installations
+* Proper error propagation through delegation chains
+
+## Special Cases
+* Monitoring setup limited to single host
+* Different fact gathering based on utility type
+* Service-specific utilities (1,2,5) require additional validation
+* Failed state detection triggers journal log collection
+* Installation utilities require pre-flight checks and confirmation
+* Certificate operations require validation of source files
+* Airgapped installation support requires additional validation
+* Multi-host operations:
+  * Parallel status collection
+  * Group-wide verifications
+  * Consistent reporting across hosts
+  * Group-level operation confirmations
+* Status tracking:
+  * Component-level verification
+  * Cross-host status validation
+  * Clear reinstallation paths
+  * Status-based branching logic
+
+## Modular Design
+* Separate utility files for different installation types
+* Consolidated removal and tuning functions
+* Standard execution patterns:
+  * Status-driven control flow
+  * Host group coordination
+  * Installation eligibility checking
+  * Common reporting templates
+* Reusable components:
+  * Status collection blocks
+  * Certificate management tasks
+  * Report generation templates
+  * Skip condition handling
+* Consistent patterns across all utilities:
+  * Variable handling
+  * Status checking
+  * Error management
+  * Reporting structure
+* Easy addition of new utilities while maintaining patterns
+
+This implementation ensures consistent behavior across utilities while maintaining proper error handling, reporting, and resource management. Each utility maintains consistent patterns for user interaction and reporting while accommodating both online and airgapped environments.
+
+The toolkit must handle both internet-connected and airgapped deployments, with appropriate safety checks and validations for each environment. All operations must be idempotent and provide clear feedback about their execution status and any errors encountered.
+
 ## Contributing
 
 Feel free to submit issues, fork the repository, and create pull requests for any improvements.
