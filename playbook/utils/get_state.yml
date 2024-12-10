@@ -1,0 +1,155 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - selected_service
+        - ansible_limit
+  run_once: true
+  delegate_to: localhost
+
+- name: Main utility tasks
+  block:
+    # Service status collection
+    - name: Collect service status
+      block:
+        - name: Get service status
+          shell: "systemctl status {{ selected_service }}"
+          register: service_status_result
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Set initial host info
+          set_fact:
+            local_host_info:
+              state: >-
+                {%- if service_status_result.rc != 0 and ('could not be found' in service_status_result.stderr or 'no such service' in service_status_result.stderr) -%}
+                not installed
+                {%- elif service_status_result.rc == 0 and 'active (running)' in service_status_result.stdout -%}
+                {%- if 'not-found' in service_status_result.stdout or 'Unit ' + selected_service + '.service not found' in service_status_result.stdout -%}
+                active but not properly installed
+                {%- else -%}
+                active
+                {%- endif -%}
+                {%- elif service_status_result.rc == 0 and 'inactive (dead)' in service_status_result.stdout -%}
+                inactive
+                {%- else -%}
+                failed
+                {%- endif -%}
+              substate: >-
+                {%- if service_status_result.rc != 0 and ('could not be found' in service_status_result.stderr or 'no such service' in service_status_result.stderr) -%}
+                not installed
+                {%- elif service_status_result.rc == 0 and 'active (running)' in service_status_result.stdout -%}
+                {%- if 'not-found' in service_status_result.stdout or 'Unit ' + selected_service + '.service not found' in service_status_result.stdout -%}
+                running but service unit not found
+                {%- else -%}
+                running
+                {%- endif -%}
+                {%- elif service_status_result.rc == 0 and 'inactive (dead)' in service_status_result.stdout -%}
+                dead
+                {%- else -%}
+                failed
+                {%- endif -%}
+              loaded_state: >-
+                {%- if 'Loaded:' in service_status_result.stdout -%}
+                {{ service_status_result.stdout | regex_search('Loaded:.*$', multiline=True) | regex_replace('Loaded:\\s*', '') | regex_replace(';.*$', '') }}
+                {%- elif 'not-found' in service_status_result.stdout -%}
+                not-found
+                {%- else -%}
+                unknown
+                {%- endif -%}
+              memory: >-
+                {%- if service_status_result.rc == 0 -%}
+                {{ service_status_result.stdout | regex_search('Memory: [0-9.]+[GMK]') | default('N/A') }}
+                {%- else -%}
+                N/A
+                {%- endif -%}
+              active_time: >-
+                {%- if service_status_result.rc == 0 -%}
+                {{ service_status_result.stdout | regex_search('since.*ago', multiline=True) | default('N/A') }}
+                {%- else -%}
+                N/A
+                {%- endif -%}
+              full_status: "{{ service_status_result.stdout if service_status_result.stdout != '' else service_status_result.stderr }}"
+
+        - name: Get journalctl logs if failed
+          shell: "journalctl -u {{ selected_service }}.service -n 50 --no-pager | tail -n 5"
+          register: journal_logs_result
+          when: "'failed' in service_status_result.stdout or service_status_result.rc != 0"
+          changed_when: false
+          become: yes
+          ignore_errors: yes
+
+        - name: Update full status with journal logs if needed
+          set_fact:
+            local_host_info: "{{ local_host_info | combine({'full_status': journal_logs_result.stdout}) }}"
+          when: "journal_logs_result is defined and journal_logs_result.stdout is defined"
+
+    # Report generation
+    - name: Generate reports
+      block:
+        - name: Ensure report directory exists on localhost
+          file:
+            path: "/tmp/service_reports"
+            state: directory
+          run_once: true
+          delegate_to: localhost
+
+        - name: Share host info with localhost
+          set_fact:
+            shared_host_info: "{{ shared_host_info | default({}) | combine({inventory_hostname: local_host_info}) }}"
+          delegate_to: localhost
+          run_once: false
+
+        - name: Create status report
+          copy:
+            content: |
+              Service Status Report for {{ selected_service }}
+              ==============================================
+              Host: {{ inventory_hostname }}
+              ----------------------------------------------
+              Status: {{ local_host_info.state }}
+              Details: {{ local_host_info.substate }}
+              Service Unit: {{ local_host_info.loaded_state }}
+              {% if local_host_info.state != 'not installed' %}
+              Memory: {{ local_host_info.memory }}
+              Active: {{ local_host_info.active_time }}
+              {% endif %}
+              {% if local_host_info.state in ['failed', 'inactive', 'not installed', 'active but not properly installed'] %}
+              
+              Full Status:
+              {{ local_host_info.full_status }}
+              {% endif %}
+
+            dest: "/tmp/service_reports/status_{{ inventory_hostname }}.txt"
+          delegate_to: localhost
+
+        - name: Collect all reports
+          shell: "cat /tmp/service_reports/status_*.txt"
+          register: combined_status
+          run_once: true
+          delegate_to: localhost
+
+        - name: Show status report
+          debug:
+            msg: "{{ combined_status.stdout_lines }}"
+          run_once: true
+          delegate_to: localhost
+      rescue:
+        - name: Handle report generation failure
+          debug:
+            msg: "Failed to generate status reports. Check disk space and permissions."
+          run_once: true
+          delegate_to: localhost
+      always:
+        - name: Cleanup report files
+          file:
+            path: "/tmp/service_reports"
+            state: absent
+          run_once: true
+          delegate_to: localhost

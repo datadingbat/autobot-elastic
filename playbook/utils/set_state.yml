@@ -1,0 +1,177 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - selected_service
+        - target_state
+        - ansible_limit
+    
+    - name: Validate target state
+      fail:
+        msg: "Invalid target state. Must be 'started', 'stopped', or 'restarted'"
+      when: target_state not in ['started', 'stopped', 'restarted']
+  run_once: true
+  delegate_to: localhost
+
+- name: Main utility tasks
+  block:
+    # Service state management
+    - name: Service state operations
+      block:
+        - name: Get initial service status
+          shell: "systemctl status {{ selected_service }}"
+          register: initial_status
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Set initial state info
+          set_fact:
+            local_host_info:
+              initial_state: >-
+                {%- if initial_status.rc != 0 and ('could not be found' in initial_status.stderr or 'no such service' in initial_status.stderr) -%}
+                not installed
+                {%- elif 'not-found' in initial_status.stdout or 'Unit ' + selected_service + '.service not found' in initial_status.stdout -%}
+                not installed
+                {%- elif initial_status.rc == 0 and 'active (running)' in initial_status.stdout -%}
+                active
+                {%- elif initial_status.rc == 0 and 'inactive (dead)' in initial_status.stdout -%}
+                inactive
+                {%- else -%}
+                failed
+                {%- endif -%}
+
+        - name: Manage service state
+          systemd:
+            name: "{{ selected_service }}"
+            state: "{{ target_state }}"
+          failed_when: false
+          become: yes
+          register: state_change_result
+          when: local_host_info.initial_state != 'not installed'
+
+        - name: Wait for service state change
+          wait_for:
+            timeout: 10
+          when: 
+            - target_state != 'stopped'
+            - local_host_info.initial_state != 'not installed'
+
+        - name: Get final service status
+          shell: "systemctl status {{ selected_service }}"
+          register: final_status
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Get journalctl logs if failed
+          shell: "journalctl -u {{ selected_service }}.service -n 50 --no-pager | tail -n 5"
+          register: journal_logs_result
+          when: "'failed' in final_status.stdout or final_status.rc != 0"
+          changed_when: false
+          become: yes
+          ignore_errors: yes
+
+        - name: Update host info with final state
+          set_fact:
+            local_host_info: "{{ local_host_info | combine({
+              'final_state': final_state,
+              'action_taken': target_state,
+              'success': success_state,
+              'journal_logs': journal_logs_result.stdout | default('')
+            }) }}"
+          vars:
+            final_state: >-
+              {%- if final_status.rc != 0 and ('could not be found' in final_status.stderr or 'no such service' in final_status.stderr) -%}
+              not installed
+              {%- elif 'not-found' in final_status.stdout or 'Unit ' + selected_service + '.service not found' in final_status.stdout -%}
+              not installed
+              {%- elif final_status.rc == 0 and 'active (running)' in final_status.stdout -%}
+              active
+              {%- elif final_status.rc == 0 and 'inactive (dead)' in final_status.stdout -%}
+              inactive
+              {%- else -%}
+              failed
+              {%- endif -%}
+            success_state: >-
+              {%- if local_host_info.initial_state == 'not installed' -%}
+              false
+              {%- elif target_state == 'started' and final_state == 'active' -%}
+              true
+              {%- elif target_state == 'stopped' and final_state == 'inactive' -%}
+              true
+              {%- elif target_state == 'restarted' and final_state == 'active' -%}
+              true
+              {%- else -%}
+              false
+              {%- endif -%}
+
+    # Report generation
+    - name: Generate reports
+      block:
+        - name: Ensure report directory exists on localhost
+          file:
+            path: "/tmp/service_reports"
+            state: directory
+          run_once: true
+          delegate_to: localhost
+
+        - name: Share host info with localhost
+          set_fact:
+            shared_host_info: "{{ shared_host_info | default({}) | combine({inventory_hostname: local_host_info}) }}"
+          delegate_to: localhost
+
+        - name: Create status report
+          copy:
+            content: |
+              Service State Change Report for {{ selected_service }}
+              ==============================================
+              Host: {{ inventory_hostname }}
+              ----------------------------------------------
+              Requested Change: {{ local_host_info.action_taken }}
+              Initial State: {{ local_host_info.initial_state }}
+              Final State: {{ local_host_info.final_state }}
+              Success: {{ local_host_info.success }}
+              {% if local_host_info.initial_state == 'not installed' %}
+              Details: Service is not installed on this host (Unit {{ selected_service }}.service not found)
+              {% endif %}
+              {% if state_change_result is defined and state_change_result.msg is defined %}
+              Operation Message: {{ state_change_result.msg }}
+              {% endif %}
+              {% if local_host_info.journal_logs != '' %}
+              
+              Recent Logs:
+              {{ local_host_info.journal_logs }}
+              {% endif %}
+            dest: "/tmp/service_reports/status_{{ inventory_hostname }}.txt"
+          delegate_to: localhost
+
+        - name: Collect all reports
+          shell: "cat /tmp/service_reports/status_*.txt"
+          register: combined_status
+          run_once: true
+          delegate_to: localhost
+
+        - name: Show status report
+          debug:
+            msg: "{{ combined_status.stdout_lines }}"
+          run_once: true
+          delegate_to: localhost
+      rescue:
+        - name: Handle report generation failure
+          debug:
+            msg: "Failed to generate status reports. Check disk space and permissions."
+          run_once: true
+          delegate_to: localhost
+      always:
+        - name: Cleanup report files
+          file:
+            path: "/tmp/service_reports"
+            state: absent
+          run_once: true
+          delegate_to: localhost

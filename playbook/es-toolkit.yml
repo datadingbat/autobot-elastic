@@ -1,0 +1,576 @@
+---
+- name: Toolkit for Elasticsearch Utilities - Setup Variables
+  hosts: localhost
+  gather_facts: no
+  vars:
+    utility_paths:
+      'get_state': get_state
+      'set_state': set_state
+      'install': add_es
+      'upgrade': upgrade_component
+      'remove': remove_component
+      'tune': tune_service
+      'backup': backup_component 
+    service_options:
+      '1': elasticsearch
+      '2': kibana
+      '3': filebeat
+      '4': metricbeat
+    menu_to_utility_map:
+      '1': 'get_state'
+      '2': 'set_state'
+      '3': 'install'
+      '4': 'upgrade'
+      '5': 'remove'
+      '6': 'tune'
+      '7': 'backup'      
+    install_utility_map:
+      '1': add_es
+      '2': add_kibana
+      '3': add_filebeat
+      '4': add_metricbeat
+      '5': add_monitoring
+  vars_prompt:
+    - name: selected_utility
+      prompt: |
+        Select a utility to run:
+        1. Get Service State
+        2. Change Service State
+        3. Install Service
+        4. Upgrade Service
+        5. Remove Service
+        6. Tune Service
+        7. Backup Service
+        Enter the number of your choice:
+      private: no
+
+  tasks:
+    - name: Validate utility selection
+      fail:
+        msg: "Invalid utility selection. Please enter a number between 1 and 6."
+      when: selected_utility not in ['1','2','3','4','5','6','7']
+
+    - name: Set initial utility mapping
+      set_fact:
+        utility_file: "{{ utility_paths[menu_to_utility_map[selected_utility]] }}"
+
+    # Handle Install Service sub-menu
+    - name: Prompt for service to install
+      pause:
+        prompt: |
+          Select the service to install:
+          1. Elasticsearch
+          2. Kibana
+          3. Filebeat
+          4. Metricbeat
+          5. Monitoring Instance (Standalone Elasticsearch)
+          Enter the number of your choice:
+      register: install_choice
+      when: selected_utility == '3'
+
+    - name: Validate install choice
+      fail:
+        msg: "Invalid installation choice. Please enter a number between 1 and 5."
+      when: >
+        selected_utility == '3' and 
+        install_choice.user_input not in ['1','2','3','4','5']
+
+    - name: Override utility file for installation
+      set_fact:
+        utility_file: "{{ install_utility_map[install_choice.user_input] }}"
+      when: selected_utility == '3' and install_choice is defined
+
+    - name: Set service for installation
+      set_fact:
+        selected_service: "{{ service_options[install_choice.user_input] }}"
+      when: selected_utility == '3'
+
+    # Handle installation method for Install Service
+    - name: Prompt for installation method
+      pause:
+        prompt: |
+          Select installation method:
+          1. APT repository
+          2. Manual .deb package
+          Enter the number of your choice:
+      register: install_method_choice
+      when: selected_utility == '3'
+
+    - name: Handle APT installation options
+      block:
+        - name: Prompt for version
+          pause:
+            prompt: |
+              Enter the version number to install, or 'latest'
+              Example: 8.15.3
+          register: version_choice
+
+        - name: Set version fact
+          set_fact:
+            es_version: "{% if version_choice.user_input | lower == 'latest' %}latest{% else %}={{ version_choice.user_input }}{% endif %}"
+            installation_method: "apt"
+      when: >
+        selected_utility == '3' and 
+        install_method_choice.user_input == '1'
+
+    - name: Handle manual package installation
+      block:
+        - name: Prompt for package path
+          pause:
+            prompt: |
+              Enter the full path to the .deb package
+              Example: /tmp/elasticsearch-8.16.1-amd64.deb
+          register: package_path
+
+        - name: Set package path fact
+          set_fact:
+            deb_package_path: "{{ package_path.user_input }}"
+            installation_method: "local"
+      when: >
+        selected_utility == '3' and 
+        install_method_choice.user_input == '2'
+
+    # Handle service selection for state management and removal
+    - name: Prompt for service selection
+      pause:
+        prompt: |
+          Select the service to manage:
+          1. Elasticsearch
+          2. Kibana
+          3. Filebeat
+          4. Metricbeat
+          Enter the number of your choice:
+      register: service_choice
+      when: selected_utility in ['1', '2', '5']
+
+    - name: Validate service selection
+      fail:
+        msg: "Invalid service selection. Please enter a number between 1 and 4."
+      when: >
+        selected_utility in ['1', '2', '5'] and 
+        service_choice.user_input not in ['1','2','3','4']
+
+    - name: Prompt for backup service selection
+      pause:
+        prompt: |
+          Select service to backup:
+          1. Elasticsearch
+          2. Kibana
+          3. Filebeat
+          4. Metricbeat
+          Enter the number of your choice:
+      register: backup_choice
+      when: selected_utility == '7'
+
+    - name: Set backup service
+      set_fact:
+        selected_service: "{{ service_options[backup_choice.user_input] }}"
+      when: selected_utility == '7'  
+
+    - name: Set selected service
+      set_fact:
+        selected_service: "{{ service_options[service_choice.user_input] }}"
+      when: selected_utility in ['1', '2', '5']
+
+    # Handle service to tune
+    - name: Prompt for service to tune
+      pause:
+        prompt: |
+          Select the service to tune:
+          1. Elasticsearch
+          2. Kibana
+          Enter the number of your choice:
+      register: tune_choice
+      when: selected_utility == '6'
+
+    - name: Set tuning service
+      set_fact:
+        selected_service: "{{ service_options[tune_choice.user_input] }}"
+      when: selected_utility == '6'
+
+    # Handle state selection for set_state utility
+    - name: Prompt for service state
+      pause:
+        prompt: |
+          Select desired state:
+          1. Start service
+          2. Stop service
+          3. Restart service
+          Enter the number of your choice:
+      register: state_choice
+      when: selected_utility == '2'
+
+    - name: Validate state selection
+      fail:
+        msg: "Invalid state selection. Please enter a number between 1 and 3."
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input not in ['1','2','3']
+
+    - name: Set target state
+      set_fact:
+        target_state: "{{ state_map[state_choice.user_input] }}"
+      vars:
+        state_map:
+          '1': 'started'
+          '2': 'stopped'
+          '3': 'restarted'
+      when: selected_utility == '2'
+
+# Target selection prompt
+    - name: Select target hosts
+      block:
+        # Monitor target (utility 8)
+        - name: Prompt for monitor target
+          pause:
+            prompt: "Enter the hostname for the monitoring instance:"
+          register: monitoring_host
+          when: selected_utility == '8'
+
+        # Standard target (utilities 1-6)
+        - name: Prompt for standard target selection
+          pause:
+            prompt: |
+              Select target hosts:
+              1. All hosts
+              2. Host group
+              3. Specific host
+              Enter the number of your choice:
+          register: standard_target_type
+          when: selected_utility not in ['7', '8']
+
+        # Backup target (utility 7)
+        - name: Prompt for backup target selection
+          pause:
+            prompt: |
+              Select target hosts to backup:
+              1. All hosts
+              2. Host group
+              3. Specific host
+              Enter the number of your choice:
+          register: backup_target_type
+          when: selected_utility == '7'
+
+        # Handle monitoring setup (utility 8)
+        - name: Handle monitoring instance setup
+          block:
+            - name: Set monitoring host as limit
+              set_fact:
+                limit: "{{ monitoring_host.user_input }}"
+                
+            - name: Validate monitoring host exists
+              fail:
+                msg: "Invalid host. The specified host was not found in inventory."
+              when: monitoring_host.user_input not in groups['all']
+          when: selected_utility == '8'
+
+        # Handle standard targeting (utilities 1-6)
+        - name: Handle standard target selection
+          block:
+            # Handle 'all hosts' selection
+            - name: Handle all hosts selection
+              block:
+                - name: Count total hosts
+                  set_fact:
+                    total_hosts_count: "{{ groups['all'] | length }}"
+
+                - name: Convert count to integer
+                  set_fact:
+                    total_hosts_int: "{{ total_hosts_count | int }}"
+
+                - name: Confirm all hosts modification
+                  pause:
+                    prompt: |
+                      WARNING: This will modify {{ selected_service | default(omit) }} ({{ target_state | default(omit) }}) on {{ total_hosts_int }} hosts.
+                      Would you like to see the list of target hosts? (yes/no):
+                  register: show_hosts_prompt
+                  when: 
+                    - total_hosts_int | int > 0
+                    - selected_utility != '1'
+
+                - name: Display all hosts
+                  block:
+                    - name: Create host report
+                      copy:
+                        content: |
+                          Target Hosts Overview
+                          ====================
+                          Total Hosts: {{ total_hosts_int }}
+
+                          Hosts by Group:
+                          {% for group in groups | sort if group != 'all' and group != 'ungrouped' %}
+                          {{ group }}:
+                          {% for host in groups[group] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endfor %}{% if groups['ungrouped'] | length > 0 %}
+                          Ungrouped Hosts:
+                          {% for host in groups['ungrouped'] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endif %}
+                        dest: "/tmp/hosts_report.txt"
+
+                    - name: Display hosts report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/hosts_report.txt') | split('\n') }}"
+                  when: >
+                    selected_utility == '1' or 
+                    (show_hosts_prompt is defined and show_hosts_prompt.user_input | lower == 'yes')
+
+                - name: Set all hosts limit
+                  set_fact:
+                    limit: all
+              when: standard_target_type.user_input == '1'
+
+            # Handle host group selection 
+            - name: Handle host group selection
+              block:
+                - name: Get available groups
+                  set_fact:
+                    available_groups: "{{ groups | dict2items | map(attribute='key') | 
+                                      select('ne', 'all') | select('ne', 'ungrouped') | list | sort }}"
+
+                - name: Display available groups
+                  block:
+                    - name: Create groups report
+                      copy:
+                        content: |
+                          Target Hosts Overview
+                          ====================
+                          {% for group in available_groups %}
+                          {{ group }}:
+                          {% for host in groups[group] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}{% endfor %}
+                        dest: "/tmp/groups_report.txt"
+
+                    - name: Display groups report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/groups_report.txt') | split('\n') }}"
+
+                - name: Prompt for host group selection
+                  pause:
+                    prompt: |
+                      Enter the name of the host group you want to target:
+                  register: host_group_input
+
+                # For non-get_state utilities, show confirmation
+                - name: Confirm group hosts modification
+                  pause:
+                    prompt: |
+                      {% if selected_utility == '3' %}
+                      WARNING: This will install {{ selected_service }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% elif selected_utility == '2' %}
+                      WARNING: This will change {{ selected_service }} state to {{ target_state }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% elif selected_utility == '5' %}
+                      WARNING: This will remove {{ selected_service }} from {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% else %}
+                      WARNING: This will modify {{ selected_service }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% endif %}
+                      Would you like to see the list of target hosts? (yes/no):
+                  register: show_group_hosts_prompt
+                  when: selected_utility != '1'
+
+                # Always show host list for get_state, conditionally for others
+                - name: Display group hosts
+                  block:
+                    - name: Create group hosts report
+                      copy:
+                        content: |
+                          Host Group: {{ host_group_input.user_input }}
+                          ======================={{ '=' * host_group_input.user_input | length }}
+                          Total Hosts: {{ groups[host_group_input.user_input] | length }}
+
+                          Target Hosts:
+                          {% for host in groups[host_group_input.user_input] | sort %}
+                          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                        dest: "/tmp/group_hosts_report.txt"
+
+                    - name: Display group hosts report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/group_hosts_report.txt') | split('\n') }}"
+                  when: >
+                    selected_utility == '1' or 
+                    (show_group_hosts_prompt is defined and show_group_hosts_prompt.user_input | lower == 'yes')
+
+                - name: Final confirmation for group modification
+                  pause:
+                    prompt: |
+                      Do you want to proceed with modifying these hosts? (yes/no):
+                  register: final_confirmation
+                  when: selected_utility != '1'
+
+                - name: Exit if not confirmed
+                  meta: end_play
+                  when: >
+                    selected_utility != '1' and
+                    final_confirmation.user_input | lower != 'yes'
+
+                - name: Set group limit
+                  set_fact:
+                    limit: "{{ host_group_input.user_input }}"
+              when: standard_target_type.user_input == '2'
+
+            # Handle specific host selection
+            - name: Handle specific host selection
+              block:
+                - name: Prompt for specific host
+                  pause:
+                    prompt: |
+                      Enter the hostname you want to target
+                      (or type 'view' to see full inventory):
+                  register: host_prompt
+
+                - name: Display full inventory and reprompt
+                  block:
+                    - name: Create inventory report
+                      copy:
+                        content: |
+                          Full Inventory Overview
+                          ======================
+                          {% for group in groups | sort if group != 'all' and group != 'ungrouped' %}
+                          {{ group }}:
+                          {% for host in groups[group] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endfor %}{% if groups['ungrouped'] | length > 0 %}
+                          Ungrouped Hosts:
+                          {% for host in groups['ungrouped'] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endif %}
+                        dest: "/tmp/inventory_report.txt"
+
+                    - name: Display inventory report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/inventory_report.txt') | split('\n') }}"
+
+                    - name: Prompt for host after viewing inventory
+                      pause:
+                        prompt: "Enter the hostname you want to target:"
+                      register: host_prompt_after_view
+                  when: host_prompt.user_input | lower == 'view'
+
+                - name: Set final host input
+                  set_fact:
+                    final_host_input: "{{ host_prompt_after_view.user_input | default(host_prompt.user_input) }}"
+                  when: host_prompt.user_input | lower != 'view' or host_prompt_after_view is defined
+
+                - name: Set specific host limit
+                  set_fact:
+                    limit: "{{ final_host_input }}"
+              when: standard_target_type.user_input == '3'
+
+            # Validate target selection
+            - name: Validate target selection
+              fail:
+                msg: "Invalid target. Host or group not found in inventory."
+              when: >
+                (standard_target_type.user_input == '2' and host_group_input.user_input not in groups) or
+                (standard_target_type.user_input == '3' and final_host_input not in groups['all'])
+          when: selected_utility not in ['7', '8']
+
+        # Handle backup targeting (utility 7)
+        - name: Handle backup selection
+          block:
+            - name: Set all hosts limit for backup
+              set_fact:
+                limit: all
+              when: backup_target_type.user_input == '1'
+
+            - name: Handle backup group selection
+              block:
+                - name: Get available groups
+                  set_fact:
+                    available_groups: "{{ groups | dict2items | map(attribute='key') | 
+                                      select('ne', 'all') | select('ne', 'ungrouped') | list | sort }}"
+
+                - name: Display available groups
+                  debug:
+                    msg: "{{ available_groups }}"
+
+                - name: Prompt for host group selection
+                  pause:
+                    prompt: |
+                      Enter the name of the host group you want to target:
+                  register: backup_group_input
+
+                - name: Set group limit for backup
+                  set_fact:
+                    limit: "{{ backup_group_input.user_input }}"
+
+                - name: Validate group selection
+                  fail:
+                    msg: "Invalid target. Group not found in inventory."
+                  when: backup_group_input.user_input not in groups
+              when: backup_target_type.user_input == '2'
+
+            - name: Handle backup host selection
+              block:
+                - name: Prompt for host
+                  pause:
+                    prompt: "Enter the hostname you want to target:"
+                  register: backup_host_input
+
+                - name: Set host limit for backup
+                  set_fact:
+                    limit: "{{ backup_host_input.user_input }}"
+
+                - name: Validate host selection
+                  fail:
+                    msg: "Invalid target. Host not found in inventory."
+                  when: backup_host_input.user_input not in groups['all']
+              when: backup_target_type.user_input == '3'
+          when: selected_utility == '7'
+
+      always:
+        - name: Validate limit is set
+          fail:
+            msg: "Target selection failed - no limit was set"
+          when: limit is not defined
+
+    # Store variables for next play
+    - name: Set play variables
+      set_fact:
+        selected_play_vars:
+          utility_file: "{{ utility_file }}"
+          limit: "{{ limit }}"
+          selected_service: "{{ selected_service | default(omit) }}"
+          target_state: "{{ target_state | default(omit) }}"
+          installation_method: "{{ installation_method | default(omit) }}"
+          es_version: "{{ es_version | default(omit) }}"
+          deb_package_path: "{{ deb_package_path | default(omit) }}"
+      delegate_to: localhost    
+
+    # Cleanup temporary files
+    - name: Cleanup temp files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/hosts_report.txt"
+        - "/tmp/group_hosts_report.txt"
+        - "/tmp/inventory_report.txt"
+      ignore_errors: yes
+
+# Second play to execute the selected utility
+- name: Execute Selected Utility
+  hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
+  gather_facts: "{{ hostvars['localhost']['selected_play_vars']['utility_file'] != 'get_state_play' }}"
+  vars:
+    selected_service: "{{ hostvars['localhost']['selected_play_vars']['selected_service'] }}"
+    target_state: "{{ hostvars['localhost']['selected_play_vars']['target_state'] }}"
+
+  tasks:
+    - name: Include selected utility
+      include_tasks: "utils/{{ hostvars['localhost']['selected_play_vars']['utility_file'] }}.yml"
+      vars:
+        ansible_limit: "{{ hostvars['localhost']['selected_play_vars']['limit'] }}"

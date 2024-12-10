@@ -1,0 +1,425 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+  run_once: true
+  delegate_to: localhost
+
+- name: Set default variables
+  set_fact:
+    installation_method: "apt"
+    start_service: true
+    es_cert_pass: "elastic2024"
+    es_version: "=8.15.4"
+    first_master: "{{ groups['master_nodes'][0] }}"
+    cert_files:
+      - elastic-http.p12
+      - elastic-certificates.p12
+      - elastic-http-ca.pem
+      - elastic-http-ca.crt
+      - elastic-http.key
+      - elastic-http.pem
+
+- name: Validate master nodes exist
+  fail:
+    msg: "No master nodes found in inventory. At least one master node is required."
+  when: groups['master_nodes'] is not defined or groups['master_nodes'] | length == 0
+  run_once: true
+
+- name: Check certificate existence on first master
+  block:
+    - name: Check certificates on controller first
+      stat:
+        path: "/tmp/es_certs/{{ item }}"
+      register: controller_cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fetch certificates from master if not on controller
+      block:
+        - name: Ensure temp cert directory exists with proper permissions
+          file:
+            path: /tmp/es_certs
+            state: directory
+            mode: '0755' 
+            owner: "{{ ansible_user }}" 
+          delegate_to: localhost
+          run_once: true
+          become: yes
+
+        - name: Fetch certificates from master
+          fetch:
+            src: "/etc/elasticsearch/certs/{{ item }}"
+            dest: "/tmp/es_certs/{{ item }}"
+            flat: yes
+            mode: '0644'  
+          with_items: "{{ cert_files }}"
+          delegate_to: "{{ first_master }}"
+          run_once: true
+          become: yes 
+    - name: Verify fetched certificates
+      stat:
+        path: "/tmp/es_certs/{{ item }}"
+      register: cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+
+- name: Validate certificates exist
+  fail:
+    msg: "Required certificates not found. Please ensure certificates are generated first."
+  when: cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+  run_once: true
+  delegate_to: localhost
+
+- name: Pre-flight checks
+  block:
+    - name: Check installation status
+      block:
+        - name: Check if package is installed
+          shell: "dpkg -l elasticsearch | grep -q '^ii'"
+          register: pkg_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check if service is active
+          shell: "systemctl is-active elasticsearch || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check if config directory exists
+          stat:
+            path: /etc/elasticsearch
+          register: config_check
+          become: yes
+
+        - name: Set installation status
+          set_fact:
+            es_installed: "{{ pkg_check.rc == 0 or service_check.stdout == 'active' or config_check.stat.exists }}"
+
+    - name: Collect installation status
+      set_fact:
+        installation_status: "{{ installation_status | default({}) | combine({inventory_hostname: es_installed}) }}"
+      delegate_to: localhost
+
+    - name: Create installation status report
+      copy:
+        content: |
+          Pre-Installation Status Report
+          =============================
+          Hosts with Existing Installation (Will Skip):
+          {% for host, installed in installation_status.items() if installed %}
+          - {{ host }}
+            Package: {% if pkg_check.rc == 0 %}Installed{% else %}Not installed{% endif %}
+            Service: {{ service_check.stdout }}
+            Config Dir: {% if config_check.stat.exists %}Exists{% else %}Not found{% endif %}
+          {% endfor %}
+
+          Hosts Ready for Installation:
+          {% for host, installed in installation_status.items() if not installed %}
+          - {{ host }}
+          {% endfor %}
+
+          {% if installation_status.values() | select('equalto', true) | list | length > 0 %}
+          NOTE: Some hosts have existing Elasticsearch installations.
+          To install Elasticsearch on these hosts:
+          1. Use "7. Backup Service" to backup your configuration
+          2. Use "5. Remove Service" to remove existing installations
+          3. Run this installation again
+          {% endif %}
+        dest: "/tmp/es_preinstall_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display pre-installation status
+      debug:
+        msg: "{{ lookup('file', '/tmp/es_preinstall_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Prompt for installation confirmation
+      pause:
+        prompt: |
+          The above report shows the current status of target hosts.
+          Do you want to proceed with installation on eligible hosts? (yes/no):
+      register: install_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: install_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
+- name: Install APT prerequisites
+  when: not es_installed
+  block:
+    - name: Ensure apt-transport-https is installed
+      apt:
+        name: apt-transport-https
+        state: present
+        update_cache: yes
+
+    - name: Install necessary packages
+      apt:
+        name:
+          - gnupg
+          - curl
+          - wget
+          - python3
+        state: present
+
+    - name: Create keyring directory
+      file:
+        path: /usr/share/keyrings
+        state: directory
+
+    - name: Download Elasticsearch GPG key
+      get_url:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        dest: /tmp/elasticsearch.asc
+        mode: '0644'
+
+    - name: Import the Elasticsearch GPG key
+      shell: |
+        cat /tmp/elasticsearch.asc | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+    - name: Add Elasticsearch repository
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        content: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg arch=amd64] https://artifacts.elastic.co/packages/8.x/apt stable main"
+        mode: '0644'
+
+    - name: Force apt update
+      apt:
+        update_cache: yes
+        cache_valid_time: 0
+  become: yes
+  when: installation_method == 'apt'
+
+- name: Install Elasticsearch
+  when: not es_installed
+  block:
+    - name: Install via APT
+      apt:
+        name: "elasticsearch{{ es_version }}"
+        state: present
+        allow_unauthenticated: no
+        update_cache: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: installation_method == 'apt'
+
+    - name: Install from local package
+      apt:
+        deb: "{{ deb_package_path }}"
+        state: present
+        allow_unauthenticated: no
+      when: installation_method == 'local'
+  become: yes
+
+- name: Configure system settings
+  when: not es_installed
+  block:
+    - name: Create systemd override directory
+      file:
+        path: /etc/systemd/system/elasticsearch.service.d
+        state: directory
+
+    - name: Configure systemd override
+      copy:
+        dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+        content: |
+          [Service]
+          LimitMEMLOCK=infinity
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+  become: yes
+
+- name: Setup certificates
+  when: not es_installed
+  block:
+    - name: Create certs directory
+      file:
+        path: /etc/elasticsearch/certs
+        state: directory
+        owner: root
+        group: elasticsearch
+        mode: '0750'
+
+    - name: Copy certificates from controller
+      copy:
+        src: "/tmp/es_certs/{{ item }}"
+        dest: "/etc/elasticsearch/certs/{{ item }}"
+        mode: '0644'
+        owner: root
+        group: elasticsearch
+      with_items: "{{ cert_files }}"
+
+    - name: Set certificate permissions
+      file:
+        path: "/etc/elasticsearch/certs/{{ item }}"
+        owner: root
+        group: elasticsearch
+        mode: '0660'
+      with_items: "{{ cert_files }}"
+  become: yes
+
+- name: Configure Elasticsearch
+  when: not es_installed
+  block:
+    - name: Update SSL passwords in keystore
+      shell: |
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password    
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.truststore.secure_password
+
+    - name: Create elasticsearch.yml
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        content: |
+          # Elasticsearch configuration
+          path.data: /var/lib/elasticsearch
+          path.logs: /var/log/elasticsearch
+
+          bootstrap.memory_lock: true
+
+          cluster.name: elastic-cluster
+          node.name: {{ hostvars[inventory_hostname].ansible_host }}
+          network.host: {{ hostvars[inventory_hostname].ansible_host }}
+
+          {% if inventory_hostname in groups['master_nodes'] %}
+          node.roles: [master]
+          {% elif inventory_hostname in groups['hot_nodes'] %}
+          node.roles: [data_hot, ingest, remote_cluster_client, ml, data_content, transform]
+          {% elif inventory_hostname in groups['frozen_nodes'] %}
+          node.roles: [data_frozen, remote_cluster_client]
+          {% endif %}
+
+          discovery.seed_hosts:
+          {% for host in groups['master_nodes'] %}
+            - "{{ hostvars[host].ansible_host }}:9300"
+          {% endfor %}
+          {% if inventory_hostname in groups['master_nodes'] %}
+          cluster.initial_master_nodes:
+          {% for host in groups['master_nodes'] %}
+            - "{{ hostvars[host].ansible_host }}"
+          {% endfor %}
+          {% endif %}
+
+          xpack.security.enabled: true
+          xpack.security.enrollment.enabled: true
+
+          xpack.security.http.ssl:
+            enabled: true
+            keystore.path: /etc/elasticsearch/certs/elastic-http.p12
+            truststore.path: /etc/elasticsearch/certs/elastic-http.p12
+            verification_mode: certificate 
+            client_authentication: optional
+
+          xpack.security.transport.ssl:
+            enabled: true
+            verification_mode: certificate
+            keystore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+            truststore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+            client_authentication: optional
+            
+          transport.host: 0.0.0.0
+          transport.port: 9300
+          http.port: 9200
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0660'
+  become: yes
+
+- name: Manage service
+  when: not es_installed
+  block:
+    - name: Start Elasticsearch if requested
+      systemd:
+        name: elasticsearch
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: start_service | bool
+
+    - name: Wait for service to settle
+      wait_for:
+        timeout: 30
+      when: start_service | bool
+  become: yes
+
+- name: Generate installation report
+  block:
+    - name: Get final service status
+      shell: "systemctl status elasticsearch || true"
+      register: final_status
+      changed_when: false
+      failed_when: false
+      become: yes
+      when: not es_installed
+
+    - name: Collect final status
+      set_fact:
+        final_status_info: "{{ final_status_info | default({}) | combine({inventory_hostname: {
+          'skipped': es_installed,
+          'status': final_status if not es_installed else omit
+        }}) }}"
+      delegate_to: localhost
+
+    - name: Create installation report
+      copy:
+        content: |
+          Elasticsearch Installation Report
+          ===============================
+          Skipped Hosts (Existing Installation):
+          {% for host, info in final_status_info.items() if info.skipped %}
+          - {{ host }}
+          {% endfor %}
+
+          Installation Results:
+          {% for host, info in final_status_info.items() if not info.skipped %}
+          Host: {{ host }}
+          Status: {% if 'Active: active (running)' in info.status.stdout %}Successfully installed and running
+          {% elif 'Active:' in info.status.stdout %}Installed but not running
+          {% else %}Installation failed or incomplete{% endif %}
+          
+          Details:
+          {{ info.status.stdout }}
+          
+          {% endfor %}
+        dest: "/tmp/es_install_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display installation report
+      debug:
+        msg: "{{ lookup('file', '/tmp/es_install_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+  always:
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/es_preinstall_report.txt"
+        - "/tmp/es_install_report.txt"
+      run_once: true
+      delegate_to: localhost
