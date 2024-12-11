@@ -9,6 +9,7 @@
       with_items:
         - ansible_limit
         - selected_service
+      no_log: true        
   run_once: true
   delegate_to: localhost
 
@@ -49,6 +50,7 @@
           register: pkg_check
           changed_when: false
           failed_when: false
+          no_log: true
           become: yes
 
         - name: Get package version
@@ -61,6 +63,7 @@
           changed_when: false
           failed_when: false
           become: yes
+          no_log: true
 
         - name: Check configuration files
           stat:
@@ -68,6 +71,7 @@
           register: config_check
           loop: "{{ service_dirs[selected_service] }}"
           become: yes
+          no_log: true
 
         - name: Check systemd drop-in configurations
           find:
@@ -76,12 +80,14 @@
           register: dropins_check
           become: yes
           ignore_errors: yes
+          no_log: true
 
         - name: Check service logs
           stat:
             path: "/var/log/{{ selected_service }}"
           register: logs_check
           become: yes
+          no_log: true
 
         - name: Get list of remaining files
           find:
@@ -130,7 +136,11 @@
         content: |
           Pre-Removal Status Report
           ========================
-          Total Target Hosts: {{ ansible_play_hosts | length }}
+          Command Details:
+          ---------------
+          Operation: Remove {{ selected_service | title }}
+          Target Selection: {{ ansible_limit }}
+          Target Hosts: {{ ansible_play_hosts | join(', ') }}
 
           Component Details:
           {% for host in ansible_play_hosts | sort %}
@@ -162,6 +172,7 @@
         dest: "/tmp/service_removal_report.txt"
       run_once: true
       delegate_to: localhost
+      no_log: true
 
     - name: Display pre-removal status
       debug:
@@ -181,9 +192,11 @@
             list | length == 0
           delegate_to: localhost
           run_once: true
+          no_log: true      
       rescue:
         - name: Skip removal
           meta: end_play
+          no_log: true
 
     - name: Prompt for removal confirmation
       pause:
@@ -200,6 +213,8 @@
       when: remove_confirmation.user_input | lower != 'yes'
       run_once: true
       delegate_to: localhost
+      no_log: true
+      
 
 - name: Remove service
   block:
@@ -209,6 +224,7 @@
         state: stopped
         enabled: no
       failed_when: false
+      no_log: true
       become: yes
 
     - name: Remove package
@@ -235,6 +251,7 @@
       apt:
         clean: yes
       become: yes
+      no_log: true
   rescue:
     - name: Log removal failure
       set_fact:
@@ -251,6 +268,7 @@
           changed_when: false
           failed_when: false
           become: yes
+          no_log: true
 
         - name: Check final service status
           shell: "systemctl status {{ selected_service }} || true"
@@ -258,6 +276,7 @@
           changed_when: false
           failed_when: false
           become: yes
+          no_log: true
 
         - name: Check remaining files
           find:
@@ -265,6 +284,7 @@
             file_type: any
           register: remaining_files
           become: yes
+          no_log: true          
 
         - name: Store local status
           set_fact:
@@ -275,12 +295,14 @@
               failure_reason: "{{ failure_reason | default('') }}"
               remaining_files: "{{ remaining_files.files | length }}"
               remaining_file_list: "{{ remaining_files.files }}"
+          no_log: true              
 
         - name: Initialize final status collection
           set_fact:
             final_status_info: {}
           run_once: true
           delegate_to: localhost
+          no_log: true          
 
         - name: Aggregate host statuses
           set_fact:
@@ -294,13 +316,18 @@
           run_once: true
           delegate_to: localhost
           when: ansible_play_hosts | difference([inventory_hostname]) | length > 0
+          no_log: true
 
         - name: Create removal report
           copy:
             content: |
-              Pre-Removal Status Report
-              ========================
-              Total Target Hosts: {{ ansible_play_hosts | length }}
+              Final Removal Report
+              ===================
+              Command Details:
+              ---------------
+              Operation: Remove {{ selected_service | title }}
+              Target Selection: {{ ansible_limit }}
+              Target Hosts: {{ ansible_play_hosts | join(', ') }}
 
               Component Details:
               {% for host in ansible_play_hosts | sort %}
@@ -333,6 +360,8 @@
               {% if failed_hosts | length > 0 %}
               - Hosts with failures: {{ failed_hosts | length }}
               {% endif %}
+
+              Execution completed at: {{ ansible_date_time.iso8601 }}
             dest: "/tmp/final_removal_report.txt"
           run_once: true
           delegate_to: localhost
@@ -353,3 +382,4 @@
       run_once: true
       delegate_to: localhost
       ignore_errors: yes
+      no_log: true      
