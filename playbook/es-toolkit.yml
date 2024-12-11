@@ -30,6 +30,10 @@
       '3': add_filebeat
       '4': add_metricbeat
       '5': add_monitoring
+    upgrade_modes:
+      '1': 'automatic'
+      '2': 'managed'
+      '3': 'intelligent'
   vars_prompt:
     - name: selected_utility
       prompt: |
@@ -85,40 +89,50 @@
         selected_service: "{{ service_options[install_choice.user_input] }}"
       when: selected_utility == '3'
 
-    # Handle installation method for Install Service
     - name: Prompt for installation method
       pause:
         prompt: |
-          Select installation method:
+          Select {% if selected_utility == '4' %}upgrade{% else %}installation{% endif %} method:
           1. APT repository
           2. Manual .deb package
           Enter the number of your choice:
-      register: install_method_choice
-      when: selected_utility == '3'
+      register: method_choice
+      when: selected_utility in ['3', '4']
 
-    - name: Handle APT installation options
+    - name: Set the appropriate variable name
+      set_fact:
+        "{% if selected_utility == '4' %}upgrade_method_choice{% else %}install_method_choice{% endif %}": "{{ method_choice.user_input }}"
+      when: selected_utility in ['3', '4']
+
+    - name: Validate installation/upgrade method
+      fail:
+        msg: "Invalid method selection. Please enter 1 or 2."
+      when: >
+        selected_utility in ['3', '4'] and method_choice.user_input not in ['1','2']
+
+    - name: Handle APT options
       block:
         - name: Prompt for version
           pause:
             prompt: |
-              Enter the version number to install, or 'latest'
-              Example: 8.15.3
+              Enter the version number to {% if selected_utility == '4' %}upgrade to{% else %}install{% endif %}, or 'latest'
+              Example: 8.15.4
           register: version_choice
 
         - name: Set version fact
           set_fact:
-            es_version: "{% if version_choice.user_input | lower == 'latest' %}latest{% else %}={{ version_choice.user_input }}{% endif %}"
+            component_version: "{{ version_choice.user_input }}"
             installation_method: "apt"
       when: >
-        selected_utility == '3' and 
-        install_method_choice.user_input == '1'
+        (selected_utility == '3' and install_method_choice == '1') or
+        (selected_utility == '4' and upgrade_method_choice == '1')
 
-    - name: Handle manual package installation
+    - name: Handle manual package
       block:
         - name: Prompt for package path
           pause:
             prompt: |
-              Enter the full path to the .deb package
+              Enter the full path to the .deb package (.deb package in this path should exist on the Ansible Controller)
               Example: /tmp/elasticsearch-8.16.1-amd64.deb
           register: package_path
 
@@ -127,8 +141,68 @@
             deb_package_path: "{{ package_path.user_input }}"
             installation_method: "local"
       when: >
-        selected_utility == '3' and 
-        install_method_choice.user_input == '2'
+        (selected_utility == '3' and install_method_choice == '2') or
+        (selected_utility == '4' and upgrade_method_choice == '2')
+
+    - name: Prompt to start service after installation
+      pause:
+        prompt: |
+          Do you want to start the service after installation? (yes/no):
+      register: start_service_prompt
+      when: selected_utility == '3'
+
+    - name: Set start_service variable
+      set_fact:
+        start_service: "{{ start_service_prompt.user_input | lower == 'yes' }}"
+      when: selected_utility == '3'
+
+    # Handle Upgrade Service selections
+    - name: Prompt for service to upgrade
+      pause:
+        prompt: |
+          Select the service to upgrade:
+          1. Elasticsearch
+          2. Kibana
+          3. Filebeat
+          4. Metricbeat
+          Enter the number of your choice:
+      register: upgrade_choice
+      when: selected_utility == '4'
+
+    - name: Validate upgrade choice
+      fail:
+        msg: "Invalid upgrade choice. Please enter a number between 1 and 4."
+      when: >
+        selected_utility == '4' and 
+        upgrade_choice.user_input not in ['1','2','3','4']
+
+    - name: Set service for upgrade
+      set_fact:
+        selected_service: "{{ service_options[upgrade_choice.user_input] }}"
+      when: selected_utility == '4'
+
+    - name: Prompt for upgrade mode
+      pause:
+        prompt: |
+          Select upgrade mode:
+          1. Automatic (Proceeds automatically after health checks)
+          2. Managed (Requires confirmation between each host)
+          3. Intelligent (Automatic, switches to managed if errors detected)
+          Enter the number of your choice:
+      register: upgrade_mode_choice
+      when: selected_utility == '4'
+
+    - name: Set upgrade mode
+      set_fact:
+        upgrade_mode: "{{ upgrade_modes[upgrade_mode_choice.user_input] }}"
+      when: selected_utility == '4'
+
+    - name: Validate upgrade mode
+      fail:
+        msg: "Invalid upgrade mode selection. Please enter 1, 2, or 3."
+      when: >
+        selected_utility == '4' and 
+        upgrade_mode_choice.user_input not in ['1','2','3']
 
     # Handle service selection for state management and removal
     - name: Prompt for service selection
@@ -227,12 +301,14 @@
           register: monitoring_host
           when: selected_utility == '8'
 
-        # Standard target (utilities 1-6)
+          # Standard target (utilities 1-6)
         - name: Prompt for standard target selection
           pause:
             prompt: |
               Select target hosts:
+              {% if not (selected_utility == '4' and selected_service == 'elasticsearch') %}
               1. All hosts
+              {% endif %}
               2. Host group
               3. Specific host
               Enter the number of your choice:
@@ -358,6 +434,11 @@
                       Enter the name of the host group you want to target:
                   register: host_group_input
 
+                - name: Validate group exists
+                  fail:
+                    msg: "Group '{{ host_group_input.user_input }}' not found in inventory"
+                  when: host_group_input.user_input not in groups
+
                 # For non-get_state utilities, show confirmation
                 - name: Confirm group hosts modification
                   pause:
@@ -384,6 +465,20 @@
                           Host Group: {{ host_group_input.user_input }}
                           ======================={{ '=' * host_group_input.user_input | length }}
                           Total Hosts: {{ groups[host_group_input.user_input] | length }}
+
+                          {% if selected_utility in ['3', '4'] %}
+                          Installation Details:
+                          -------------------
+                          Component: {{ selected_service }}
+                          {% if installation_method == 'apt' %}
+                          Version: {% if component_version == 'latest' %}Latest available{% else %}{{ component_version }}{% endif %}
+
+                          Installation Method: APT repository
+                          {% else %}
+                          Installation Method: Manual package
+                          Package Path: {{ deb_package_path }}
+                          {% endif %}
+                          {% endif %}
 
                           Target Hosts:
                           {% for host in groups[host_group_input.user_input] | sort %}
@@ -503,6 +598,11 @@
                       Enter the name of the host group you want to target:
                   register: backup_group_input
 
+                - name: Validate group exists
+                  fail:
+                    msg: "Group '{{ host_group_input.user_input }}' not found in inventory"
+                  when: host_group_input.user_input not in groups
+
                 - name: Set group limit for backup
                   set_fact:
                     limit: "{{ backup_group_input.user_input }}"
@@ -547,8 +647,10 @@
           target_state: "{{ target_state | default(omit) }}"
           installation_method: "{{ installation_method | default(omit) }}"
           es_version: "{{ es_version | default(omit) }}"
+          component_version: "{{ component_version | default(omit) }}"  # Added for upgrades
           deb_package_path: "{{ deb_package_path | default(omit) }}"
-      delegate_to: localhost    
+          upgrade_mode: "{{ upgrade_mode | default(omit) }}"  # Added for upgrades
+          start_service: "{{ start_service | default(omit)}}"
 
     # Cleanup temporary files
     - name: Cleanup temp files
@@ -560,7 +662,7 @@
         - "/tmp/group_hosts_report.txt"
         - "/tmp/inventory_report.txt"
       ignore_errors: yes
-
+      
 # Second play to execute the selected utility
 - name: Execute Selected Utility
   hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
@@ -568,9 +670,28 @@
   vars:
     selected_service: "{{ hostvars['localhost']['selected_play_vars']['selected_service'] }}"
     target_state: "{{ hostvars['localhost']['selected_play_vars']['target_state'] }}"
+    installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] }}"
+    es_version: "{{ hostvars['localhost']['selected_play_vars']['es_version'] }}"
+    component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] }}"
+    deb_package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}"
+    upgrade_mode: "{{ hostvars['localhost']['selected_play_vars']['upgrade_mode'] }}"
+    start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] }}"
+    hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
+    serial: "{{ '1' if hostvars['localhost']['selected_play_vars']['utility_file'] == 'upgrade_component' else '0' }}"
 
   tasks:
     - name: Include selected utility
       include_tasks: "utils/{{ hostvars['localhost']['selected_play_vars']['utility_file'] }}.yml"
       vars:
         ansible_limit: "{{ hostvars['localhost']['selected_play_vars']['limit'] }}"
+
+    # Cleanup temporary files
+    - name: Cleanup temp files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/hosts_report.txt"
+        - "/tmp/group_hosts_report.txt"
+        - "/tmp/inventory_report.txt"
+      ignore_errors: yes
