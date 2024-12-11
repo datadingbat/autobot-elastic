@@ -1,0 +1,47 @@
+# roles/common/tasks/generate_report.yml
+- name: Generate standardized report
+  copy:
+    content: |
+      {{ operation_title | default('Operation Report') }}
+      {{ '=' * operation_title | length }}
+
+      Command Details:
+      ---------------
+      Operation: {{ operation_type }}
+      Component: {{ selected_service | title }}
+      Target Selection: {{ ansible_limit }}
+      Target Hosts: {{ ansible_play_hosts | join(', ') }}
+      Execution Time: {{ ansible_date_time.iso8601 }}
+
+      {% if pre_execution_info is defined %}
+      Pre-Execution Status:
+      --------------------
+      {% for host in ansible_play_hosts | sort %}
+      Host: {{ hostvars[host].ansible_host | default(host) }}
+      {{ pre_execution_info[host] | to_nice_yaml(indent=2) | indent(2) }}
+      {% endfor %}
+      {% endif %}
+
+      {% if post_execution_info is defined %}
+      Post-Execution Status:
+      --------------------
+      {% for host in ansible_play_hosts | sort %}
+      Host: {{ hostvars[host].ansible_host | default(host) }}
+      {{ post_execution_info[host] | to_nice_yaml(indent=2) | indent(2) }}
+      {% endfor %}
+      {% endif %}
+
+      Summary:
+      --------
+      {{ summary_info | to_nice_yaml(indent=2) }}
+
+      {% if next_steps is defined %}
+      Next Steps:
+      -----------
+      {% for step in next_steps %}
+      - {{ step }}
+      {% endfor %}
+      {% endif %}
+    dest: "/tmp/{{ report_filename }}"
+  delegate_to: localhost
+  run_once: true
