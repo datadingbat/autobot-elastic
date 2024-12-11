@@ -43,20 +43,6 @@ Target Selection:
 Select targeting method [1-3]:
 ```
 
-### Example Operations
-
-**Checking Service Status**:
-```bash
-# Get status of elasticsearch across all nodes
-ansible-playbook es-toolkit.yml -i inventory.ini -e "operation=1 service=elasticsearch target=all"
-```
-
-**Installing Elasticsearch**:
-```bash
-# Install elasticsearch on a specific host group
-ansible-playbook es-toolkit.yml -i inventory.ini -e "operation=3 service=elasticsearch target=hot_nodes"
-```
-
 ## Technical Summary
 
 ### Core Functions
