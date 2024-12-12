@@ -11,6 +11,7 @@
       'remove': remove_component
       'tune': tune_service
       'backup': backup_component 
+      'run_command': run_command       
     service_options:
       '1': elasticsearch
       '2': kibana
@@ -23,7 +24,8 @@
       '4': 'upgrade'
       '5': 'remove'
       '6': 'tune'
-      '7': 'backup'      
+      '7': 'backup'     
+      '8': 'run_command'  
     install_utility_map:
       '1': add_es
       '2': add_kibana
@@ -45,14 +47,15 @@
         5. Remove Service
         6. Tune Service
         7. Backup Service
+        8. Run Command
         Enter the number of your choice:
       private: no
 
   tasks:
     - name: Validate utility selection
       fail:
-        msg: "Invalid utility selection. Please enter a number between 1 and 6."
-      when: selected_utility not in ['1','2','3','4','5','6','7']
+        msg: "Invalid utility selection. Please enter a number between 1 and 8."
+      when: selected_utility not in ['1','2','3','4','5','6','7','8']
 
     - name: Set initial utility mapping
       set_fact:
@@ -299,9 +302,9 @@
           pause:
             prompt: "Enter the hostname for the monitoring instance:"
           register: monitoring_host
-          when: selected_utility == '8'
+          when: selected_utility == '3' and install_choice.user_input == '5'
 
-          # Standard target (utilities 1-6)
+          # Standard target (utilities 1-6, 8)
         - name: Prompt for standard target selection
           pause:
             prompt: |
@@ -313,7 +316,9 @@
               3. Specific host
               Enter the number of your choice:
           register: standard_target_type
-          when: selected_utility not in ['7', '8']
+          when: >
+            selected_utility not in ['7'] and
+            not (selected_utility == '3' and install_choice.user_input == '5')
 
         # Backup target (utility 7)
         - name: Prompt for backup target selection
@@ -338,7 +343,7 @@
               fail:
                 msg: "Invalid host. The specified host was not found in inventory."
               when: monitoring_host.user_input not in groups['all']
-          when: selected_utility == '8'
+          when: selected_utility == '3' and install_choice.user_input == '5'
 
         # Handle standard targeting (utilities 1-6)
         - name: Handle standard target selection
@@ -449,6 +454,8 @@
                       WARNING: This will change {{ selected_service }} state to {{ target_state }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
                       {% elif selected_utility == '5' %}
                       WARNING: This will remove {{ selected_service }} from {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% elif selected_utility == '8' %}
+                      WARNING: This will execute the specified command on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
                       {% else %}
                       WARNING: This will modify {{ selected_service }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
                       {% endif %}
@@ -571,7 +578,9 @@
               when: >
                 (standard_target_type.user_input == '2' and host_group_input.user_input not in groups) or
                 (standard_target_type.user_input == '3' and final_host_input not in groups['all'])
-          when: selected_utility not in ['7', '8']
+          when: >
+            selected_utility not in ['7'] and
+            not (selected_utility == '3' and install_choice.user_input == '5')
 
         # Handle backup targeting (utility 7)
         - name: Handle backup selection
