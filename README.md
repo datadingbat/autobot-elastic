@@ -138,7 +138,7 @@ ansible_ssh_private_key_file=/home/ubuntu/.ssh/your-key.pem   <---- UPDATE THIS
 6. Set up SSH access on helper node:
 
 * Update the utils/config with your private key file name and inventory hostnames/IP-ranges
-* Copy the config file and priate key to the Ansible (helper) node, and set permissions
+* Copy the config file and private key to the Ansible (helper) node, and set permissions
 ```bash
 # ~/.ssh/config
 # This is a ssh config file that's used to allow Ansible to perform automation tasks to the cluster
