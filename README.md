@@ -138,7 +138,7 @@ ansible_ssh_private_key_file=/home/ubuntu/.ssh/your-key.pem   <---- UPDATE THIS
 6. Set up SSH access on helper node:
 
 * Update the utils/config with your private key file name and inventory hostnames/IP-ranges
-* Copy the config file and private key to the Ansible (helper) node, and set permissions
+* Copy the config file and private key to the Ansible (helper) node, and set permissions (pem file should be 400)
 ```bash
 # ~/.ssh/config
 # This is a ssh config file that's used to allow Ansible to perform automation tasks to the cluster
@@ -154,7 +154,7 @@ Host *.amazonaws.com *.compute.internal ec2-* 10.* 3.* 18.*  <---- UPDATE THIS
 # Copy SSH config and key to helper node
 # From the "utils" subdirectory of the playbook:
 scp -rp config your-key.pem ubuntu@<HELPER_NODE_IP>:/home/ubuntu/.ssh/  <---- replace "your-key" and <HELPER_NODE_IP>
-chmod 600 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/your-key.pem  <---- replace "your-key"
+chmod 400 /home/ubuntu/.ssh/config /home/ubuntu/.ssh/your-key.pem  <---- replace "your-key"
 
 # Test SSH Keypair authentication from your client machine to the Anisble helper node:
 ssh -i your-key.pem ubuntu@<HELPER_NODE_IP>  <---- replace "your-key" and <HELPER_NODE_IP>
