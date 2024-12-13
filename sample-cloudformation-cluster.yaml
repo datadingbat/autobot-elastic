@@ -229,7 +229,7 @@ Resources:
         - Key: team
           Value: amer-strat
         - Key: project
-          Value: $username$-$project
+          Value: $username$-$project$
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
 
