@@ -677,7 +677,7 @@
         path: "{{ item }}"
         owner: elasticsearch
         group: elasticsearch
-        mode: '0660'
+        mode: '0750'
         state: directory
         recurse: yes    
       loop:
