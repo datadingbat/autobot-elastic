@@ -5,24 +5,6 @@
   delegate_to: localhost
   run_once: true
 
-- name: Debug deployment vars 1
-  debug:
-    msg: |
-      es_cert_pass: {{ es_cert_pass }}
-      cluster_name: {{ cluster_name }}
-      es_data_path: {{ es_data_path }}
-      es_log_path: {{ es_log_path }}
-  delegate_to: localhost
-  run_once: true
-
-- name: Debug hostvars localhost
-  debug:
-    msg: |
-      hostvars localhost content:
-      {{ hostvars['localhost'] | to_yaml }}
-  delegate_to: localhost
-  run_once: true
-
 - name: Set default variables
   set_fact:
     installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] | default('apt') }}"
@@ -120,16 +102,6 @@
     that:
       - cluster_name is defined and cluster_name != ''
     fail_msg: "Cluster name must be provided."
-  delegate_to: localhost
-  run_once: true
-
-- name: Debug deployment vars 2
-  debug:
-    msg: |
-      es_cert_pass: {{ es_cert_pass }}
-      cluster_name: {{ cluster_name }}
-      es_data_path: {{ es_data_path }}
-      es_log_path: {{ es_log_path }}
   delegate_to: localhost
   run_once: true
 
@@ -292,16 +264,6 @@
   when: cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
   run_once: true
   delegate_to: localhost
-
-- name: Debug deployment vars 3
-  debug:
-    msg: |
-      es_cert_pass: {{ es_cert_pass }}
-      cluster_name: {{ cluster_name }}
-      es_data_path: {{ es_data_path }}
-      es_log_path: {{ es_log_path }}
-  delegate_to: localhost
-  run_once: true
 
 # Pre-flight status check
 - name: Pre-flight checks
@@ -531,16 +493,6 @@
   delegate_to: localhost
   run_once: true
 
-- name: Debug deployment vars 5
-  debug:
-    msg: |
-      es_cert_pass: {{ es_cert_pass }}
-      cluster_name: {{ cluster_name }}
-      es_data_path: {{ es_data_path }}
-      es_log_path: {{ es_log_path }}
-  delegate_to: localhost
-  run_once: true
-
 # System Configuration
 - name: Configure system settings
   when: not es_installed
@@ -596,22 +548,15 @@
           no_log: true
       no_log: true
 
-    # Move SSL password configuration before elasticsearch.yml and service start
     - name: Update SSL passwords in keystore
-      shell: |
-        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
-        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password    
-        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
-        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.truststore.secure_password
+      shell: 'echo -n {{ es_cert_pass | trim | quote }} | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f {{ item }}'
+      loop:
+        - xpack.security.transport.ssl.keystore.secure_password
+        - xpack.security.transport.ssl.truststore.secure_password
+        - xpack.security.http.ssl.keystore.secure_password
+        - xpack.security.http.ssl.truststore.secure_password
       #no_log: true
       become: yes
-
-    # Verify keystore configuration
-    - name: Verify elasticsearch keystore
-      command: /usr/share/elasticsearch/bin/elasticsearch-keystore list
-      register: keystore_list
-      changed_when: false
-      no_log: true
 
     - name: Configure elasticsearch.yml
       copy:
@@ -694,17 +639,6 @@
         path: "/etc/elasticsearch/certs/{{ item }}"
       register: cert_stat
       with_items: "{{ cert_files }}"
-      no_log: true
-
-    - name: Check certificate access
-      fail:
-        msg: "Certificate {{ item.item }} has incorrect permissions or ownership"
-      when: >
-        not item.stat.exists or
-        item.stat.pw_name != "root" or
-        item.stat.gr_name != "elasticsearch" or
-        item.stat.mode != "0660"
-      with_items: "{{ cert_stat.results }}"
       no_log: true
 
     - name: Start Elasticsearch
@@ -795,7 +729,7 @@
 
           Next Steps:
           -----------
-          1. Verify cluster health: curl -k https://[host]:9200/_cluster/health
+          1. Verify cluster health: Use this toolkit's "Get Service State " function.
           2. Set up additional security features if needed
           3. Configure monitoring if required
           4. Review logs at {{ final_paths.logs }}/elastic-cluster.log
