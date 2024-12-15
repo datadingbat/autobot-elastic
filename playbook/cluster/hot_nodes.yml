@@ -150,13 +150,13 @@
               bootstrap.memory_lock: true
 
               # Performance settings
-              indices.memory.index_buffer_size: 30%
-              indices.queries.cache.size: 15%
+              # indices.memory.index_buffer_size: 30%
+              # indices.queries.cache.size: 15%
               
               # Hot node specific settings
-              cluster.routing.allocation.disk.watermark.low: 85%
-              cluster.routing.allocation.disk.watermark.high: 90%
-              cluster.routing.allocation.disk.watermark.flood_stage: 95%
+              # cluster.routing.allocation.disk.watermark.low: 85%
+              # cluster.routing.allocation.disk.watermark.high: 90%
+              # cluster.routing.allocation.disk.watermark.flood_stage: 95%
             owner: root
             group: elasticsearch
             mode: '0660'
