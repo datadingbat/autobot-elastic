@@ -1,0 +1,284 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+        - selected_service
+  run_once: true
+  delegate_to: localhost
+
+- name: Set backup variables
+  set_fact:
+    timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    backup_dir: "/home/{{ ansible_user }}/{{ selected_service }}_backups"
+    service_dirs:
+      elasticsearch:
+        config: /etc/elasticsearch
+        logs: /var/log/elasticsearch
+        data: /var/lib/elasticsearch
+      kibana:
+        config: /etc/kibana
+        logs: /var/log/kibana
+        data: /var/lib/kibana
+      filebeat:
+        config: /etc/filebeat
+        logs: /var/log/filebeat
+        data: /var/lib/filebeat
+      metricbeat:
+        config: /etc/metricbeat
+        logs: /var/log/metricbeat
+        data: /var/lib/metricbeat
+
+- name: Pre-flight checks
+  block:
+    # Initial status checks for each host
+    - name: Check installation status
+      block:
+        - name: Check if package is installed
+          shell: "dpkg -l {{ selected_service }} | grep '^ii'"
+          register: pkg_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Get package version
+          set_fact:
+            pkg_version: "{{ pkg_check.stdout.split()[2] | default('not installed') if pkg_check.rc == 0 else 'not installed' }}"
+
+        - name: Check if service exists
+          shell: "systemctl status {{ selected_service }} || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check directories
+          stat:
+            path: "{{ item.value }}"
+          register: dir_check
+          loop: "{{ service_dirs[selected_service] | dict2items }}"
+          become: yes
+
+        - name: Get directory sizes
+          shell: "du -sb {{ item.value }} 2>/dev/null || echo '0'"
+          register: dir_sizes
+          changed_when: false
+          loop: "{{ service_dirs[selected_service] | dict2items }}"
+          become: yes
+
+        - name: Check available disk space
+          shell: df -B1 /home | awk 'NR==2 {print $4}'
+          register: available_space
+          changed_when: false
+          become: yes
+
+        - name: Store host status
+          set_fact:
+            host_status:
+              installed: "{{ pkg_check.rc == 0 }}"
+              version: "{{ pkg_version }}"
+              service_state: "{{ service_check.stdout_lines[2] | default('not running') if service_check.rc == 0 else 'not found' }}"
+              service_running: "{{ 'active (running)' in service_check.stdout }}"
+              dirs_exist: "{{ dir_check.results | map(attribute='stat.exists') | list }}"
+              dir_sizes: "{{ dir_sizes.results | map(attribute='stdout') | list | map('int') | list }}"
+              available_space: "{{ available_space.stdout | int }}"
+
+    # Ensure status gets aggregated from all hosts
+    - name: Initialize status collection
+      set_fact:
+        all_hosts_status: {}
+      run_once: true
+      delegate_to: localhost
+
+    - name: Aggregate host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | default({}) | combine({ inventory_hostname: hostvars[inventory_hostname].host_status }) }}"
+      delegate_to: localhost
+
+    - name: Combine all host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | default({}) | combine({ item: hostvars[item].host_status }) }}"
+      loop: "{{ ansible_play_hosts | difference([inventory_hostname]) }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Create backup status report
+      copy:
+        content: |
+          Pre-Backup Status Report
+          =======================
+          Total Target Hosts: {{ ansible_play_hosts | length }}
+
+          Component Details:
+          {% for host in ansible_play_hosts | sort %}
+          Host: {{ hostvars[host].ansible_host | default(host) }}
+          {% if hostvars[host].host_status.installed %}
+          Status: {{ selected_service | title }} found
+          Version: {{ hostvars[host].host_status.version }}
+          Service State: {{ hostvars[host].host_status.service_state }}
+          Service Running: {{ hostvars[host].host_status.service_running }}
+          
+          Available Directories:
+          {% for path in service_dirs[selected_service] | dict2items %}
+          - {{ path.key }}: {% if hostvars[host].host_status.dirs_exist[loop.index0] %}Present ({{ (hostvars[host].host_status.dir_sizes[loop.index0] | int / 1024 / 1024) | round(2) }} MB){% else %}Not found{% endif %}
+          {% endfor %}
+
+          Available Space: {{ (hostvars[host].host_status.available_space | int / 1024 / 1024) | round(2) }} MB
+          {% if (hostvars[host].host_status.available_space | int) < (hostvars[host].host_status.dir_sizes | map('int') | sum) * 2 %}
+          WARNING: Low disk space for backup
+          {% endif %}
+
+          {% else %}
+          Status: {{ selected_service | title }} not found
+          {% endif %}
+
+          {% endfor %}
+
+          Summary:
+          - Hosts with {{ selected_service | title }} installed: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('host_status.installed', 'equalto', true) | list | length }}
+          - Hosts without {{ selected_service | title }}: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('host_status.installed', 'equalto', false) | list | length }}
+        dest: "/tmp/service_backup_report.txt"
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Display pre-backup status
+      debug:
+        msg: "{{ lookup('file', '/tmp/service_backup_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Check for eligible hosts
+      block:
+        - name: Verify backup needed
+          fail:
+            msg: "No hosts have {{ selected_service }} installed. Nothing to backup."
+          when: >
+            ansible_play_hosts | map('extract', hostvars) | 
+            map(attribute='host_status') | 
+            selectattr('installed', 'equalto', true) | 
+            list | length == 0
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Skip backup
+          meta: end_play
+
+    - name: Prompt for backup confirmation
+      pause:
+        prompt: |
+          The above report shows the current status of target hosts.
+          Do you want to proceed with the backup? (yes/no):
+      register: backup_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: backup_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
+    - name: Prompt for components to backup
+      pause:
+        prompt: |
+          Select components to backup (comma-separated):
+          1. Configuration
+          2. Logs
+          3. Data
+          Example: 1,2 for config and logs
+      register: backup_components
+      run_once: true
+      delegate_to: localhost
+
+- name: Perform backup
+  block:
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}/{{ timestamp }}"
+        state: directory
+        mode: '0750'
+
+    - name: Create config backup
+      archive:
+        path: "{{ service_dirs[selected_service].config }}"
+        dest: "{{ backup_dir }}/{{ timestamp }}/{{ selected_service }}_config.tar.gz"
+        format: gz
+      when: "'1' in backup_components.user_input"
+      become: yes
+
+    - name: Create logs backup
+      archive:
+        path: "{{ service_dirs[selected_service].logs }}"
+        dest: "{{ backup_dir }}/{{ timestamp }}/{{ selected_service }}_logs.tar.gz"
+        format: gz
+      when: "'2' in backup_components.user_input"
+      become: yes
+
+    - name: Create data backup
+      archive:
+        path: "{{ service_dirs[selected_service].data }}"
+        dest: "{{ backup_dir }}/{{ timestamp }}/{{ selected_service }}_data.tar.gz"
+        format: gz
+      when: "'3' in backup_components.user_input"
+      become: yes
+
+  rescue:
+    - name: Log backup failure
+      set_fact:
+        backup_failed: true
+        failure_reason: "{{ ansible_failed_result.msg | default('Unknown error during backup') }}"
+
+    # And modify the backup report generation:
+    - name: Generate backup report
+      block:
+        - name: Check backup results
+          stat:
+            path: "{{ backup_dir }}/{{ timestamp }}/{{ selected_service }}_{{ item }}.tar.gz"
+          register: backup_sizes
+          loop:
+            - config
+            - logs
+            - data
+          delegate_to: localhost
+          run_once: true
+
+        - name: Create backup report
+          copy:
+            content: |
+              {{ selected_service | title }} Backup Report
+              ================={{ '=' * selected_service | length }}=====
+              Timestamp: {{ timestamp }}
+              
+              {% for file in backup_sizes.results %}
+              {% if file.stat.exists %}
+              {{ file.item | title }} Backup Size: {{ (file.stat.size / 1024 / 1024) | round(2) }} MB
+              {% endif %}
+              {% endfor %}
+              
+              Backup Location: {{ backup_dir }}/{{ timestamp }}/
+            dest: "/tmp/backup_report.txt"
+          run_once: true
+          delegate_to: localhost
+
+        - name: Display backup report
+          debug:
+            msg: "{{ lookup('file', '/tmp/backup_report.txt') | split('\n') }}"
+          run_once: true
+          delegate_to: localhost
+
+  always:
+    - name: Cleanup temp files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/service_backup_report.txt"
+        - "/tmp/backup_report.txt"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes

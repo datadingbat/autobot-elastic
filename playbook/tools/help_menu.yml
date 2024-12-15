@@ -1,0 +1,24 @@
+---
+- name: Show Help Menu
+  debug:
+    msg: |
+      =====================================
+                HELP MENU
+      =====================================
+      1. About
+      2. Prerequisites
+      3. Deployment Variables & Password Files
+      4. Troubleshooting
+      5. Return to Main Menu
+      
+      Select a topic number (1-5):
+
+- name: Prompt for help topic
+  pause:
+    prompt: "Enter your choice (1-5): "
+  register: help_choice
+
+- name: Include help content tasks
+  include_tasks: "{{ playbook_dir }}/main.yml"
+  vars:
+    selected_utility: '9'

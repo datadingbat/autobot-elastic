@@ -1,0 +1,675 @@
+---
+# Input validation tasks
+# Input validation tasks
+- name: Set default variables
+  set_fact:
+    first_master: "{{ groups['master_nodes'][0] }}"
+    cert_files:
+      - elastic-http-ca.pem
+      - elastic-http.key
+      - elastic-http.pem
+    installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] | default('apt') }}"
+    start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] | default(true) }}"
+    metricbeat_version: "{% if installation_method == 'apt' and hostvars['localhost']['selected_play_vars']['component_version'] is defined %}={{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% else %}''{% endif %}"
+    deb_package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
+
+- name: Validate local installation requirements
+  assert:
+    that:
+      - deb_package_path != ''
+    fail_msg: "deb_package_path must be set for local installation method"
+  when: installation_method == 'local'
+  run_once: true
+  delegate_to: localhost
+
+- name: Pre-flight checks
+  block:
+    # Initial status checks for each host
+    - name: Check installation status
+      block:
+        - name: Check if package is installed
+          shell: "dpkg -l metricbeat | grep -q '^ii'"
+          register: pkg_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check if service is active
+          shell: "systemctl is-active metricbeat || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check if config directory exists
+          stat:
+            path: /etc/metricbeat
+          register: config_check
+          become: yes
+
+        - name: Store host status
+          set_fact:
+            host_status:
+              installed: "{{ pkg_check.rc == 0 or service_check.stdout == 'active' or config_check.stat.exists }}"
+              pkg_status: "{{ pkg_check.rc == 0 }}"
+              service_status: "{{ service_check.stdout }}"
+              config_exists: "{{ config_check.stat.exists }}"
+
+    # Gather all statuses on localhost
+    - name: Initialize status collection
+      set_fact:
+        all_hosts_status: {}
+      run_once: true
+      delegate_to: localhost
+
+    - name: Aggregate host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | combine({inventory_hostname: host_status}) }}"
+      delegate_to: localhost
+
+    - name: Create installation status report
+      copy:
+        content: |
+          Pre-Installation Status Report
+          =============================
+          Installation Details:
+          -------------------
+          Component: Metricbeat
+          Installation Method: {{ hostvars['localhost']['selected_play_vars']['installation_method'] }}
+          {% if hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt' %}
+          Version: {% if hostvars['localhost']['selected_play_vars']['component_version'] is defined %}{% if hostvars['localhost']['selected_play_vars']['component_version'] == 'latest' %}Latest available{% else %}{{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% endif %}{% else %}Not specified{% endif %}
+          {% else %}
+          Package Path: {{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}
+          {% endif %}
+
+          Total Target Hosts: {{ ansible_play_hosts | length }}
+
+          Hosts with Existing Installation (Will Skip):
+          {% for host in ansible_play_hosts %}
+          {% if hostvars[host]['host_status'].installed %}
+          - {{ host }}
+            Package: {% if hostvars[host]['host_status'].pkg_status %}Installed{% else %}Not installed{% endif %}
+            Service: {{ hostvars[host]['host_status'].service_status }}
+            Config Directory: {% if hostvars[host]['host_status'].config_exists %}Exists{% else %}Not found{% endif %}
+
+          {% endif %}
+          {% endfor %}
+
+          Hosts Ready for Installation:
+          {% for host in ansible_play_hosts %}
+          {% if not hostvars[host]['host_status'].installed %}
+          - {{ host }}
+          {% endif %}
+          {% endfor %}
+
+          {% if ansible_play_hosts | map('extract', hostvars) | map(attribute='host_status') | selectattr('installed', 'equalto', true) | list | length > 0 %}
+          NOTE: Some hosts have existing Metricbeat installations.
+          To install Metricbeat on these hosts:
+          1. Use "7. Backup Service" to backup your configuration
+          2. Use "5. Remove Service" to remove existing installations
+          3. Run this installation again
+          {% endif %}
+        dest: "/tmp/metricbeat_preinstall_report.txt"
+      delegate_to: localhost
+      run_once: true
+
+    # Display report
+    - name: Display pre-installation status
+      debug:
+        msg: "{{ lookup('file', '/tmp/metricbeat_preinstall_report.txt') | split('\n') }}"
+      delegate_to: localhost
+      run_once: true
+
+    # Check for eligible hosts
+    - name: Check for eligible hosts
+      block:
+        - name: Verify installation needed
+          fail:
+            msg: |
+              No hosts eligible for installation. All target hosts have existing Metricbeat installations.
+              Use "7. Backup Service" and "5. Remove Service" first if you need to reinstall.
+          when: >
+            ansible_play_hosts | map('extract', hostvars) | 
+            map(attribute='host_status') | 
+            selectattr('installed', 'equalto', false) | 
+            list | length == 0
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Skip installation
+          meta: end_play
+
+    # Get user confirmation
+    - name: Prompt for installation confirmation
+      pause:
+        prompt: |
+          The above report shows the current status of target hosts.
+          Do you want to proceed with installation on eligible hosts? (yes/no):
+      register: install_confirmation
+      delegate_to: localhost
+      run_once: true
+
+    # Handle user response
+    - name: Exit if not confirmed
+      meta: end_play
+      when: install_confirmation.user_input | lower != 'yes'
+      delegate_to: localhost
+      run_once: true
+
+  rescue:
+    - name: Handle pre-flight check failure
+      fail:
+        msg: "Pre-flight checks failed. Please check the error messages above."
+      delegate_to: localhost
+      run_once: true
+
+- name: Certificate management
+  when: not host_status.installed
+  block:
+    - name: Set temp directory path
+      set_fact:
+        temp_cert_dir: "/tmp/elastic-certs"
+
+    - name: Remove existing temp cert directory if present
+      file:
+        path: "{{ temp_cert_dir }}"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      become: yes
+
+    - name: Create temp cert directory
+      file:
+        path: "{{ temp_cert_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      delegate_to: localhost
+      run_once: true
+      become: yes
+
+    - name: Check certificates on controller
+      stat:
+        path: "{{ temp_cert_dir }}/{{ item }}"
+      register: controller_cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Create temp cert directory
+      file:
+        path: "{{ temp_cert_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+      become: yes
+
+    - name: Fetch certificates from master
+      fetch:
+        src: "/etc/elasticsearch/certs/{{ item }}"
+        dest: "{{ temp_cert_dir }}/{{ item }}"
+        flat: yes
+        mode: '0644'
+      with_items: "{{ cert_files }}"
+      delegate_to: "{{ first_master }}"
+      run_once: true
+      become: yes
+      when: not controller_cert_check.results[0].stat.exists
+
+    - name: Verify certificates
+      stat:
+        path: "{{ temp_cert_dir }}/{{ item }}"
+      register: cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Validate certificates exist
+      fail:
+        msg: "Required certificates not found. Please ensure certificates are generated first."
+      when: cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+      run_once: true
+      delegate_to: localhost
+
+- name: Main installation tasks
+  when: not host_status.installed
+  block:
+    # Cluster information gathering
+    - name: Get cluster information
+      block:
+        - name: Load elastic password
+          set_fact:
+            elastic_password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+          delegate_to: localhost
+          run_once: true
+
+        - name: Get cluster UUID
+          uri:
+            url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/state/metadata?filter_path=metadata.cluster_uuid"
+            method: GET
+            user: "elastic"
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: cluster_uuid_response
+          delegate_to: localhost
+
+        - name: Set cluster UUID fact
+          set_fact:
+            cluster_uuid: "{{ cluster_uuid_response.json.metadata.cluster_uuid }}"
+          delegate_to: localhost
+      rescue:
+        - name: Handle cluster info failure
+          fail:
+            msg: "Failed to get cluster UUID. Ensure cluster is running and accessible."
+
+    # Remote monitoring user password management
+    - name: Setup remote monitoring user password
+      block:
+        - name: Check existing password file
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/metricbeat_remote_monitoring_user.txt"
+          register: monitoring_password_file
+          delegate_to: localhost
+          run_once: true
+
+        - name: Generate and save remote monitoring user password
+          block:
+            - name: Set remote monitoring user password
+              uri:
+                url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_security/user/remote_monitoring_user/_password"
+                method: POST
+                body: |
+                  {
+                    "password": "hQc6NtBw26ChmvA"
+                  }
+                body_format: json
+                user: "elastic"
+                password: "{{ elastic_password }}"
+                force_basic_auth: yes
+                validate_certs: no
+                headers:
+                  Content-Type: "application/json"
+              delegate_to: localhost
+
+            - name: Save remote monitoring password
+              copy:
+                content: "hQc6NtBw26ChmvA"
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/metricbeat_remote_monitoring_user.txt"
+                mode: '0600'
+              delegate_to: localhost
+          when: not monitoring_password_file.stat.exists
+
+        - name: Load remote monitoring password
+          set_fact:
+            remote_monitoring_password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/metricbeat_remote_monitoring_user.txt') | trim }}"
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Handle remote monitoring user setup failure
+          fail:
+            msg: "Failed to setup remote monitoring user password. Check Elasticsearch connectivity and permissions."
+
+    # API key management
+    - name: Setup API keys
+      block:
+        - name: Check existing API key
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/monitoring_cluster_metricbeat_output_apikey.txt"
+          register: api_key_file
+          delegate_to: localhost
+          run_once: true
+
+        - name: Generate and save API key
+          block:
+            - name: Generate new API key
+              uri:
+                url: "https://{{ hostvars[groups['monitoring_instance'][0]].ansible_host }}:9200/_security/api_key"
+                method: POST
+                body: |
+                  {
+                    "name": "metricbeat-remote",
+                    "role_descriptors": {
+                      "metricbeat_full_access": {
+                        "cluster": [
+                          "monitor",
+                          "manage_ilm",
+                          "manage_index_templates",
+                          "manage_ingest_pipelines",
+                          "read_ilm",
+                          "cluster:admin/ilm/get",
+                          "cluster:admin/ilm/put"
+                        ],
+                        "indices": [
+                          {
+                            "names": [
+                              ".monitoring-*",
+                              "monitoring-*",
+                              ".ds-monitoring-*",
+                              ".ds-.monitoring-*",
+                              ".ds-metricbeat-*",
+                              ".ds-.metricbeat-*",
+                              "metricbeat-*",
+                              ".metricbeat-*"
+                            ],
+                            "privileges": [
+                              "create_index",
+                              "create",
+                              "write",
+                              "manage",
+                              "read",
+                              "view_index_metadata"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  }
+                body_format: json
+                user: "elastic"
+                password: "{{ elastic_password }}"
+                force_basic_auth: yes
+                validate_certs: no
+                return_content: yes
+                headers:
+                  Content-Type: "application/json"
+              register: api_key_response
+              delegate_to: localhost
+
+            - name: Save API key
+              copy:
+                content: "{{ api_key_response.json.id }}:{{ api_key_response.json.api_key }}"
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/monitoring_cluster_metricbeat_output_apikey.txt"
+                mode: '0600'
+              delegate_to: localhost
+          when: not api_key_file.stat.exists
+
+        - name: Load API key
+          set_fact:
+            monitoring_cluster_api_key: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/monitoring_cluster_metricbeat_output_apikey.txt') | trim }}"
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Handle API key setup failure
+          fail:
+            msg: "Failed to setup API keys. Check Elasticsearch connectivity and permissions."
+
+    # Certificate setup
+    - name: Setup certificates
+      block:
+        - name: Create certs directory
+          file:
+            path: /etc/metricbeat/certs
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Copy certificates
+          copy:
+            src: "{{ temp_cert_dir }}/{{ item }}"
+            dest: "/etc/metricbeat/certs/{{ item }}"
+            owner: root
+            group: root
+            mode: '0644'
+          with_items: "{{ cert_files }}"
+      rescue:
+        - name: Handle certificate setup failure
+          fail:
+            msg: "Failed to setup certificates. Check permissions and certificate existence."
+      become: yes
+
+    # Metricbeat installation
+    - name: Install Metricbeat
+      block:
+        - name: Install via APT
+          apt:
+            name: "metricbeat{{ metricbeat_version }}"
+            state: present
+            update_cache: yes
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          when: installation_method == 'apt'
+
+        - name: Handle local package installation
+          block:
+            - name: Check package exists on controller
+              stat:
+                path: "{{ deb_package_path }}"
+              register: controller_package_check
+              delegate_to: localhost
+
+            - name: Fail if package not found on controller
+              fail:
+                msg: "Package file not found at {{ deb_package_path }} on Ansible controller. Please ensure the .deb package exists and the path is correct."
+              when: not controller_package_check.stat.exists
+              delegate_to: localhost
+
+            - name: Copy package to target
+              copy:
+                src: "{{ deb_package_path }}"
+                dest: "/tmp/{{ deb_package_path | basename }}"
+                mode: '0644'
+
+            - name: Install from local package
+              apt:
+                deb: "/tmp/{{ deb_package_path | basename }}"
+                state: present
+          when: installation_method == 'local'
+      rescue:
+        - name: Handle installation failure
+          fail:
+            msg: "Failed to install Metricbeat package. Check package availability and system requirements."
+      become: yes
+
+    # Configuration
+    - name: Configure Metricbeat
+      block:
+        - name: Configure main settings
+          copy:
+            dest: /etc/metricbeat/metricbeat.yml
+            content: |
+              logging.level: warning
+              logging.to_files: true
+
+              logging.files:
+                path: /var/log/metricbeat
+                name: metricbeat
+                keepfiles: 10
+                permissions: 0644
+
+              metricbeat.config.modules:
+                path: /etc/metricbeat/modules.d/*.yml
+                reload.enabled: false
+
+              monitoring.cluster_uuid: "{{ cluster_uuid }}"
+              name: "{{ hostvars[inventory_hostname].ansible_host }}"
+              
+              output.elasticsearch:
+                hosts: ["https://{{ hostvars[groups['monitoring_instance'][0]].ansible_host }}:9200"]
+                api_key: "{{ monitoring_cluster_api_key }}"
+                ssl.verification_mode: certificate
+                ssl.certificate_authorities: ["/etc/metricbeat/certs/elastic-http-ca.pem"]
+                ssl.certificate: "/etc/metricbeat/certs/elastic-http.pem"
+                ssl.key: "/etc/metricbeat/certs/elastic-http.key"
+            mode: '0644'
+            owner: root
+            group: root
+
+        # Module configuration
+        - name: Enable required modules
+          command: "metricbeat modules enable {{ item }}"
+          with_items:
+            - elasticsearch-xpack
+            - system
+          register: module_enable
+          changed_when: module_enable.rc == 0
+
+        - name: Configure Elasticsearch module
+          copy:
+            dest: /etc/metricbeat/modules.d/elasticsearch-xpack.yml
+            content: |
+              - module: elasticsearch
+                xpack.enabled: true
+                period: 10s
+                hosts: ["https://{{ hostvars[inventory_hostname].ansible_host }}:9200"]
+                username: "remote_monitoring_user"
+                password: "{{ remote_monitoring_password }}"
+                ssl.certificate_authorities: ["/etc/metricbeat/certs/elastic-http-ca.pem"]
+                ssl.certificate: "/etc/metricbeat/certs/elastic-http.pem"
+                ssl.key: "/etc/metricbeat/certs/elastic-http.key"
+                ssl.verification_mode: certificate
+                scope: cluster
+            mode: '0644'
+
+        - name: Configure System module
+          copy:
+            dest: /etc/metricbeat/modules.d/system.yml
+            content: |
+              # Module: system
+              - module: system
+                period: 10s
+                metricsets:
+                  - cpu
+                  - load
+                  - memory
+                  - network
+                  - process
+                  - process_summary
+                  - socket_summary
+                process.include_top_n:
+                  by_cpu: 5
+                  by_memory: 5
+                cpu.metrics: ["percentages","normalized_percentages"]
+                core.metrics: ["percentages"]
+              - module: system
+                period: 1m
+                metricsets:
+                  - filesystem
+                  - fsstat
+                processors:
+                - drop_event.when.regexp:
+                    system.filesystem.mount_point: '^/(sys|cgroup|proc|dev|etc|host|lib|snap)($|/)'
+              - module: system
+                period: 15m
+                metricsets:
+                  - uptime
+            mode: '0644'
+      rescue:
+        - name: Handle configuration failure
+          fail:
+            msg: "Failed to configure Metricbeat. Check file permissions and disk space."
+      become: yes
+
+    # Service management
+    - name: Manage service
+      block:
+        - name: Enable service
+          systemd:
+            name: metricbeat
+            enabled: yes
+            daemon_reload: yes
+
+        - name: Start service
+          systemd:
+            name: metricbeat
+            state: started
+          when: start_service | bool
+
+        - name: Wait for service
+          wait_for:
+            timeout: 10
+          when: start_service | bool
+      rescue:
+        - name: Handle service management failure
+          fail:
+            msg: "Failed to manage Metricbeat service. Check 'journalctl -u metricbeat' for details."
+      become: yes
+
+    # Generate final report
+    - name: Generate installation report
+      block:
+        - name: Get final service status
+          shell: "systemctl status metricbeat || true"
+          register: final_status
+          changed_when: false
+          failed_when: false
+          become: yes
+          when: not host_status.installed
+
+        - name: Collect final status
+          set_fact:
+            final_status_info: "{{ final_status_info | default({}) | combine({inventory_hostname: {
+              'skipped': host_status.installed,
+              'status': final_status if not host_status.installed else omit
+            }}) }}"
+          delegate_to: localhost
+
+        - name: Create installation report
+          copy:
+            content: |
+              Metricbeat Installation Report
+              ============================
+              Skipped Hosts (Existing Installation):
+              {% for host, info in final_status_info.items() if info.skipped %}
+              - {{ host }}
+              {% endfor %}
+
+              Installation Results:
+              {% for host, info in final_status_info.items() if not info.skipped %}
+              Host: {{ host }}
+              Status: {% if info.status.stdout is defined and 'Active: active (running)' in info.status.stdout %}Successfully installed and running
+              {% elif info.status.stdout is defined and 'Active:' in info.status.stdout %}Installed but not running
+              {% else %}Installation failed or incomplete{% endif %}
+              
+              Details:
+              {% if info.status.stdout is defined %}{{ info.status.stdout }}{% endif %}
+              
+              {% endfor %}
+            dest: "/tmp/metricbeat_install_report.txt"
+          run_once: true
+          delegate_to: localhost
+
+        - name: Display installation report
+          debug:
+            msg: "{{ lookup('file', '/tmp/metricbeat_install_report.txt') | split('\n') }}"
+          run_once: true
+          delegate_to: localhost
+
+# Cleanup tasks
+- name: Cleanup
+  block:
+    - name: Cleanup installation files
+      file:
+        path: "/tmp/{{ deb_package_path | basename }}"
+        state: absent
+      when: installation_method == 'local'
+      ignore_errors: yes
+      become: yes
+
+    - name: Remove temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/metricbeat_preinstall_report.txt"
+        - "/tmp/metricbeat_install_report.txt"
+        - "{{ temp_cert_dir }}"
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes
+  always:
+    - name: Ensure temp files are removed
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/metricbeat_preinstall_report.txt"
+        - "/tmp/metricbeat_install_report.txt"
+        - "{{ temp_cert_dir }}"
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes

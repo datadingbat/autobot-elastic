@@ -1,0 +1,385 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+        - selected_service
+      no_log: true        
+  run_once: true
+  delegate_to: localhost
+
+- name: Set default variables
+  set_fact:
+    service_dirs:
+      elasticsearch:
+        - /etc/elasticsearch
+        - /var/lib/elasticsearch
+        - /var/log/elasticsearch
+        - /usr/share/elasticsearch
+        - /etc/systemd/system/elasticsearch.service.d
+      kibana:
+        - /etc/kibana
+        - /var/lib/kibana
+        - /var/log/kibana
+        - /usr/share/kibana
+        - /etc/systemd/system/kibana.service.d
+      filebeat:
+        - /etc/filebeat
+        - /var/lib/filebeat
+        - /var/log/filebeat
+        - /usr/share/filebeat
+        - /etc/systemd/system/filebeat.service.d
+      metricbeat:
+        - /etc/metricbeat
+        - /var/lib/metricbeat
+        - /var/log/metricbeat
+        - /usr/share/metricbeat
+        - /etc/systemd/system/metricbeat.service.d
+
+- name: Pre-flight checks
+  block:
+    - name: Check installation status
+      block:
+        - name: Check if package is installed
+          shell: "dpkg -l {{ selected_service }} | grep '^ii'"
+          register: pkg_check
+          changed_when: false
+          failed_when: false
+          no_log: true
+          become: yes
+
+        - name: Get package version
+          set_fact:
+            pkg_version: "{{ pkg_check.stdout.split()[2] | default('not installed') if pkg_check.rc == 0 else 'not installed' }}"
+
+        - name: Check if service exists
+          shell: "systemctl status {{ selected_service }} || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check configuration files
+          stat:
+            path: "{{ item }}"
+          register: config_check
+          loop: "{{ service_dirs[selected_service] }}"
+          become: yes
+          no_log: true
+
+        - name: Check systemd drop-in configurations
+          find:
+            paths: "/etc/systemd/system/{{ selected_service }}.service.d"
+            patterns: "*.conf"
+          register: dropins_check
+          become: yes
+          ignore_errors: yes
+          no_log: true
+
+        - name: Check service logs
+          stat:
+            path: "/var/log/{{ selected_service }}"
+          register: logs_check
+          become: yes
+          no_log: true
+
+        - name: Get list of remaining files
+          find:
+            paths: "{{ item }}"
+            file_type: any
+          register: existing_files
+          loop: "{{ service_dirs[selected_service] }}"
+          become: yes
+          when: config_check.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
+
+        - name: Store host status
+          set_fact:
+            host_status:
+              installed: "{{ pkg_check.rc == 0 or service_check.rc == 0 or (config_check.results | selectattr('stat.exists', 'equalto', true) | list | length > 0) }}"
+              version: "{{ pkg_version }}"
+              service_state: "{{ service_check.stdout_lines[2] | default('not running') if service_check.rc == 0 else 'not found' }}"
+              config_exists: "{{ config_check.results | selectattr('stat.exists', 'equalto', true) | list | length > 0 }}"
+              config_paths: "{{ config_check.results | selectattr('stat.exists', 'equalto', true) | map(attribute='item') | list }}"
+              has_dropins: "{{ dropins_check.matched | default(0) > 0 }}"
+              has_logs: "{{ logs_check.stat.exists | default(false) }}"
+              remaining_files_count: "{{ existing_files.results | selectattr('matched', 'defined') | sum(attribute='matched') | default(0) }}"
+              remaining_files_details: "{{ existing_files.results | selectattr('files', 'defined') | map(attribute='files') | flatten | list }}"
+
+
+    # Aggregate status on localhost
+    - name: Initialize status collection
+      set_fact:
+        all_hosts_status: {}
+      run_once: true
+      delegate_to: localhost
+
+    - name: Aggregate host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | default({}) | combine({ inventory_hostname: hostvars[inventory_hostname].host_status }) }}"
+      delegate_to: localhost
+
+    - name: Combine all host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | default({}) | combine({ item: hostvars[item].host_status }) }}"
+      loop: "{{ ansible_play_hosts | difference([inventory_hostname]) }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Create removal status report
+      copy:
+        content: |
+          Pre-Removal Status Report
+          ========================
+          Command Details:
+          ---------------
+          Operation: Remove {{ selected_service | title }}
+          Target Selection: {{ ansible_limit }}
+          Target Hosts: {{ ansible_play_hosts | join(', ') }}
+
+          Component Details:
+          {% for host in ansible_play_hosts | sort %}
+          Host: {{ hostvars[host].ansible_host | default(host) }}
+          {% if hostvars[host].host_status.installed %}
+          Status: {{ selected_service | title }} found and will be removed
+          Version: {{ hostvars[host].host_status.version }}
+          Service State: {{ hostvars[host].host_status.service_state }}
+          Configuration Found: {{ hostvars[host].host_status.config_paths | length }} directories
+          {% if hostvars[host].host_status.config_paths %}
+          Configuration Locations:
+          {% for path in hostvars[host].host_status.config_paths %}
+            - {{ path }}
+          {% endfor %}
+          {% endif %}
+          Service Files: {% if hostvars[host].host_status.has_dropins %}Custom systemd configurations present{% else %}Standard configuration{% endif %}
+          
+          Log Files: {% if hostvars[host].host_status.has_logs %}Present{% else %}Not found{% endif %}
+
+          {% else %}
+          Status: {{ selected_service | title }} not found
+          {% endif %}
+
+          {% endfor %}
+
+          Summary:
+          - Hosts with {{ selected_service | title }} installed: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('host_status.installed', 'equalto', true) | list | length }}
+          - Hosts without {{ selected_service | title }}: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('host_status.installed', 'equalto', false) | list | length }}
+        dest: "/tmp/service_removal_report.txt"
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+
+    - name: Display pre-removal status
+      debug:
+        msg: "{{ lookup('file', '/tmp/service_removal_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Check for eligible hosts
+      block:
+        - name: Verify removal needed
+          fail:
+            msg: "No hosts have {{ selected_service }} installed. Nothing to remove."
+          when: >
+            ansible_play_hosts | map('extract', hostvars) | 
+            map(attribute='host_status') | 
+            selectattr('installed', 'equalto', true) | 
+            list | length == 0
+          delegate_to: localhost
+          run_once: true
+          no_log: true      
+      rescue:
+        - name: Skip removal
+          meta: end_play
+          no_log: true
+
+    - name: Prompt for removal confirmation
+      pause:
+        prompt: |
+          The above report shows the current status of target hosts.
+          WARNING: This will completely remove {{ selected_service }} and all associated data.
+          Do you want to proceed with the removal? (yes/no):
+      register: remove_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: remove_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+      
+
+- name: Remove service
+  block:
+    - name: Stop and disable service
+      systemd:
+        name: "{{ selected_service }}"
+        state: stopped
+        enabled: no
+      failed_when: false
+      no_log: true
+      become: yes
+
+    - name: Remove package
+      apt:
+        name: "{{ selected_service }}"
+        state: absent
+        purge: yes
+        autoremove: yes
+      become: yes
+
+    - name: Remove all service directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ service_dirs[selected_service] }}"
+      become: yes
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      become: yes
+
+    - name: Clean package cache
+      apt:
+        clean: yes
+      become: yes
+      no_log: true
+  rescue:
+    - name: Log removal failure
+      set_fact:
+        removal_failed: true
+        failure_reason: "{{ ansible_failed_result.msg | default('Unknown error during removal') }}"
+
+- name: Generate removal report
+  block:
+    - name: Get final status
+      block:
+        - name: Check final package status
+          shell: "dpkg -l {{ selected_service }} || true"
+          register: final_pkg_status
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check final service status
+          shell: "systemctl status {{ selected_service }} || true"
+          register: final_service_status
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check remaining files
+          find:
+            paths: "{{ service_dirs[selected_service] }}"
+            file_type: any
+          register: remaining_files
+          become: yes
+          no_log: true          
+
+        - name: Store local status
+          set_fact:
+            host_final_status:
+              pkg_status: "{{ final_pkg_status.stdout | default('') }}"
+              service_status: "{{ final_service_status.stdout | default('') }}"
+              failed: "{{ removal_failed | default(false) }}"
+              failure_reason: "{{ failure_reason | default('') }}"
+              remaining_files: "{{ remaining_files.files | length }}"
+              remaining_file_list: "{{ remaining_files.files }}"
+          no_log: true              
+
+        - name: Initialize final status collection
+          set_fact:
+            final_status_info: {}
+          run_once: true
+          delegate_to: localhost
+          no_log: true          
+
+        - name: Aggregate host statuses
+          set_fact:
+            final_status_info: "{{ final_status_info | combine({inventory_hostname: host_final_status}) }}"
+          delegate_to: localhost
+
+        - name: Combine all final host statuses
+          set_fact:
+            final_status_info: "{{ final_status_info | combine({item: hostvars[item]['host_final_status']}) }}"
+          loop: "{{ ansible_play_hosts | difference([inventory_hostname]) }}"
+          run_once: true
+          delegate_to: localhost
+          when: ansible_play_hosts | difference([inventory_hostname]) | length > 0
+          no_log: true
+
+        - name: Create removal report
+          copy:
+            content: |
+              Final Removal Report
+              ===================
+              Command Details:
+              ---------------
+              Operation: Remove {{ selected_service | title }}
+              Target Selection: {{ ansible_limit }}
+              Target Hosts: {{ ansible_play_hosts | join(', ') }}
+
+              Component Details:
+              {% for host in ansible_play_hosts | sort %}
+              Host: {{ hostvars[host].ansible_host | default(host) }}
+              Status: {{ selected_service | title }} {% if (hostvars[host].host_final_status.remaining_files | int) > 0 %}needs cleanup{% else %}successfully removed{% endif %}
+
+              Current State:
+                Package Status: {{ hostvars[host].host_final_status.pkg_status if hostvars[host].host_final_status.pkg_status else 'Not installed' }}
+                Service Status: {{ hostvars[host].host_final_status.service_status if hostvars[host].host_final_status.service_status else 'Not found' }}
+                {% if hostvars[host].host_final_status.failed %}
+                Failed: Yes
+                Failure Reason: {{ hostvars[host].host_final_status.failure_reason }}
+                {% endif %}
+
+              {% if (hostvars[host].host_final_status.remaining_files | int) > 0 %}
+              Remaining Files ({{ hostvars[host].host_final_status.remaining_files }} found):
+              {% for file in hostvars[host].host_final_status.remaining_file_list %}
+                - {{ file.path }} ({{ (file.size / 1024 / 1024) | round(2) }} MB)
+              {% endfor %}
+              {% else %}
+              No remaining files found.
+              {% endif %}
+
+              {% endfor %}
+
+              Summary:
+              - Hosts with remaining files: {{ ansible_play_hosts | map('extract', hostvars) | map(attribute='host_final_status') | map(attribute='remaining_files') | map('int') | select('>', 0) | list | length }}
+              - Hosts completely cleaned: {{ ansible_play_hosts | map('extract', hostvars) | map(attribute='host_final_status') | map(attribute='remaining_files') | map('int') | select('==', 0) | list | length }}
+              {% set failed_hosts = ansible_play_hosts | map('extract', hostvars) | map(attribute='host_final_status') | selectattr('failed', 'defined') | selectattr('failed') | list %}
+              {% if failed_hosts | length > 0 %}
+              - Hosts with failures: {{ failed_hosts | length }}
+              {% endif %}
+
+              Execution completed at: {{ ansible_date_time.iso8601 }}
+            dest: "/tmp/final_removal_report.txt"
+          run_once: true
+          delegate_to: localhost
+
+    - name: Display removal report
+      debug:
+        msg: "{{ lookup('file', '/tmp/final_removal_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+  always:
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/service_removal_report.txt"
+        - "/tmp/final_removal_report.txt"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes
+      no_log: true      
