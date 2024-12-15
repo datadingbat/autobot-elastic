@@ -1,0 +1,479 @@
+---
+- name: Deploy Elasticsearch Master Nodes
+  hosts: master_nodes
+  gather_facts: yes
+  vars_files:
+    - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  tasks:
+    - name: Install Elasticsearch
+      block:
+        - name: Copy deb package
+          copy:
+            src: "{{ es_deb_package_path }}"
+            dest: "/tmp/elasticsearch.deb"
+            mode: '0644'
+          when: installation_method == 'local'
+
+        - name: Install Elasticsearch via APT
+          apt:
+            name: "elasticsearch{% if component_version != 'latest' %}={{ component_version }}{% endif %}"
+            state: "{{ 'latest' if component_version == 'latest' else 'present' }}"
+            allow_unauthenticated: no
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          when: installation_method == 'apt'
+
+        - name: Install from local package
+          apt:
+            deb: "/tmp/elasticsearch.deb"
+            state: present
+          when: installation_method == 'local'
+      become: yes
+
+    - name: Short pause after install
+      wait_for:
+        timeout: 5
+      delegate_to: localhost
+      run_once: true
+
+    - name: Set Elasticsearch directory permissions
+      file:
+        path: "{{ item }}"
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0750'
+        state: directory
+      loop:
+        - "/etc/elasticsearch"
+        - "{{ es_data_path }}"
+        - "{{ es_log_path }}"
+      when: installation_method == 'local' or installation_method == 'apt'
+      register: dir_perms
+      failed_when: false  # Don't fail if elasticsearch user doesn't exist yet
+      become: yes
+
+    - name: Short pause after perms
+      wait_for:
+        timeout: 5
+      delegate_to: localhost
+      run_once: true      
+
+    # Certificate Generation (First Master Only)
+    - name: Generate certificates on first master
+      block:
+        - name: Create certificates directory
+          file:
+            path: /etc/elasticsearch/certs
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Generate Transport CA certificate
+          command: >
+            /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+            --out "/etc/elasticsearch/certs/elastic-stack-ca.p12"
+            --pass "{{ es_cert_pass }}"
+          args:
+            creates: "/etc/elasticsearch/certs/elastic-stack-ca.p12"
+
+        - name: Generate Transport certificates for all nodes
+          command: >
+            /usr/share/elasticsearch/bin/elasticsearch-certutil cert 
+            --ca "/etc/elasticsearch/certs/elastic-stack-ca.p12"
+            --ca-pass "{{ es_cert_pass }}"
+            --out "/etc/elasticsearch/certs/elastic-certificates.p12"
+            --pass "{{ es_cert_pass }}"
+          args:
+            creates: "/etc/elasticsearch/certs/elastic-certificates.p12"
+
+        - name: Generate HTTP CA certificate
+          command: >
+            /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+            --out "/etc/elasticsearch/certs/elastic-http-ca.p12"
+            --pass "{{ es_cert_pass }}"
+          args:
+            creates: "/etc/elasticsearch/certs/elastic-http-ca.p12"
+
+        - name: Extract HTTP CA certificate as PEM
+          command: >
+            openssl pkcs12 -in /etc/elasticsearch/certs/elastic-http-ca.p12
+            -clcerts -nokeys -out /etc/elasticsearch/certs/elastic-http-ca.pem
+            -passin pass:"{{ es_cert_pass }}"
+          args:
+            creates: "/etc/elasticsearch/certs/elastic-http-ca.pem"
+
+        - name: Generate HTTP certificates for all nodes
+          command: >
+            /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+            --ca "/etc/elasticsearch/certs/elastic-http-ca.p12"
+            --ca-pass "{{ es_cert_pass }}"
+            --out "/etc/elasticsearch/certs/elastic-http.p12"
+            --pass "{{ es_cert_pass }}"
+          args:
+            creates: "/etc/elasticsearch/certs/elastic-http.p12"
+
+        # Extract additional required certificates
+        - name: Extract HTTP key and certificate from P12
+          shell: |
+            # Extract the private key
+            openssl pkcs12 -in /etc/elasticsearch/certs/elastic-http.p12 \
+              -nocerts -nodes \
+              -out /etc/elasticsearch/certs/elastic-http.key \
+              -passin pass:"{{ es_cert_pass }}"
+            
+            # Extract the certificate
+            openssl pkcs12 -in /etc/elasticsearch/certs/elastic-http.p12 \
+              -clcerts -nokeys \
+              -out /etc/elasticsearch/certs/elastic-http.pem \
+              -passin pass:"{{ es_cert_pass }}"
+
+        - name: Copy PEM to CRT format
+          copy:
+            src: /etc/elasticsearch/certs/elastic-http-ca.pem
+            dest: /etc/elasticsearch/certs/elastic-http-ca.crt
+            remote_src: yes
+            owner: root
+            group: elasticsearch
+            mode: '0640'
+
+        # Certificate Distribution
+        - name: Ensure certificates directory exists on localhost
+          file:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/certs"
+            state: directory
+            mode: '0700'
+            owner: "{{ lookup('env', 'USER') }}"
+            group: "{{ lookup('env', 'USER') }}"
+          delegate_to: localhost
+          become: no
+
+        - name: Fetch certificates to localhost
+          fetch:
+            src: "/etc/elasticsearch/certs/{{ item }}"
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/certs/"
+            flat: yes
+            mode: '0600'
+          with_items:
+            - elastic-certificates.p12
+            - elastic-http.p12
+            - elastic-http-ca.pem
+            - elastic-http-ca.crt
+            - elastic-http.key
+            - elastic-http.pem
+
+        - name: Verify certificates exist on localhost
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/certs/{{ item }}"
+          delegate_to: localhost
+          register: cert_check
+          with_items:
+            - elastic-certificates.p12
+            - elastic-http.p12
+            - elastic-http-ca.pem
+            - elastic-http-ca.crt
+
+        - name: Confirm all certificates were copied
+          assert:
+            that: "{{ cert_check.results | map(attribute='stat.exists') | list | unique | join('') == 'True' }}"
+            fail_msg: "One or more certificates were not copied successfully"
+            success_msg: "All certificates were copied successfully"
+          delegate_to: localhost
+      become: yes
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    # Certificate Distribution (Other Masters)
+    - name: Setup certificates on other masters
+      block:
+        - name: Create certificates directory
+          file:
+            path: /etc/elasticsearch/certs
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Copy certificates from localhost
+          copy:
+            src: "{{ lookup('env', 'HOME') }}/.elasticsearch/certs/{{ item }}"
+            dest: "/etc/elasticsearch/certs/{{ item }}"
+            owner: root
+            group: elasticsearch
+            mode: '0640'
+          with_items:
+            - elastic-certificates.p12
+            - elastic-http.p12
+            - elastic-http-ca.pem
+            - elastic-http-ca.crt
+      become: yes
+      when: inventory_hostname != groups['master_nodes'][0]
+
+    # Update keystore
+    - name: Update SSL passwords in keystore
+      shell: |
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password    
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.truststore.secure_password
+      become: yes
+
+    # Elasticsearch Configuration
+    - name: Configure Elasticsearch
+      block:
+        - name: Configure elasticsearch.yml
+          copy:
+            dest: /etc/elasticsearch/elasticsearch.yml
+            content: |
+              # Elasticsearch master node configuration
+              cluster.name: {{ cluster_name }}
+              node.name: {{ hostvars[inventory_hostname]['ansible_host'] }}
+              node.roles: [ master ]
+              
+              # Paths
+              path.data: {{ es_data_path }}
+              path.logs: {{ es_log_path }}
+              
+              # Network
+              network.host: {{ hostvars[inventory_hostname]['ansible_host'] }}
+              http.port: 9200
+              transport.port: 9300
+              
+              # Discovery
+              discovery.seed_hosts:
+              {% for host in groups['master_nodes'] %}
+                - {{ hostvars[host].ansible_host }}:9300
+              {% endfor %}
+              
+              cluster.initial_master_nodes:
+              {% for host in groups['master_nodes'] %}
+                - {{ hostvars[host].ansible_host }}
+              {% endfor %}
+              
+              # Security
+              xpack.security.enabled: true
+              xpack.security.enrollment.enabled: true
+              
+              xpack.security.http.ssl:
+                enabled: true
+                keystore.path: /etc/elasticsearch/certs/elastic-http.p12
+                truststore.path: /etc/elasticsearch/certs/elastic-http.p12
+                verification_mode: certificate
+                client_authentication: optional
+              
+              xpack.security.transport.ssl:
+                enabled: true
+                verification_mode: certificate
+                keystore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+                truststore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+                client_authentication: optional
+              
+              # System
+              bootstrap.memory_lock: true
+            owner: root
+            group: elasticsearch
+            mode: '0660'
+
+        # Fix directory permissions after all configuration
+        - name: Ensure Elasticsearch user owns required directories
+          file:
+            path: "{{ item }}"
+            owner: elasticsearch
+            group: elasticsearch
+            recurse: yes
+            state: directory
+          with_items:
+            - /etc/elasticsearch
+            - "{{ es_data_path }}"
+            - "{{ es_log_path }}"
+      become: yes            
+    
+    # System and Elasticsearch Tuning Tasks
+    - name: Apply system and elasticsearch tuning
+      block:
+        - name: Set heap size based on node type
+          set_fact:
+            heap_size: "{{ heap_sizes.master }}"
+
+        # Disable and persist swap settings
+        - name: Disable swap
+          command: swapoff -a
+          changed_when: false
+
+        - name: Disable swap in fstab
+          replace:
+            path: /etc/fstab
+            regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+            replace: '# \1'
+
+        # Configure system limits
+        - name: Configure memlock limits for elasticsearch
+          copy:
+            dest: /etc/security/limits.d/elasticsearch.conf
+            content: |
+              elasticsearch soft memlock unlimited
+              elasticsearch hard memlock unlimited
+              elasticsearch soft nproc 4096
+              elasticsearch hard nproc 4096
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Set system limits for Elasticsearch
+          lineinfile:
+            path: /etc/security/limits.conf
+            line: "{{ item }}"
+            create: yes
+          loop:
+            - "elasticsearch  -  nofile  65535"
+
+        # Configure virtual memory settings
+        - name: Set vm.max_map_count
+          sysctl:
+            name: vm.max_map_count
+            value: '262144'
+            state: present
+            sysctl_file: /etc/sysctl.d/elasticsearch.conf
+
+        - name: Set vm.swappiness
+          sysctl:
+            name: vm.swappiness
+            value: '1'
+            state: present
+            sysctl_file: /etc/sysctl.d/elasticsearch.conf
+
+        # Configure transparent hugepages
+        - name: Disable transparent hugepages
+          copy:
+            dest: /etc/systemd/system/disable-transparent-huge-pages.service
+            content: |
+              [Unit]
+              Description=Disable Transparent Huge Pages
+              DefaultDependencies=no
+              After=sysinit.target local-fs.target
+              Before=elasticsearch.service
+
+              [Service]
+              Type=oneshot
+              ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+              ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+              RemainAfterExit=yes
+
+              [Install]
+              WantedBy=sysinit.target
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Enable transparent hugepages service
+          systemd:
+            name: disable-transparent-huge-pages
+            enabled: yes
+            state: started
+            daemon_reload: yes
+
+        # Configure JVM options
+        - name: Create jvm.options.d directory
+          file:
+            path: /etc/elasticsearch/jvm.options.d
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Configure JVM heap size
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/heap.options
+            content: |
+              -Xms{{ heap_size }}g
+              -Xmx{{ heap_size }}g
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+
+        - name: Configure additional JVM options
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/custom.options
+            content: |
+              # GC configuration
+              -XX:+UseG1GC
+              -XX:G1ReservePercent=25
+              -XX:InitiatingHeapOccupancyPercent=30
+              
+              # JVM temporary directory
+              -Djava.io.tmpdir=${ES_TMPDIR}
+              
+              # DNS cache TTL
+              -Dnetworkaddress.cache.ttl=60
+              
+              # Heap dumps
+              -XX:+HeapDumpOnOutOfMemoryError
+              -XX:HeapDumpPath=/var/lib/elasticsearch
+              
+              # JVM fatal error logs
+              -XX:ErrorFile=/var/log/elasticsearch/hs_err_pid%p.log
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+
+        # Configure systemd service
+        - name: Set additional systemd service parameters
+          blockinfile:
+            path: /usr/lib/systemd/system/elasticsearch.service
+            insertafter: '^\[Service\]'
+            block: |
+              LimitMEMLOCK=infinity
+              LimitNOFILE=65535
+              LimitNPROC=4096
+            backup: yes
+
+        # Reload systemd for changes to take effect
+        - name: Reload systemd
+          systemd:
+            daemon_reload: yes
+
+      rescue:
+        - name: Log tuning failure
+          debug:
+            msg: "Failed to apply system tuning tasks"
+          failed_when: true
+      when: apply_system_tuning | bool
+      become: yes
+
+    - name: Start Elasticsearch service (This will take a minute)
+      systemd:
+        name: elasticsearch
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      become: yes
+
+- name: Wait for cluster formation and setup security
+  hosts: master_nodes
+  gather_facts: no
+  vars_files:
+    - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  tasks:
+    - name: Wait for all master nodes to start 
+      wait_for:
+        host: "{{ hostvars[item]['ansible_host'] }}"
+        port: 9200
+        timeout: 180
+      with_items: "{{ groups['master_nodes'] }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Forced 1-minute wait for cluster stabilization
+      wait_for:
+        timeout: 60
+      delegate_to: localhost
+      run_once: true
+
+    # Cleanup
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/elasticsearch.deb"
+      ignore_errors: yes
+      become: yes

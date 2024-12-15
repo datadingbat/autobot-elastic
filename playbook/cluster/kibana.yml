@@ -1,0 +1,176 @@
+---
+#cluster/kibana.yml
+- name: Deploy Kibana
+  hosts: kibana
+  gather_facts: yes
+  vars:
+    installation_method: "{{ hostvars['localhost']['deployment_vars']['installation_method'] }}"
+    component_version: "{{ hostvars['localhost']['deployment_vars']['component_version'] }}"
+    kibana_deb_package_path: "{{ hostvars['localhost']['deployment_vars']['kibana_deb_package_path'] }}"
+    es_cert_pass: "{{ hostvars['localhost']['deployment_vars']['es_cert_pass'] }}"
+    ansible_become: yes
+  vars_files:
+    - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  tasks:
+    - name: Install Kibana
+      block:
+        - name: Copy Kibana deb package
+          copy:
+            src: "{{ kibana_deb_package_path }}"
+            dest: "/tmp/kibana.deb"
+            mode: '0644'
+          when: installation_method == 'local'
+
+        - name: Install Kibana via APT
+          apt:
+            name: "kibana{% if component_version != 'latest' %}={{ component_version }}{% endif %}"
+            state: "{{ 'latest' if component_version == 'latest' else 'present' }}"
+            allow_unauthenticated: no
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          when: installation_method == 'apt'
+
+        - name: Install from local package
+          apt:
+            deb: "/tmp/kibana.deb"
+            state: present
+          when: installation_method == 'local'
+      become: yes
+
+    - name: Setup certificates
+      block:
+        - name: Create Kibana certificates directory
+          file:
+            path: /etc/kibana/certs
+            state: directory
+            owner: kibana
+            group: kibana
+            mode: '0750'
+
+        - name: Copy certificates from localhost
+          copy:
+            src: "{{ lookup('env', 'HOME') }}/.elasticsearch/certs/{{ item.src }}"
+            dest: "/etc/kibana/certs/{{ item.dest }}"
+            owner: kibana
+            group: kibana
+            mode: '0640'
+          with_items:
+            - { src: "elastic-http.p12", dest: "elastic-http.p12" }
+            - { src: "elastic-http-ca.pem", dest: "elastic-http-ca.pem" }
+            - { src: "elastic-http-ca.crt", dest: "elastic-http-ca.crt" }
+      become: yes
+
+    - name: Generate encryption keys
+      shell: /usr/share/kibana/bin/kibana-encryption-keys generate -q
+      register: encryption_keys
+      changed_when: false
+      become: yes
+
+    - name: Reset kibana_system user password
+      shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -b -f
+      register: kibana_password
+      delegate_to: "{{ groups['hot_nodes'][0] }}"
+      become: yes
+
+    - name: Debug es_cert_pass
+      debug:
+        msg: "es_cert_pass is {{ es_cert_pass }}"
+
+    - name: Configure Kibana
+      block:
+        - name: Set Kibana keystore passwords
+          shell: |
+            echo '{{ kibana_password.stdout.split("New value: ")[1] | trim }}' | /usr/share/kibana/bin/kibana-keystore add --stdin elasticsearch.password          
+            echo '{{ es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.keystore.password            
+            echo '{{ es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.truststore.password
+
+        - name: Configure kibana.yml
+          copy:
+            dest: /etc/kibana/kibana.yml
+            content: |
+              # Server configuration
+              server.host: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+              server.port: 5601
+              server.name: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+
+              # SSL Configuration
+              server.ssl.enabled: true
+              server.ssl.keystore.path: "/etc/kibana/certs/elastic-http.p12"
+              server.ssl.truststore.path: "/etc/kibana/certs/elastic-http.p12"
+
+              # Elasticsearch connection
+              elasticsearch.hosts:
+                {% for host in groups['hot_nodes'] %}
+                - "https://{{ hostvars[host].ansible_host }}:9200"
+                {% endfor %}
+              
+              elasticsearch.username: "kibana_system"
+              
+              elasticsearch.ssl.verificationMode: certificate
+              elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/elastic-http-ca.crt"]
+
+              # Generated encryption keys
+              {{ encryption_keys.stdout }}
+              
+              # Logging configuration
+              logging.root.level: info
+              logging.appenders.default:
+                type: file
+                fileName: /var/log/kibana/kibana.log
+                layout:
+                  type: json
+                        # Logging
+              elasticsearch.logQueries: true
+
+              # Monitoring
+              # monitoring.ui.container.elasticsearch.enabled: true
+            owner: kibana
+            group: kibana
+            mode: '0660'
+
+        - name: Create log directory
+          file:
+            path: /var/log/kibana
+            state: directory
+            owner: kibana
+            group: kibana
+            mode: '0755'
+
+        - name: Start Kibana service
+          systemd:
+            name: kibana
+            state: started
+            enabled: yes
+            daemon_reload: yes
+
+        - name: Wait for service stabilization
+          wait_for:
+            timeout: 30
+      become: yes
+
+    - name: Save Kibana credentials
+      block:
+        - name: Ensure elasticsearch directory exists
+          file:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+            state: directory
+            mode: '0700'
+          delegate_to: localhost
+
+        - name: Save Kibana password
+          copy:
+            content: "{{ kibana_password.stdout }}"
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/kibana_password.txt"
+            mode: '0600'
+          delegate_to: localhost
+
+    # Cleanup
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/kibana.deb"
+      ignore_errors: yes
+      become: yes
