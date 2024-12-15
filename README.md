@@ -103,27 +103,8 @@ aws cloudformation create-stack \
   --capabilities CAPABILITY_IAM
 ```
 
-4. (Optional) Update playbook/roles/elasticsearch/tasks/main.yml with custom values as needed
-* Find the stanza "Set certificate password fact" and change es_cert_pass if you want a custom value
-  * Note if you change es_cert_pass here, you also must change it in playbook/roles/kibana/tasks/main.yml with the same value
-* Find the stanza "Set s3 secret key fact" and change s3_client_secret_key to match your s3 provider (minIO, others) spec
-* Find the stanza "Set s3 access key fact" and change s3_client_access_key to match your s3 provider (minIO, others) spec
 
-```bash
-    - name: Set certificate password fact
-      set_fact:
-        es_cert_pass: "elastic2024"
-        
-    - name: Set s3 secret key fact
-      set_fact:
-        s3_client_secret_key: "sample_secret_key"  <---- UPDATE THIS
-
-    - name: Set s3 access key fact
-      set_fact:
-        s3_client_access_key: "sample_access_key"  <---- UPDATE THIS
-```
-
-5. Generate or modify inventory.ini:
+4. Generate or modify inventory.ini:
 * If you created your cluster manually, you should customize the sample playbook/inventory.ini with your cluster hostnames & private key file at the bottom
 * You must include the "ansible_host=" prefix as specified in the sample playbook/inventory.ini
 * If your cluster was built with Cloudformation in steps 2&3 above, run the provided script utils/gen-inventory.sh to generate inventory.ini based on EC2 tags
@@ -135,7 +116,7 @@ Modify this line in inventory.ini with the full path to your private key file:
 ansible_ssh_private_key_file=/home/ubuntu/.ssh/your-key.pem   <---- UPDATE THIS
 ```
 
-6. Set up SSH access on helper node:
+5. Set up SSH access on helper node:
 
 * Update the utils/config with your private key file name and inventory hostnames/IP-ranges
 * Copy the config file and private key to the Ansible (helper) node, and set permissions (pem file should be 400)
@@ -161,45 +142,25 @@ ssh -i your-key.pem ubuntu@<HELPER_NODE_IP>  <---- replace "your-key" and <HELPE
 ssh ubuntu@<MASTER_NODE_INTERNAL_IP>  <---- replace <MASTER_NODE__IP>
 ```
 
-7. (Optional) Customize the location where Elastic will store its data
-* By default, and as specified in /etc/elasticsearch/elasticsearch.yml, Elastic will store data in: /var/lib/elasticsearch/
-  * If you have a different location in mind (like a dedicated data array), you should modify playbook/roles/elasticsearch/tasks/main.yml:
-```bash
-# playbook/roles/elasticsearch/tasks/main.yml:
-
-    - name: Create initial elasticsearch settings
-      copy:
-        dest: /etc/elasticsearch/elasticsearch.yml
-        content: |
-          # Elasticsearch configuration
-          path.data: /var/lib/elasticsearch   <------ Change this value to the folder you want Elastic to store its data in
-          path.logs: /var/log/elasticsearch
-```
-
-
-8. Deploy with Ansible:
+6. Deploy a complete cluster (master+hot+frozen currently supported):
 ```bash
 cd playbook
-ansible-playbook -i inventory.ini playbook.yml
+ansible-playbook -i inventory.ini deploy_cluster.yml
 ```
+* Follow the prompts
 
-9. (Recommended) Environment Tuning:
-* utils/tuning.yml was written for Linux OS with systemd usage, and defines very large (128GB) Heap Size values
+7. Manage your cluster with the toolkit:
+```bash
+cd playbook
+ansible-playbook -i inventory.ini es-toolkit.yml
+```
+* Follow the prompts
+
+8. (Recommended) Environment Tuning:
+* Tuning is offered in both the deploy_cluster & es-toolkit playsbooks.
   * You should verify and modify references to "heap", "apt", and "systemd" in this file, as per your environment
-  * Heap size guidance can be found here: https://www.elastic.co/guide/en/elasticsearch/reference/current/advanced-configuration.html#set-jvm-heap-size
-```bash
-cd playbook
-ansible-playbook -i inventory.ini utils/tuning.yml
-```
-
-9. (Optional) Remove Elastic Components:
-* utils/remove-es.yml was written for Debian/Ubuntu OS with apt & systemd usage
-  * You may need to modify as per your environment
-```bash
-cd playbook
-ansible-playbook -i inventory.ini utils/remove-es.yml
-```
-
+  * Heap size guidance can be found here: https://www.elastic.co/guide/en/elasticsearch/reference/current/advanced-
+  
 ## Components
 
 ### Helper Node
@@ -260,20 +221,7 @@ aws cloudformation wait stack-delete-complete --stack-name autobot-elastic
 
 ## Project Structure
 ```
-autobot/
-├── cloudformation.yaml     # AWS infrastructure template
-├── generate-inventory.sh   # Script to generate Ansible inventory
-├── playbook/
-│   ├── inventory.ini      # Ansible inventory
-│   ├── playbook.yml       # Main playbook
-│   └── roles/
-│       ├── common/        # Common configurations
-│       ├── elasticsearch/ # Elasticsearch setup
-│       └── kibana/        # Kibana setup
-├── utils/
-│   ├── config             # .ssh/config example
-│   ├── remove-es.yml      # Cleanup playbook
-│   ├── tuning.yml         # OS Tuning playbook
+UPDATE ME
 ```
 
 #V2 Info
