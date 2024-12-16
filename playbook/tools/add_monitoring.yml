@@ -39,17 +39,26 @@
 
 - name: Main utility tasks
   block:
-    # Installation tasks
     - name: Install Elasticsearch
       block:
-        - name: Install Elasticsearch package
+        - name: Install Elasticsearch from local package
           apt:
-            name: elasticsearch=8.15.4
+            deb: "{{ es_deb_package_path }}" 
+            state: present
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          become: yes
+          when: installation_method == "local"
+
+        - name: Install Elasticsearch from apt repository
+          apt:
+            name: "elasticsearch={{ component_version }}"
             state: present
             update_cache: yes
           environment:
             DEBIAN_FRONTEND: noninteractive
           become: yes
+          when: installation_method == "apt"
 
         - name: Wait for installation to settle
           wait_for:
