@@ -1,0 +1,291 @@
+---
+# cluster_summary.yml
+
+# First define our variables
+- name: Set summary variables
+  set_fact:
+    deployment_dir: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+    services:
+      - elasticsearch
+      - kibana
+      - filebeat
+      - metricbeat
+    cert_files:
+      - elastic-http-ca.pem
+      - elastic-http.key
+      - elastic-http.pem
+      - elastic-certificates.p12
+      - elastic-http.p12
+      - elastic-http-ca.crt
+  delegate_to: localhost
+  run_once: true
+
+# Initialize the summary structure
+- name: Initialize summary data
+  set_fact:
+    cluster_summary:
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+      topology: {}
+      deployment: {}
+      services: {}
+      security: {}
+      resources: {}
+      alerts: []
+      recommendations: []
+  delegate_to: localhost
+  run_once: true
+
+# Load deployment info (on localhost)
+- name: Load deployment variables
+  include_vars:
+    file: "{{ deployment_dir }}/deployment_vars.yml"
+  ignore_errors: yes
+  delegate_to: localhost
+  run_once: true
+
+# Deployment info check (on localhost)
+- name: Gather deployment information
+  block:
+    - name: Check deployment artifacts
+      stat:
+        path: "{{ deployment_dir }}/{{ item }}"
+      register: artifact_check
+      with_items:
+        - deployment_vars.yml
+        - elastic_password.txt
+        - kibana_password.txt
+        - filebeat_output_apikey.txt
+        - metricbeat_remote_monitoring_user.txt
+        - monitoring_cluster_metricbeat_output_apikey.txt
+
+    - name: Store deployment info
+      set_fact:
+        cluster_summary: "{{ cluster_summary | combine({
+          'deployment': {
+            'installation_method': installation_method | default('unknown'),
+            'cluster_name': cluster_name | default('unknown'),
+            'data_path': es_data_path | default('/var/lib/elasticsearch'),
+            'log_path': es_log_path | default('/var/log/elasticsearch'),
+            'artifacts': {
+              'vars_file': artifact_check.results[0].stat.exists,
+              'elastic_password': artifact_check.results[1].stat.exists,
+              'kibana_password': artifact_check.results[2].stat.exists,
+              'filebeat_key': artifact_check.results[3].stat.exists,
+              'metricbeat_user': artifact_check.results[4].stat.exists,
+              'monitoring_key': artifact_check.results[5].stat.exists
+            }
+          }
+        }, recursive=True) }}"
+  delegate_to: localhost
+  run_once: true
+
+# Topology analysis (on localhost)
+- name: Analyze cluster topology
+  set_fact:
+    cluster_summary: "{{ cluster_summary | combine({
+      'topology': {
+        'master_nodes': groups['master_nodes'] | default([]) | length,
+        'hot_nodes': groups['hot_nodes'] | default([]) | length,
+        'frozen_nodes': groups['frozen_nodes'] | default([]) | length,
+        'kibana': groups['kibana'] | default([]) | length,
+        'monitoring_instance': groups['monitoring_instance'] | default([]) | length,
+        'helper_instance': groups['helper_instance'] | default([]) | length,
+        'total_hosts': groups['all'] | length
+      }
+    }, recursive=True) }}"
+  delegate_to: localhost
+  run_once: true
+
+# Certificate check (on localhost)
+- name: Check certificate status
+  block:
+    - name: Check cert directory
+      stat:
+        path: "{{ deployment_dir }}/certs"
+      register: cert_dir_check
+
+    - name: Check individual certificates
+      stat:
+        path: "{{ deployment_dir }}/certs/{{ item }}"
+      register: cert_checks
+      with_items: "{{ cert_files }}"
+      when: cert_dir_check.stat.exists
+
+    - name: Store certificate status
+      set_fact:
+        cluster_summary: "{{ cluster_summary | combine({
+          'security': {
+            'certificates': {
+              'directory_exists': cert_dir_check.stat.exists,
+              'files_present': cert_checks.results | selectattr('stat.exists', 'defined') | list | length,
+              'files_expected': cert_files | length
+            }
+          }
+        }, recursive=True) }}"
+  delegate_to: localhost
+  run_once: true
+
+# Service state collection (runs on all hosts)
+- name: Initialize service states collection
+  set_fact:
+    service_states: {}
+  delegate_to: localhost
+  run_once: true
+
+- name: Collect all service states
+  block:
+    - name: Get service state
+      include_tasks: tools/get_state.yml
+      vars:
+        selected_service: "{{ item }}"
+      loop: "{{ services }}"
+      
+    - name: Register host service states
+      set_fact:
+        host_service_states: "{{ host_service_states | default({}) | combine({
+          item: local_host_info
+        }) }}"
+      loop: "{{ services }}"
+      when: local_host_info is defined
+  
+    - name: Gather all host states
+      set_fact:
+        service_states: "{{ service_states | combine({
+          inventory_hostname: host_service_states
+        }, recursive=True) }}"
+      delegate_to: localhost
+      run_once: true
+
+# Process service states (on localhost)
+- name: Process service information
+  set_fact:
+    cluster_summary: "{{ cluster_summary | combine({
+      'services': {
+        item: {
+          'total': hosts_with_service | length,
+          'active': hosts_with_active | length,
+          'inactive': hosts_with_inactive | length,
+          'failed': hosts_with_failed | length,
+          'not_installed': (groups['all'] | length) - (hosts_with_service | length)
+        }
+      }
+    }, recursive=True) }}"
+  vars:
+    hosts_with_service: "{{ service_states.keys() | select('in', hostvars) | 
+                           list | select('contains', item) | list }}"
+    hosts_with_active: "{{ hosts_with_service | 
+                          select('match', '^.*state == \"active\".*$') | list }}"
+    hosts_with_inactive: "{{ hosts_with_service | 
+                            select('match', '^.*state == \"inactive\".*$') | list }}"
+    hosts_with_failed: "{{ hosts_with_service | 
+                          select('match', '^.*state == \"failed\".*$') | list }}"
+  loop: "{{ services }}"
+  delegate_to: localhost
+  run_once: true
+
+# Elasticsearch health check (on localhost)
+- name: Check Elasticsearch cluster health
+  block:
+    - name: Load elastic password
+      set_fact:
+        elastic_password: "{{ lookup('file', deployment_dir + '/elastic_password.txt') | trim }}"
+      no_log: true
+      when: artifact_check.results[1].stat.exists
+
+    - name: Get cluster health
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: es_health
+      when: elastic_password is defined
+      ignore_errors: yes
+
+    - name: Store Elasticsearch health
+      set_fact:
+        cluster_summary: "{{ cluster_summary | combine({
+          'elasticsearch': {
+            'health': es_health.json.status | default('unknown'),
+            'nodes': es_health.json.number_of_nodes | default(0),
+            'data_nodes': es_health.json.number_of_data_nodes | default(0),
+            'active_shards': es_health.json.active_shards | default(0),
+            'relocating_shards': es_health.json.relocating_shards | default(0),
+            'initializing_shards': es_health.json.initializing_shards | default(0),
+            'unassigned_shards': es_health.json.unassigned_shards | default(0)
+          }
+        }, recursive=True) }}"
+      when: es_health is success
+  delegate_to: localhost
+  run_once: true
+  ignore_errors: yes
+
+# Generate summary report (on localhost)
+- name: Create summary report
+  copy:
+    dest: "/tmp/cluster_summary_report.txt"
+    content: |
+      CLUSTER SUMMARY REPORT
+      =====================
+      Generated: {{ cluster_summary.timestamp }}
+
+      DEPLOYMENT INFORMATION
+      --------------------
+      Installation Method: {{ cluster_summary.deployment.installation_method }}
+      Cluster Name: {{ cluster_summary.deployment.cluster_name }}
+      Data Path: {{ cluster_summary.deployment.data_path }}
+      Log Path: {{ cluster_summary.deployment.log_path }}
+
+      TOPOLOGY
+      --------
+      Total Hosts: {{ cluster_summary.topology.total_hosts }}
+      Master Nodes: {{ cluster_summary.topology.master_nodes }}
+      Hot Nodes: {{ cluster_summary.topology.hot_nodes }}
+      Frozen Nodes: {{ cluster_summary.topology.frozen_nodes }}
+      Kibana Nodes: {{ cluster_summary.topology.kibana }}
+      Monitoring Instances: {{ cluster_summary.topology.monitoring_instance }}
+      Helper Instances: {{ cluster_summary.topology.helper_instance }}
+
+      SERVICE STATUS
+      -------------
+      {% for service, status in cluster_summary.services.items() %}
+      {{ service | title }}:
+        Total Installations: {{ status.total }}
+        Active: {{ status.active }}
+        Inactive: {{ status.inactive }}
+        Failed: {{ status.failed }}
+        Not Installed: {{ status.not_installed }}
+
+      {% endfor %}
+
+      {% if cluster_summary.elasticsearch is defined %}
+      ELASTICSEARCH CLUSTER HEALTH
+      --------------------------
+      Status: {{ cluster_summary.elasticsearch.health }}
+      Nodes: {{ cluster_summary.elasticsearch.nodes }}
+      Data Nodes: {{ cluster_summary.elasticsearch.data_nodes }}
+      Active Shards: {{ cluster_summary.elasticsearch.active_shards }}
+      Relocating Shards: {{ cluster_summary.elasticsearch.relocating_shards }}
+      Initializing Shards: {{ cluster_summary.elasticsearch.initializing_shards }}
+      Unassigned Shards: {{ cluster_summary.elasticsearch.unassigned_shards }}
+
+      {% endif %}
+  delegate_to: localhost
+  run_once: true
+
+- name: Display summary report
+  debug:
+    msg: "{{ lookup('file', '/tmp/cluster_summary_report.txt') | split('\n') }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Cleanup temporary files
+  file:
+    path: "/tmp/cluster_summary_report.txt"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  ignore_errors: yes

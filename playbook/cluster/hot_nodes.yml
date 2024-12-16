@@ -88,10 +88,6 @@
           changed_when: false
       become: yes
 
-    - name: Prompt again after showing details
-      pause:
-        prompt: "check"
-
     # Update keystore
     - name: Update SSL passwords in keystore
       shell: |

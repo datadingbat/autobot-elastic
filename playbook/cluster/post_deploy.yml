@@ -76,17 +76,16 @@
       delay: 10
       until: kibana_status.status == 200
 
-    # - name: Check SSL certificate validity
-    #   uri:
-    #     url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200"
-    #     method: GET
-    #     user: elastic
-    #     password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
-    #     force_basic_auth: yes
-    #     validate_certs: yes
-    #     ca_path: "/etc/elasticsearch/certs/elastic-http-ca.crt"
-    #     return_content: yes
-    #   register: ssl_check
+    - name: Check SSL connectivity
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: ssl_check
 
     - name: Generate deployment report
       copy:
@@ -179,10 +178,15 @@
           - Review node metrics above for any resource usage concerns
           - SSL certificates are stored in ~/.elasticsearch/certs/
           - Backup the credential files in a secure location
-
         dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_report.txt"
-        mode: '0600'
+        mode: '0644'
 
+    - name: Update the deployment report SSL section
+      replace:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_report.txt"
+        regexp: 'SSL/TLS: .*'
+        replace: 'SSL/TLS: {% if ssl_check.status == 200 %}✓ HTTPS Connectivity Confirmed{% else %}⚠ HTTPS Connection Failed{% endif %}'
+        
     - name: Display deployment report
       debug:
         msg: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/deployment_report.txt') | split('\n') }}"

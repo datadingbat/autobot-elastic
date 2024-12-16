@@ -12,7 +12,8 @@
       'tune': tune_service
       'backup': backup_component 
       'run_command': run_command     
-      'help': help_menu  
+      'help': help_menu 
+      'summary': cluster_summary 
     service_options:
       '1': elasticsearch
       '2': kibana
@@ -741,6 +742,7 @@
           2. Kibana
           3. Filebeat
           4. Metricbeat
+          5. Cluster Summary
           Enter the number of your choice:
       register: service_choice
       when: selected_utility in ['1', '2', '5']
@@ -750,7 +752,7 @@
         msg: "Invalid service selection. Please enter a number between 1 and 4."
       when: >
         selected_utility in ['1', '2', '5'] and 
-        service_choice.user_input not in ['1','2','3','4']
+        service_choice.user_input not in ['1','2','3','4','5']
 
     - name: Prompt for backup service selection
       pause:
@@ -769,10 +771,21 @@
         selected_service: "{{ service_options[backup_choice.user_input] }}"
       when: selected_utility == '7'  
 
-    - name: Set selected service
+    - name: Set selected service and utility file for summary
+      set_fact:
+        selected_service: "cluster_summary"
+        utility_file: "{{ utility_paths['summary'] }}"
+      when: selected_utility in ['1', '2', '5'] and service_choice.user_input == '5'
+
+    - name: Set limit for cluster summary
+      set_fact:
+        limit: "all"
+      when: selected_utility in ['1', '2', '5'] and service_choice.user_input == '5'
+
+    - name: Set selected service for regular services
       set_fact:
         selected_service: "{{ service_options[service_choice.user_input] }}"
-      when: selected_utility in ['1', '2', '5']
+      when: selected_utility in ['1', '2', '5'] and service_choice.user_input != '5'
 
     # Handle service to tune
     - name: Prompt for service to tune
@@ -829,7 +842,8 @@
           register: monitoring_host
           when: selected_utility == '3' and install_choice.user_input == '5'
 
-          # Standard target (utilities 1-6, 8)
+      
+        # Standard target (utilities 1-6, 8)
         - name: Prompt for standard target selection
           pause:
             prompt: |
@@ -843,8 +857,9 @@
           register: standard_target_type
           when: >
             selected_utility not in ['7','9'] and
-            not (selected_utility == '3' and install_choice.user_input == '5')
-
+            not (selected_utility == '3' and install_choice.user_input == '5') and
+            not (selected_service == 'cluster_summary')
+            
         # Backup target (utility 7)
         - name: Prompt for backup target selection
           pause:
@@ -1115,7 +1130,9 @@
                 (standard_target_type.user_input == '3' and final_host_input not in groups['all'])
           when: >
             selected_utility not in ['7','9'] and
-            not (selected_utility == '3' and install_choice.user_input == '5')
+            not (selected_utility == '3' and install_choice.user_input == '5') and
+            not (selected_service == 'cluster_summary') and
+            standard_target_type is defined
 
         # Handle backup targeting (utility 7)
         - name: Handle backup selection
@@ -1186,7 +1203,7 @@
       set_fact:
         selected_play_vars:
           utility_file: "{{ utility_file }}"
-          limit: "{{ limit }}"
+          limit: "{{ 'localhost' if selected_service == 'cluster_summary' else limit }}"
           selected_service: "{{ selected_service | default(omit) }}"
           target_state: "{{ target_state | default(omit) }}"
           installation_method: "{{ installation_method | default(omit) }}"

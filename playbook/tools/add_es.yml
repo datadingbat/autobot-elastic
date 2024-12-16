@@ -729,7 +729,7 @@
 
           Next Steps:
           -----------
-          1. Verify cluster health: Use this toolkit's "Get Service State " function.
+          1. Verify cluster health: curl -k https://[host]:9200/_cluster/health
           2. Set up additional security features if needed
           3. Configure monitoring if required
           4. Review logs at {{ final_paths.logs }}/elastic-cluster.log

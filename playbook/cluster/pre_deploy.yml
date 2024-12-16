@@ -214,8 +214,8 @@
 
         - name: Update paths if custom values provided
           set_fact:
-            es_data_path: "{{ data_path_input.user_input | default(es_data_path) }}"
-            es_log_path: "{{ log_path_input.user_input | default(es_log_path) }}"
+            es_data_path: "{{ data_path_input.user_input | default(es_data_path, true) }}"
+            es_log_path: "{{ log_path_input.user_input | default(es_log_path, true) }}"
       when: custom_paths_choice.user_input | lower == 'yes'
 
     - name: Calculate recommended heap sizes

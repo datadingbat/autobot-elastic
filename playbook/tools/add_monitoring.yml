@@ -307,7 +307,7 @@
 
 - name: Display installation report
   debug:
-    msg: "{{ lookup('file', '/tmp/es_install_report.txt') | split('\n') }}"
+    msg: "{{ lookup('file', '/tmp/monitoring_install_report.txt') | split('\n') }}"
   run_once: true
   delegate_to: localhost
 

@@ -76,6 +76,16 @@
         content: |
           Pre-Installation Status Report
           =============================
+          Installation Details:
+          -------------------
+          Component: Filebeat
+          Installation Method: {{ hostvars['localhost']['selected_play_vars']['installation_method'] }}
+          {% if hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt' %}
+          Version: {% if hostvars['localhost']['selected_play_vars']['component_version'] is defined %}{% if hostvars['localhost']['selected_play_vars']['component_version'] == 'latest' %}Latest available{% else %}{{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% endif %}{% else %}Not specified{% endif %}
+          {% else %}
+          Package Path: {{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}
+          {% endif %}
+
           Total Target Hosts: {{ ansible_play_hosts | length }}
 
           Hosts with Existing Installation (Will Skip):
