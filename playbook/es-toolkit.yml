@@ -857,8 +857,9 @@
           register: standard_target_type
           when: >
             selected_utility not in ['7','9'] and
-            not (selected_utility == '3' and install_choice.user_input == '5') and
-            not (selected_service == 'cluster_summary')
+            not (selected_utility == '3' and install_choice is defined and install_choice.user_input == '5') and
+            not (selected_utility == '8') and
+            not (selected_service is defined and selected_service == 'cluster_summary')
             
         # Backup target (utility 7)
         - name: Prompt for backup target selection
