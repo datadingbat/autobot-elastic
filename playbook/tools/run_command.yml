@@ -109,10 +109,19 @@
           run_once: true
           delegate_to: localhost
 
+        - name: Ask which user to run the custom command as (default is root)
+          pause:
+            prompt: |
+              Enter the user to run the command as (leave blank for root):
+          register: custom_command_user
+          run_once: true
+          delegate_to: localhost
+
         - name: Set command for custom execution
           set_fact:
             command_to_run: "{{ custom_command.user_input }}"
             operation_type: "custom"
+            custom_user: "{{ (custom_command_user.user_input|length > 0) | ternary(custom_command_user.user_input, 'root') }}"
       when: command_type_choice.user_input == "5"
 
     # Command validation
@@ -191,35 +200,34 @@
       run_once: true
       delegate_to: localhost
 
-# Command execution and reporting
-- name: Execute command
-  block:
-    # Pre-execution check
-    - name: Check if Elasticsearch is installed
-      stat:
-        path: /usr/share/elasticsearch/bin/elasticsearch-keystore
-      register: es_keystore
-      become: yes
-      when: command_type_choice.user_input in ["1", "2", "3", "4"]
+    # Command execution and reporting
+    - name: Execute command
+      block:
+        # Pre-execution check
+        - name: Check if Elasticsearch is installed
+          stat:
+            path: /usr/share/elasticsearch/bin/elasticsearch-keystore
+          register: es_keystore
+          become: yes
+          when: command_type_choice.user_input in ["1", "2", "3", "4"]
 
-    - name: Verify Elasticsearch installation
-      fail:
-        msg: "Elasticsearch keystore not found on {{ inventory_hostname }}"
-      when: >
-        command_type_choice.user_input in ["1", "2", "3", "4"] and
-        not es_keystore.stat.exists
-    
-    # Execute command
-    - name: Run command
-      shell: "{{ command_to_run }}"
-      register: command_result
-      become: yes
-      no_log: "{{ command_type_choice.user_input == '1' }}"
-      # Don't fail for keystore remove operations
-      failed_when: >
-        command_result.rc != 0 and not
-        (operation_type == 'keystore_delete' and command_result.rc == 78)
-    
+        - name: Verify Elasticsearch installation
+          fail:
+            msg: "Elasticsearch keystore not found on {{ inventory_hostname }}"
+          when: >
+            command_type_choice.user_input in ["1", "2", "3", "4"] and
+            not es_keystore.stat.exists
+        
+        # Execute command
+        - name: Run command
+          shell: >
+            sudo -u elasticsearch /bin/bash -c '{{ command_to_run }}'
+          register: command_result
+          #no_log: "{{ command_type_choice.user_input == '1' }}"
+          failed_when: >
+            command_result.rc != 0 and not
+            (operation_type == 'keystore_delete' and command_result.rc == 78)
+
     - name: Store execution result
       set_fact:
         execution_status:
