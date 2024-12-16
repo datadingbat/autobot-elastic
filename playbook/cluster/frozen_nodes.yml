@@ -151,25 +151,25 @@
               bootstrap.memory_lock: true
 
               # Frozen tier specific settings
-              node.store.allow_mmap: false
-              indices.memory.index_buffer_size: 10%
-              indices.queries.cache.size: 5%
+              #node.store.allow_mmap: false
+              #indices.memory.index_buffer_size: 10%
+              #indices.queries.cache.size: 5%
               
               # Optimize for read operations
-              indices.recovery.max_bytes_per_sec: 40mb
+              #indices.recovery.max_bytes_per_sec: 40mb
               
               # Disk usage thresholds
-              cluster.routing.allocation.disk.watermark.low: 95%
-              cluster.routing.allocation.disk.watermark.high: 97%
-              cluster.routing.allocation.disk.watermark.flood_stage: 98%
+              #cluster.routing.allocation.disk.watermark.low: 95%
+              #cluster.routing.allocation.disk.watermark.high: 97%
+              #cluster.routing.allocation.disk.watermark.flood_stage: 98%
               
               # Search settings for frozen indices
-              search.default_search_timeout: 60s
+              #search.default_search_timeout: 60s
               
               # Increase timeouts for frozen operations
-              cluster.routing.allocation.cluster_concurrent_rebalance: 2
-              cluster.routing.allocation.node_concurrent_recoveries: 2
-              cluster.routing.allocation.node_initial_primaries_recoveries: 4
+              #cluster.routing.allocation.cluster_concurrent_rebalance: 2
+              #cluster.routing.allocation.node_concurrent_recoveries: 2
+              #cluster.routing.allocation.node_initial_primaries_recoveries: 4
             owner: root
             group: elasticsearch
             mode: '0660'  
