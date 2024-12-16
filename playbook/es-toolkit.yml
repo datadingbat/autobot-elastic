@@ -1128,11 +1128,20 @@
               when: >
                 (standard_target_type.user_input == '2' and host_group_input.user_input not in groups) or
                 (standard_target_type.user_input == '3' and final_host_input not in groups['all'])
+
           when: >
             selected_utility not in ['7','9'] and
-            not (selected_utility == '3' and install_choice.user_input == '5') and
-            not (selected_service == 'cluster_summary') and
+            not (selected_utility == '3' and install_choice is defined and install_choice.user_input == '5') and
+            not (selected_service is defined and selected_service == 'cluster_summary') and
             standard_target_type is defined
+
+          # when: >
+          #   selected_utility not in ['7','9'] and
+          #   not (selected_utility == '3' and install_choice.user_input == '5') and
+          #   not (selected_service == 'cluster_summary') and
+          #   standard_target_type is defined
+            
+
 
         # Handle backup targeting (utility 7)
         - name: Handle backup selection
@@ -1203,7 +1212,7 @@
       set_fact:
         selected_play_vars:
           utility_file: "{{ utility_file }}"
-          limit: "{{ 'localhost' if selected_service == 'cluster_summary' else limit }}"
+          limit: "{{ 'localhost' if selected_service is defined and selected_service == 'cluster_summary' else limit }}"
           selected_service: "{{ selected_service | default(omit) }}"
           target_state: "{{ target_state | default(omit) }}"
           installation_method: "{{ installation_method | default(omit) }}"
