@@ -323,7 +323,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -381,7 +381,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -439,7 +439,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -499,7 +499,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -557,7 +557,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -615,7 +615,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -673,7 +673,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -733,7 +733,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -791,7 +791,7 @@ Resources:
     Type: AWS::EC2::Instance
     DependsOn: HelperNode
     Properties:
-      InstanceType: m6i.16xlarge	
+      InstanceType: m6i.xlarge	
       ImageId: !Ref UbuntuAMI
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
