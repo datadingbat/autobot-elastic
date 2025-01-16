@@ -161,6 +161,7 @@
           Key: {{ keystore_key_list.user_input }}
           {% else %}
           Command: {{ command_to_run }}
+          Execution User: {{ custom_user }}      
           {% endif %}
           
           Target Details:
@@ -218,15 +219,18 @@
             command_type_choice.user_input in ["1", "2", "3", "4"] and
             not es_keystore.stat.exists
         
-        # Execute command
-        - name: Run command
-          shell: >
-            sudo -u elasticsearch /bin/bash -c '{{ command_to_run }}'
-          register: command_result
-          #no_log: "{{ command_type_choice.user_input == '1' }}"
-          failed_when: >
-            command_result.rc != 0 and not
-            (operation_type == 'keystore_delete' and command_result.rc == 78)
+      # Execute command
+      - name: Run command
+        shell: >
+          {% if operation_type == 'custom' %}
+          sudo -u {{ custom_user }} /bin/bash -c '{{ command_to_run }}'
+          {% else %}
+          sudo -u elasticsearch /bin/bash -c '{{ command_to_run }}'
+          {% endif %}
+        register: command_result
+        failed_when: >
+          command_result.rc != 0 and not
+          (operation_type == 'keystore_delete' and command_result.rc == 78)
 
     - name: Store execution result
       set_fact:
@@ -266,6 +270,7 @@
           Key: {{ keystore_key_list.user_input }}
           {% else %}
           Command: {{ command_to_run }}
+          Execution User: {{ custom_user }}      
           {% endif %}
           
           Target Selection: {{ ansible_limit }}
