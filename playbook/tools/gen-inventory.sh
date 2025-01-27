@@ -16,6 +16,9 @@ SCRIPT_NAME=$(basename "$0")
 # Temp directory for intermediate files
 TEMP_DIR="/tmp/ansible_inventory_$$"
 
+# Project tag placeholder - MUST BE MODIFIED BY USER
+PROJECT_TAG='$your-project$'
+
 # Function for error handling
 error_exit() {
     echo "ERROR: $1" >&2
@@ -37,6 +40,22 @@ check_aws_credentials() {
     fi
 }
 
+# Function to validate project tag
+validate_project_tag() {
+    if [[ "$PROJECT_TAG" == '$your-project$' ]]; then
+        error_exit "Project tag has not been modified. Please replace '$PROJECT_TAG' with your actual project tag value."
+    fi
+    
+    if [[ -z "$PROJECT_TAG" ]]; then
+        error_exit "Project tag cannot be empty."
+    fi
+    
+    # Check if the project tag exists in AWS
+    if ! aws ec2 describe-tags --filters "Name=key,Values=project" "Name=value,Values=$PROJECT_TAG" --query 'Tags[0].Value' --output text 2>/dev/null | grep -q .; then
+        error_exit "No EC2 instances found with project tag '$PROJECT_TAG'. Please verify the tag value."
+    fi
+}
+
 # Create temporary directory
 create_temp_dir() {
     mkdir -p "$TEMP_DIR" || error_exit "Failed to create temporary directory"
@@ -45,7 +64,7 @@ create_temp_dir() {
 # Main function to fetch and process EC2 instances
 fetch_instances() {
     aws ec2 describe-instances \
-        --filters "Name=tag:project,Values=your-project" \
+        --filters "Name=tag:project,Values=$PROJECT_TAG" \
         --query 'Reservations[].Instances[].[
             Tags[?Key==`Name`].Value|[0],
             PrivateIpAddress
@@ -70,6 +89,9 @@ process_instances() {
                 ;;
             *"frozen"*)
                 echo "${name%.*} ansible_host=${name}" >> "$TEMP_DIR/frozen_nodes.txt"
+                ;;
+            *"ml"*)
+                echo "${name%.*} ansible_host=${name}" >> "$TEMP_DIR/ml_nodes.txt"
                 ;;
             *"helper"*)
                 echo "${name%.*} ansible_host=${name}" >> "$TEMP_DIR/helper_nodes.txt"
@@ -101,6 +123,9 @@ generate_inventory() {
         echo -e "\n[frozen_nodes]"
         [[ -f "$TEMP_DIR/frozen_nodes.txt" ]] && cat "$TEMP_DIR/frozen_nodes.txt"
         
+        echo -e "\n[ml_nodes]"
+        [[ -f "$TEMP_DIR/ml_nodes.txt" ]] && cat "$TEMP_DIR/ml_nodes.txt"
+
         echo -e "\n[helper_instance]"
         [[ -f "$TEMP_DIR/helper_nodes.txt" ]] && cat "$TEMP_DIR/helper_nodes.txt"
         
@@ -125,6 +150,7 @@ cleanup() {
 main() {
     check_aws_cli
     check_aws_credentials
+    validate_project_tag    
     create_temp_dir
     
     echo "Fetching EC2 instances..."
