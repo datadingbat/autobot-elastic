@@ -845,6 +845,124 @@ Resources:
           echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
           chmod 440 /etc/sudoers.d/ubuntu          
 
+  # EC2 Instances for ML Nodes
+
+  MLNode1:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: ml1.elastic.internal
+      PrivateDnsName: ml1.elastic.internal                       
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=jessem-autobot-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  MLNode2:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: ml2.elastic.internal
+      PrivateDnsName: ml2.elastic.internal                                 
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=jessem-autobot-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu          
+
   # Elastic Load Balancer for Elasticsearch
   ElasticsearchLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
@@ -1002,7 +1120,7 @@ Resources:
       ResourceRecords:
         - !GetAtt FrozenNode1.PrivateIp
 
-  FrozenNode2DNS:  # This was incorrectly named FrozenNode1DNS
+  FrozenNode2DNS:  
     Type: AWS::Route53::RecordSet
     Properties:
       HostedZoneId: !Ref PrivateHostedZone
@@ -1011,6 +1129,27 @@ Resources:
       TTL: '300'
       ResourceRecords:
         - !GetAtt FrozenNode2.PrivateIp
+
+  # DNS Records for ML Nodes
+  MLNode1DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: ml1.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt MLNode1.PrivateIp
+
+  MLNode2DNS:  
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: ml2.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt MLNode2.PrivateIp
 
   HelperNodeDNS:
     Type: AWS::Route53::RecordSet
