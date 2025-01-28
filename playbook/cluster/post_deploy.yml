@@ -75,6 +75,7 @@
       retries: 12
       delay: 10
       until: kibana_status.status == 200
+      when: "'kibana' in groups and groups['kibana'] | length > 0"
 
     - name: Check SSL connectivity
       uri:
@@ -124,9 +125,20 @@
           {% endfor %}
           {% endif %}
 
-          Kibana Node:
-          - {{ groups['kibana'][0] }} ({{ hostvars[groups['kibana'][0]].ansible_host }})
+          {% if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 %}
+          ML Nodes ({{ groups['ml_nodes'] | length }}):
+          {% for host in groups['ml_nodes'] %}
+          - {{ host }} ({{ hostvars[host].ansible_host }})
+          {% endfor %}
+          {% endif %}
+
+          {% if 'kibana' in groups and groups['kibana'] | length > 0 %}
+          Kibana Nodes ({{ groups['kibana'] | length }}):
+          {% for host in groups['kibana'] %}
+          - {{ host }} ({{ hostvars[host].ansible_host }})
+          {% endfor %}
           Status: {% if kibana_status.status == 200 %}✓ Active{% else %}⚠ Not Responding{% endif %}
+          {% endif %}          
 
           Cluster Health Details
           ---------------------
@@ -211,7 +223,9 @@
           
           Quick access:
           - Elasticsearch: https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200
+          {% if 'kibana' in groups and groups['kibana'] | length > 0 %}
           - Kibana: https://{{ kibana_host }}:5601
+          {% endif %}
           
           Credentials are stored in:
           - ~/.elasticsearch/elastic_password.txt
