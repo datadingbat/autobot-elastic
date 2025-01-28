@@ -11,7 +11,6 @@
       with_items:
         - master_nodes
         - hot_nodes
-        - kibana
 
     # Node count validations
     - name: Check master node count
@@ -23,11 +22,6 @@
       fail:
         msg: "Must have at least 1 hot node, found {{ groups['hot_nodes'] | length }}."
       when: groups['hot_nodes'] | length < 1
-
-    - name: Check Kibana node count
-      fail:
-        msg: "Must have exactly 1 Kibana node, found {{ groups['kibana'] | length }}."
-      when: groups['kibana'] | length != 1
 
     # Directory Setup
     - name: Create required directories
@@ -232,11 +226,26 @@
           delegate_to: "{{ groups['hot_nodes'][0] }}"
           run_once: true
 
+        - name: Get memory for frozen nodes
+          shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+          register: frozen_ram
+          delegate_to: "{{ groups['frozen_nodes'][0] }}"
+          run_once: true
+          when: "'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0"
+
+        - name: Get memory for ML nodes
+          shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+          register: ml_ram
+          delegate_to: "{{ groups['ml_nodes'][0] }}"
+          run_once: true
+          when: "'ml_nodes' in groups and groups['ml_nodes'] | length > 0"
+
         - name: Calculate recommended heap sizes
           set_fact:
             master_heap: "{{ [(master_ram.stdout|int / 2)|round|int, 128|int]|min }}"
             hot_heap: "{{ [(hot_ram.stdout|int / 2)|round|int, 128|int]|min }}"
-            frozen_heap: "{{ [(hot_ram.stdout|int / 2)|round|int, 128|int]|min if 'frozen_nodes' in groups else 0 }}"
+            frozen_heap: "{{ [(frozen_ram.stdout|int / 2)|round|int, 128|int]|min if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 else 0 }}"
+            ml_heap: "{{ [(ml_ram.stdout|int / 2)|round|int, 128|int]|min if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 else 0 }}"
 
         - name: Prompt for system tuning
           pause:
@@ -246,8 +255,11 @@
               JVM Heap Sizes (calculated based on 50% of available RAM):
               - Master Nodes: {{ master_heap }}GB (assumes all master nodes have {{ master_ram.stdout }}GB RAM)
               - Hot Nodes: {{ hot_heap }}GB (assumes all hot nodes have {{ hot_ram.stdout }}GB RAM)
-              {% if 'frozen_nodes' in groups %}
-              - Frozen Nodes: {{ frozen_heap }}GB (assumes all frozen nodes have {{ hot_ram.stdout }}GB RAM)
+              {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+              - Frozen Nodes: {{ frozen_heap }}GB (assumes all frozen nodes have {{ frozen_ram.stdout }}GB RAM)
+              {% endif %}
+              {% if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 %}
+              - ML Nodes: {{ ml_heap }}GB (assumes all ML nodes have {{ ml_ram.stdout }}GB RAM)
               {% endif %}
               
               Do you want to:
@@ -341,11 +353,18 @@
               register: custom_frozen_heap
               when: "'frozen_nodes' in groups"
 
+            - name: Get ml heap
+              pause:
+                prompt: "Enter heap size for ML nodes in GB (current recommendation: {{ ml_heap }}GB):"
+              register: custom_ml_heap
+              when: "'ml_nodes' in groups"              
+
             - name: Set custom heap values
               set_fact:
                 master_heap: "{{ custom_master_heap.user_input }}"
                 hot_heap: "{{ custom_hot_heap.user_input }}"
                 frozen_heap: "{{ custom_frozen_heap.user_input if 'frozen_nodes' in groups else 0 }}"
+                ml_heap: "{{ custom_ml_heap.user_input if 'ml_nodes' in groups else 0 }}"
           when: final_tuning_choice.user_input == '2'
 
         - name: Set tuning facts
@@ -355,6 +374,7 @@
               master: "{{ master_heap }}"
               hot: "{{ hot_heap }}"
               frozen: "{{ frozen_heap if 'frozen_nodes' in groups else 0 }}"
+              ml: "{{ ml_heap if 'ml_nodes' in groups else 0 }}"              
 
     # Security Configuration
     - name: Prompt for password management
@@ -438,7 +458,8 @@
           heap_sizes:
             master: {{ heap_sizes.master }}
             hot: {{ heap_sizes.hot }}
-            frozen: {{ heap_sizes.frozen }}
+            frozen: {{ heap_sizes.frozen if 'frozen_nodes' in groups else 0 }}
+            ml: {{ heap_sizes.ml if 'ml_nodes' in groups else 0 }}
 
         dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
         mode: '0600'
@@ -469,10 +490,19 @@
           {% endfor %}
           {% endif %}
 
-          Kibana Node:
+          {% if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 %}
+          ML Nodes ({{ groups['ml_nodes'] | length }}):
+          {% for host in groups['ml_nodes'] %}
+          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+          {% endfor %}
+          {% endif %}
+
+          {% if 'kibana' in groups and groups['kibana'] | length > 0 %}
+          Kibana Nodes ({{ groups['kibana'] | length }}):
           {% for host in groups['kibana'] %}
           - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
           {% endfor %}
+          {% endif %}
 
           Installation Details
           -------------------
@@ -501,11 +531,15 @@
           {% if 'frozen_nodes' in groups %}
           - Frozen Nodes: {{ heap_sizes.frozen }}GB
           {% endif %}
+          {% if 'ml_nodes' in groups %}
+          - ML Nodes: {{ heap_sizes.ml }}GB          
           {% endif %}
-
+          {% endif %}
+          
           Security Configuration
           ---------------------
           Password Management: {% if passwords_generated %}Auto-generated secure passwords{% else %}Custom password provided{% endif %}
+          
         dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/pre_deploy_summary.txt"
         mode: '0600'
 
