@@ -1,6 +1,6 @@
 ---
 - name: Configure All Nodes
-  hosts: master_nodes,hot_nodes,frozen_nodes,kibana
+  hosts: master_nodes,hot_nodes,frozen_nodes,ml_nodes,kibana
   gather_facts: yes
   vars_files:
     - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
