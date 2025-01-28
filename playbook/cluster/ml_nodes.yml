@@ -1,0 +1,347 @@
+---
+- name: Deploy Elasticsearch ML Nodes
+  hosts: ml_nodes
+  gather_facts: yes
+  vars_files:
+    - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"    
+  tasks:
+    - name: Install Elasticsearch
+      block:
+        - name: Copy deb package
+          copy:
+            src: "{{ es_deb_package_path }}"
+            dest: "/tmp/elasticsearch.deb"
+            mode: '0644'
+          when: installation_method == 'local'
+
+        - name: Install Elasticsearch via APT
+          apt:
+            name: "elasticsearch{% if component_version != 'latest' %}={{ component_version }}{% endif %}"
+            state: "{{ 'latest' if component_version == 'latest' else 'present' }}"
+            allow_unauthenticated: no
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          when: installation_method == 'apt'
+
+        - name: Install from local package
+          apt:
+            deb: "/tmp/elasticsearch.deb"
+            state: present
+          when: installation_method == 'local'
+      become: yes
+
+    - name: Short pause after install
+      wait_for:
+        timeout: 10
+      delegate_to: localhost
+      run_once: true
+
+    - name: Set Elasticsearch directory permissions
+      file:
+        path: "{{ item }}"
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0750'
+        state: directory
+      loop:
+        - "/etc/elasticsearch"
+        - "{{ es_data_path }}"
+        - "{{ es_log_path }}"
+      when: installation_method == 'local' or installation_method == 'apt'
+      register: dir_perms
+      failed_when: false  # Don't fail if elasticsearch user doesn't exist yet
+      become: yes
+
+    - name: Short pause after perms
+      wait_for:
+        timeout: 10
+      delegate_to: localhost
+      run_once: true
+
+    - name: Setup certificates
+      block:
+        - name: Create certificates directory
+          file:
+            path: /etc/elasticsearch/certs
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Copy certificates from localhost
+          copy:
+            src: "{{ lookup('env', 'HOME') }}/.elasticsearch/certs/{{ item }}"
+            dest: "/etc/elasticsearch/certs/{{ item }}"
+            owner: root
+            group: elasticsearch
+            mode: '0640'
+          with_items:
+            - elastic-certificates.p12
+            - elastic-http.p12
+            - elastic-http-ca.pem
+            - elastic-http-ca.crt
+
+        # Verify certificate password
+        - name: Verify certificate password
+          shell: |
+            openssl pkcs12 -in /etc/elasticsearch/certs/elastic-certificates.p12 -nodes -passin pass:"{{ es_cert_pass }}" > /dev/null
+          changed_when: false
+      become: yes
+
+    # Update keystore
+    - name: Update SSL passwords in keystore
+      shell: |
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password    
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
+        echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.truststore.secure_password
+      become: yes
+
+    # Elasticsearch Configuration
+    - name: Configure Elasticsearch
+      block:
+        - name: Configure elasticsearch.yml
+          copy:
+            dest: /etc/elasticsearch/elasticsearch.yml
+            content: |
+              # Elasticsearch ML node configuration
+              cluster.name: {{ cluster_name }}
+              node.name: {{ hostvars[inventory_hostname]['ansible_host'] }}
+              node.roles: [ ml, remote_cluster_client ]
+              
+              # Paths
+              path.data: {{ es_data_path }}
+              path.logs: {{ es_log_path }}
+              
+              # Network
+              network.host: {{ hostvars[inventory_hostname]['ansible_host'] }}
+              http.port: 9200
+              transport.port: 9300
+              
+              # Discovery
+              discovery.seed_hosts:
+              {% for host in groups['master_nodes'] %}
+                - {{ hostvars[host].ansible_host }}:9300
+              {% endfor %}
+              
+              # Security
+              xpack.security.enabled: true
+              xpack.security.enrollment.enabled: true
+              
+              xpack.security.http.ssl:
+                enabled: true
+                keystore.path: /etc/elasticsearch/certs/elastic-http.p12
+                truststore.path: /etc/elasticsearch/certs/elastic-http.p12
+                verification_mode: certificate
+                client_authentication: optional
+              
+              xpack.security.transport.ssl:
+                enabled: true
+                verification_mode: certificate
+                keystore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+                truststore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+                client_authentication: optional
+              
+              # System
+              bootstrap.memory_lock: true
+
+              # Performance settings
+              # indices.memory.index_buffer_size: 30%
+              # indices.queries.cache.size: 15%
+              
+              # ML node specific settings
+              xpack.ml.enabled: true
+
+            owner: root
+            group: elasticsearch
+            mode: '0660'
+
+        # Fix directory permissions after all configuration
+        - name: Ensure Elasticsearch user owns required directories
+          file:
+            path: "{{ item }}"
+            owner: elasticsearch
+            group: elasticsearch
+            recurse: yes
+            state: directory
+          with_items:
+            - /etc/elasticsearch
+            - "{{ es_data_path }}"
+            - "{{ es_log_path }}"
+      become: yes            
+    
+    # System and Elasticsearch Tuning Tasks
+    - name: Apply system and elasticsearch tuning
+      block:
+
+        - name: Set heap size based on node type
+          set_fact:
+            heap_size: "{{ heap_sizes.ml }}"
+
+        # Disable and persist swap settings
+        - name: Disable swap
+          command: swapoff -a
+          changed_when: false
+
+        - name: Disable swap in fstab
+          replace:
+            path: /etc/fstab
+            regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+            replace: '# \1'
+
+        # Configure system limits
+        - name: Configure memlock limits for elasticsearch
+          copy:
+            dest: /etc/security/limits.d/elasticsearch.conf
+            content: |
+              elasticsearch soft memlock unlimited
+              elasticsearch hard memlock unlimited
+              elasticsearch soft nproc 4096
+              elasticsearch hard nproc 4096
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Set system limits for Elasticsearch
+          lineinfile:
+            path: /etc/security/limits.conf
+            line: "{{ item }}"
+            create: yes
+          loop:
+            - "elasticsearch  -  nofile  65535"
+
+        # Configure virtual memory settings
+        - name: Set vm.max_map_count
+          sysctl:
+            name: vm.max_map_count
+            value: '262144'
+            state: present
+            sysctl_file: /etc/sysctl.d/elasticsearch.conf
+
+        - name: Set vm.swappiness
+          sysctl:
+            name: vm.swappiness
+            value: '1'
+            state: present
+            sysctl_file: /etc/sysctl.d/elasticsearch.conf
+
+        # Configure transparent hugepages
+        - name: Disable transparent hugepages
+          copy:
+            dest: /etc/systemd/system/disable-transparent-huge-pages.service
+            content: |
+              [Unit]
+              Description=Disable Transparent Huge Pages
+              DefaultDependencies=no
+              After=sysinit.target local-fs.target
+              Before=elasticsearch.service
+
+              [Service]
+              Type=oneshot
+              ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+              ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+              RemainAfterExit=yes
+
+              [Install]
+              WantedBy=sysinit.target
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Enable transparent hugepages service
+          systemd:
+            name: disable-transparent-huge-pages
+            enabled: yes
+            state: started
+            daemon_reload: yes
+
+        # Configure JVM options
+        - name: Create jvm.options.d directory
+          file:
+            path: /etc/elasticsearch/jvm.options.d
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Configure JVM heap size
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/heap.options
+            content: |
+              -Xms{{ heap_size }}g
+              -Xmx{{ heap_size }}g
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+
+        - name: Configure additional JVM options
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/custom.options
+            content: |
+              # GC configuration
+              -XX:+UseG1GC
+              -XX:G1ReservePercent=25
+              -XX:InitiatingHeapOccupancyPercent=30
+              
+              # JVM temporary directory
+              -Djava.io.tmpdir=${ES_TMPDIR}
+              
+              # DNS cache TTL
+              -Dnetworkaddress.cache.ttl=60
+              
+              # Heap dumps
+              -XX:+HeapDumpOnOutOfMemoryError
+              -XX:HeapDumpPath=/var/lib/elasticsearch
+              
+              # JVM fatal error logs
+              -XX:ErrorFile=/var/log/elasticsearch/hs_err_pid%p.log
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+
+        # Configure systemd service
+        - name: Set additional systemd service parameters
+          blockinfile:
+            path: /usr/lib/systemd/system/elasticsearch.service
+            insertafter: '^\[Service\]'
+            block: |
+              LimitMEMLOCK=infinity
+              LimitNOFILE=65535
+              LimitNPROC=4096
+            backup: yes
+
+        # Reload systemd for changes to take effect
+        - name: Reload systemd
+          systemd:
+            daemon_reload: yes
+
+      rescue:
+        - name: Log tuning failure
+          debug:
+            msg: "Failed to apply system tuning tasks"
+          failed_when: true
+      when: apply_system_tuning | bool
+      become: yes
+
+    - name: Start Elasticsearch service
+      systemd:
+        name: elasticsearch
+        state: started
+        enabled: yes
+      become: yes
+
+    - name: Forced 2-minute wait for cluster stabilization
+      wait_for:
+        timeout: 120
+      delegate_to: localhost
+      run_once: true
+
+    # Cleanup
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/elasticsearch.deb"
+      ignore_errors: yes
+      become: yes
