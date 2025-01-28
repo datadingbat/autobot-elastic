@@ -111,8 +111,58 @@
         msg: "Frozen nodes joining {{ 'complete' if cluster_health.status == 200 else 'still in progress' }}"
       when: hostvars['localhost']['deploy_frozen_nodes'] | default(false)
 
+- name: Set ML Nodes Deployment Flag
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Set ml nodes deployment flag
+      set_fact:
+        deploy_ml_nodes: "{{ groups['ml_nodes'] is defined and groups['ml_nodes'] | length > 0 }}"
+
+- name: Deploy ML Nodes
+  import_playbook: cluster/ml_nodes.yml
+  when: hostvars['localhost']['deploy_ml_nodes'] | default(false)
+
+- name: Wait for ML Nodes
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Wait for ML nodes to join cluster
+      uri:
+        url: "https://{{ hostvars[groups['master_nodes'][0]].ansible_host }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: cluster_health
+      until: >
+        cluster_health.status == 200 and
+        cluster_health.json.number_of_nodes == (groups['master_nodes'] | length + 
+                                              groups['hot_nodes'] | length +
+                                              groups['ml_nodes'] | length)
+      retries: 20
+      delay: 5
+      ignore_errors: yes
+      when: hostvars['localhost']['deploy_ml_nodes'] | default(false)
+
+    - name: Show cluster status after ML nodes
+      debug:
+        msg: "ML nodes joining {{ 'complete' if cluster_health.status == 200 else 'still in progress' }}"
+      when: hostvars['localhost']['deploy_ml_nodes'] | default(false)
+
+- name: Set Kibana Deployment Flag
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Set kibana deployment flag
+      set_fact:
+        deploy_kibana: "{{ groups['kibana'] is defined and groups['kibana'] | length > 0 }}"
+
 - name: Deploy Kibana
   import_playbook: cluster/kibana.yml
+  when: hostvars['localhost']['deploy_kibana'] | default(false)
 
 - name: Post-Deployment Verification and Report
   import_playbook: cluster/post_deploy.yml
