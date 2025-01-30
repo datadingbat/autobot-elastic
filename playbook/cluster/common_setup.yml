@@ -6,37 +6,6 @@
     - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
   tasks:
 
-    - name: Display prerequisites for local installation
-      debug:
-        msg: |
-          Checking prerequisites for local .deb package installation:
-          - gnupg
-          - curl
-          - wget
-      when: installation_method == 'local'
-
-    - name: Check prerequisites for local installation
-      package:
-        name: "{{ item }}"
-        state: present
-      register: pkg_check
-      check_mode: yes
-      with_items:
-        - gnupg
-        - curl
-        - wget
-      when: installation_method == 'local'
-      become: yes
-      no_log: true
-
-    - name: Fail if prerequisites are missing for local installation
-      fail:
-        msg: "Missing required package: {{ item.item }}. Please install it manually."
-      when: 
-        - installation_method == 'local'
-        - item.changed
-      with_items: "{{ pkg_check.results }}"
-
     - name: Configure APT prerequisites
       block:
         - name: Ensure apt-transport-https is installed
