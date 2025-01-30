@@ -683,20 +683,36 @@
         mode: '0660'
       no_log: true
 
-    - name: Set Elasticsearch directory permissions
-      file:
-        path: "{{ item }}"
-        owner: elasticsearch
-        group: elasticsearch
-        mode: '0750'
-        state: directory
-        recurse: yes    
-      loop:
-        - "/etc/elasticsearch"
-        - "/var/lib/elasticsearch"
-        - "/var/log/elasticsearch"
-      register: dir_perms
-      failed_when: false  # Don't fail if elasticsearch user doesn't exist yet
+    - name: Create and set permissions for Elasticsearch directories
+      block:
+        - name: Create custom data directory if not exists
+          file:
+            path: "{{ final_paths.data }}"
+            state: directory
+            mode: '0750'
+          when: final_paths.data != '/var/lib/elasticsearch'
+    
+        - name: Create custom log directory if not exists
+          file:
+            path: "{{ final_paths.logs }}"
+            state: directory
+            mode: '0750'
+          when: final_paths.logs != '/var/log/elasticsearch'
+    
+        - name: Set Elasticsearch directory permissions
+          file:
+            path: "{{ item }}"
+            owner: elasticsearch
+            group: elasticsearch
+            mode: '0750'
+            state: directory
+            recurse: yes    
+          loop:
+            - "/etc/elasticsearch"
+            - "{{ final_paths.data }}"
+            - "{{ final_paths.logs }}"
+          register: dir_perms
+          failed_when: false  # Don't fail if elasticsearch user doesn't exist yet
       become: yes
 
     # Verify certificate permissions before starting
