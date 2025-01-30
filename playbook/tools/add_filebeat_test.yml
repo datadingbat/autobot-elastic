@@ -390,14 +390,14 @@
               fields:
                 host.name: "{{ inventory_hostname }}"
                 agent.hostname: "{{ inventory_hostname }}"
-
+        
               filebeat.inputs:
               - type: filestream
                 id: var-log
                 enabled: false
                 paths:
                   - /var/log/*.log
-
+        
               logging.level: warning
               logging.to_files: true
               logging.files:
@@ -405,15 +405,16 @@
                 name: filebeat
                 keepfiles: 10
                 permissions: 0644
-
+        
               filebeat.config.modules:
                 path: /etc/filebeat/modules.d/*.yml
                 reload.enabled: false
-
+        
               setup.template.settings:
                 index.number_of_shards: 1
                 index.codec: best_compression
-
+        
+              {% if 'kibana' in groups %}
               setup.kibana:
                 host: "https://{{ hostvars[groups['kibana'][0]].ansible_host }}:5601"
                 ssl.enabled: true
@@ -421,7 +422,8 @@
                 ssl.certificate_authorities: ["/etc/filebeat/certs/elastic-http-ca.pem"]
                 ssl.certificate: "/etc/filebeat/certs/elastic-http.pem"
                 ssl.key: "/etc/filebeat/certs/elastic-http.key"
-
+              {% endif %}
+        
               output.elasticsearch:
                 hosts: ["https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200"]
                 api_key: "{{ filebeat_api_key }}"
@@ -429,14 +431,13 @@
                 ssl.certificate_authorities: ["/etc/filebeat/certs/elastic-http-ca.pem"]
                 ssl.certificate: "/etc/filebeat/certs/elastic-http.pem"
                 ssl.key: "/etc/filebeat/certs/elastic-http.key"
-
+        
               processors:
                 - add_host_metadata:
                     when.not.contains.tags: forwarded
             mode: '0644'
             owner: root
             group: root
-
         # Module configuration
         - name: Enable system module
           command: "filebeat modules enable system"
