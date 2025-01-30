@@ -369,7 +369,7 @@
 
         - name: Set tuning facts
           set_fact:
-            apply_system_tuning: "{{ final_tuning_choice.user_input == '1' }}"
+            apply_system_tuning: "{{ final_tuning_choice.user_input != '3' }}"
             heap_sizes:
               master: "{{ master_heap }}"
               hot: "{{ hot_heap }}"
