@@ -135,28 +135,94 @@
           {%- endif -%}
 
     # Try to get config from existing nodes but don't require it
-    - name: Attempt to read existing configuration
-      block:
-        - name: Check for viable existing nodes
-          set_fact:
-            existing_viable_nodes: "{{ existing_nodes | difference([inventory_hostname]) }}"
-          
-        - name: Read elasticsearch.yml from existing node
-          slurp:
-            src: /etc/elasticsearch/elasticsearch.yml
-          register: es_config_file
-          delegate_to: "{{ existing_viable_nodes | first }}"
-          when: >
-            existing_viable_nodes | length > 0 and
-            existing_viable_nodes | first is defined
-          ignore_errors: yes
+- name: Handle reference node selection
+  block:
+    - name: List available hot nodes
+      debug:
+        msg: |
+          Available hot nodes:
+          {% for host in groups['hot_nodes'] %}
+          - {{ host }}
+          {% endfor %}
+      run_once: true
+      delegate_to: localhost
 
-        - name: Extract paths if config found
-          set_fact:
-            existing_paths:
-              data: "{{ (es_config_file.content | b64decode | regex_findall('path.data: (.+)') | first) if es_config_file is defined and es_config_file.content is defined else '' }}"
-              logs: "{{ (es_config_file.content | b64decode | regex_findall('path.logs: (.+)') | first) if es_config_file is defined and es_config_file.content is defined else '' }}"
-          when: es_config_file is defined and es_config_file.content is defined
+    - name: Prompt for reference node
+      pause:
+        prompt: |
+          Enter the hostname of a working Elasticsearch node to use as reference.
+          This node should have a working Elasticsearch installation.
+          The configuration from this node will be used as a template.
+          
+          Enter hostname (or press enter to skip):
+      register: reference_node_input
+      run_once: true
+      delegate_to: localhost
+
+    - name: Skip reference node if no input
+      set_fact:
+        skip_reference: "{{ reference_node_input.user_input | default('') == '' }}"
+      run_once: true
+
+    - name: Validate reference node if provided
+      fail:
+        msg: "The specified reference node '{{ reference_node_input.user_input }}' was not found in the hot_nodes group"
+      when: 
+        - not skip_reference
+        - reference_node_input.user_input not in groups['hot_nodes']
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set reference node fact if provided
+      set_fact:
+        reference_node: "{{ reference_node_input.user_input }}"
+      when: not skip_reference
+      run_once: true
+
+- name: Attempt to read existing configuration
+  block:
+    - name: Check directory access on reference node
+      stat:
+        path: /etc/elasticsearch
+      register: es_dir
+      delegate_to: "{{ reference_node }}"
+      become: yes
+      ignore_errors: yes
+      when: not skip_reference
+
+    - name: Read elasticsearch.yml from reference node
+      slurp:
+        src: /etc/elasticsearch/elasticsearch.yml
+      register: es_config_file
+      delegate_to: "{{ reference_node }}"
+      become: yes
+      when: 
+        - not skip_reference
+        - es_dir.stat is defined 
+        - es_dir.stat.exists
+      ignore_errors: yes
+
+    - name: Debug configuration read status
+      debug:
+        msg:
+          - "Reference node: {{ reference_node }}"
+          - "Directory exists: {{ es_dir.stat.exists | default(false) }}"
+          - "Config file read: {{ es_config_file is defined and es_config_file.content is defined }}"
+      when: 
+        - not skip_reference
+        - es_dir.stat is defined
+      run_once: true
+      delegate_to: localhost
+
+    - name: Extract paths if config found
+      set_fact:
+        existing_paths:
+          data: "{{ (es_config_file.content | b64decode | regex_findall('path.data: (.+)') | first) if es_config_file is defined and es_config_file.content is defined else '' }}"
+          logs: "{{ (es_config_file.content | b64decode | regex_findall('path.logs: (.+)') | first) if es_config_file is defined and es_config_file.content is defined else '' }}"
+      when: 
+        - not skip_reference
+        - es_config_file is defined 
+        - es_config_file.content is defined
 
     # Always handle path configuration
     - name: Handle path configuration
@@ -617,20 +683,36 @@
         mode: '0660'
       no_log: true
 
-    - name: Set Elasticsearch directory permissions
-      file:
-        path: "{{ item }}"
-        owner: elasticsearch
-        group: elasticsearch
-        mode: '0750'
-        state: directory
-        recurse: yes    
-      loop:
-        - "/etc/elasticsearch"
-        - "/var/lib/elasticsearch"
-        - "/var/log/elasticsearch"
-      register: dir_perms
-      failed_when: false  # Don't fail if elasticsearch user doesn't exist yet
+    - name: Create and set permissions for Elasticsearch directories
+      block:
+        - name: Create custom data directory if not exists
+          file:
+            path: "{{ final_paths.data }}"
+            state: directory
+            mode: '0750'
+          when: final_paths.data != '/var/lib/elasticsearch'
+    
+        - name: Create custom log directory if not exists
+          file:
+            path: "{{ final_paths.logs }}"
+            state: directory
+            mode: '0750'
+          when: final_paths.logs != '/var/log/elasticsearch'
+    
+        - name: Set Elasticsearch directory permissions
+          file:
+            path: "{{ item }}"
+            owner: elasticsearch
+            group: elasticsearch
+            mode: '0750'
+            state: directory
+            recurse: yes    
+          loop:
+            - "/etc/elasticsearch"
+            - "{{ final_paths.data }}"
+            - "{{ final_paths.logs }}"
+          register: dir_perms
+          failed_when: false  # Don't fail if elasticsearch user doesn't exist yet
       become: yes
 
     # Verify certificate permissions before starting
