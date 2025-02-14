@@ -1,10 +1,10 @@
-import pdfplumber
+import fitz
 import re
 import unicodedata
 import logging
 import os
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 # Configure logging
@@ -21,30 +21,24 @@ class ChunkingConfig:
 
 class PDFToTSVConverter:
     def __init__(self, chunking_config: Optional[ChunkingConfig] = None):
-        """Initialize the PDF to TSV converter."""
         self.config = chunking_config or ChunkingConfig()
         self._compile_patterns()
-        self.doc_id_counter = int(time.time() * 1000)  # Start with current timestamp
-        
+        self.doc_id_counter = int(time.time() * 1000)
+
     def _compile_patterns(self):
         """Compile regex patterns for text processing"""
-        # Pattern for finding sentence boundaries
         self.sentence_pattern = re.compile(
             r'(?<!Mr)(?<!Mrs)(?<!Ms)(?<!Dr)(?<!Jr)(?<!Sr)(?<!Prof)'
             r'(?<!\w\.\w)(?<=[.!?])\s+(?=[A-Z])'
         )
-        
-        # Pattern for multiple whitespace
         self.whitespace_pattern = re.compile(r'\s+')
-        
-        # Pattern for section breaks
         self.section_break_pattern = re.compile(r'\n\n+')
-    
+
     def get_next_id(self) -> int:
         """Generate the next sequential document ID."""
         self.doc_id_counter += 1
         return self.doc_id_counter
-    
+
     def clean_text(self, text: str) -> str:
         """Clean extracted text while preserving meaningful characters."""
         if not text:
@@ -64,29 +58,86 @@ class PDFToTSVConverter:
         # Normalize unicode characters
         text = unicodedata.normalize('NFKC', text)
         
-        # Remove repeated punctuation
-        text = re.sub(r'([!?,.:;])\1+', r'\1', text)
-        
         return text.strip()
-    
+
     def split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences using smart sentence boundary detection."""
         sentences = self.sentence_pattern.split(text)
         return [s.strip() for s in sentences if s.strip()]
-    
-    def create_meaningful_chunks(self, sentences: List[str]) -> List[str]:
-        """Create meaningful chunks from sentences."""
+
+    def extract_links_from_page(self, page) -> List[Dict]:
+        """Extract links from a PDF page using PyMuPDF."""
+        links = []
+        
+        # Get all links on the page
+        for link in page.get_links():
+            link_data = {}
+            
+            # Get link type and destination
+            if link.get("kind") == fitz.LINK_URI:
+                link_data["type"] = "external"
+                link_data["uri"] = link["uri"]
+            elif link.get("kind") == fitz.LINK_GOTO:
+                link_data["type"] = "internal"
+                link_data["uri"] = f"page_{link.get('page', 0) + 1}"
+            elif link.get("kind") == fitz.LINK_NAMED:
+                link_data["type"] = "named"
+                if "name" in link:
+                    link_data["uri"] = link["name"]
+                else:
+                    logger.debug(f"Link of kind 'named' does not have a 'name' attribute: {link}")
+            
+            # Get the link text by extracting from the rect area
+            if "from" in link:
+                rect = fitz.Rect(link["from"])
+                words = page.get_text("text", clip=rect)
+                link_data["text"] = words.strip()
+            
+            if link_data.get("uri"):
+                link_data["page"] = page.number + 1
+                links.append(link_data)
+                logger.debug(f"Found link: {link_data}")
+        
+        return links
+
+    def create_meaningful_chunks(self, sentences: List[str], page_links: List[Dict] = None) -> List[str]:
+        """Create meaningful chunks from sentences while preserving link context."""
+        if page_links is None:
+            page_links = []
+            
         chunks = []
         current_chunk = []
         current_length = 0
         
-        for i, sentence in enumerate(sentences):
+        # Create a map of sentences containing links
+        link_sentences = set()
+        for link in page_links:
+            if not link.get('text'):
+                continue
+            link_text = link['text'].strip()
+            for i, sentence in enumerate(sentences):
+                if link_text in sentence:
+                    link_sentences.add(i)
+                    # Also add adjacent sentences for context
+                    if i > 0:
+                        link_sentences.add(i - 1)
+                    if i < len(sentences) - 1:
+                        link_sentences.add(i + 1)
+
+        i = 0
+        while i < len(sentences):
+            sentence = sentences[i]
             sentence_length = len(sentence)
             
-            # If adding this sentence would exceed max_chunk_size and we have
-            # enough sentences for a chunk, create a new chunk
+            # Check if this sentence contains a link or is part of link context
+            is_link_context = i in link_sentences
+            
+            # If adding this sentence would exceed max_chunk_size and we have enough sentences
+            # for a chunk, AND the sentence isn't part of a link context
             if (current_length + sentence_length > self.config.max_chunk_size and 
-                len(current_chunk) >= self.config.min_sentences_per_chunk):
+                len(current_chunk) >= self.config.min_sentences_per_chunk and
+                not is_link_context):
+                
                 chunks.append(' '.join(current_chunk))
                 
                 # Start new chunk with overlap
@@ -98,11 +149,14 @@ class PDFToTSVConverter:
             current_length += sentence_length
             
             # If we have enough sentences and hit a good breaking point,
-            # consider creating a new chunk
+            # AND the next sentence isn't part of a link context
+            next_is_link_context = (i + 1) in link_sentences if i + 1 < len(sentences) else False
             if (len(current_chunk) >= self.config.min_sentences_per_chunk * 2 and
                 current_length >= self.config.min_chunk_size and
                 i < len(sentences) - 1 and
-                self._is_good_break_point(sentence, sentences[i + 1])):
+                self._is_good_break_point(sentence, sentences[i + 1]) and
+                not next_is_link_context and
+                not is_link_context):
                 
                 chunks.append(' '.join(current_chunk))
                 
@@ -110,66 +164,103 @@ class PDFToTSVConverter:
                 overlap_start = max(0, len(current_chunk) - self.config.overlap_sentences)
                 current_chunk = current_chunk[overlap_start:]
                 current_length = sum(len(s) for s in current_chunk)
+            
+            i += 1
         
         # Add any remaining sentences as the last chunk
         if current_chunk:
             chunks.append(' '.join(current_chunk))
         
         return chunks
-    
+
     def _is_good_break_point(self, current_sentence: str, next_sentence: str) -> bool:
         """Determine if this is a good point to break the text into chunks."""
-        # Break if there's a significant topic shift
         if current_sentence.endswith('.') and next_sentence.startswith(('However', 'Moreover', 'Furthermore')):
             return True
             
-        # Break if the current sentence ends a thought and next starts a new one
         if (current_sentence.endswith('.') and 
             not any(current_sentence.lower().endswith(x) for x in [' etc.', 'e.g.', 'i.e.']) and
             next_sentence[0].isupper()):
             return True
             
         return False
-    
+
+    def enrich_chunk_with_links(self, chunk: str, links: List[Dict]) -> str:
+        """Add link information inline within the chunk text."""
+        if not links:
+            return chunk
+            
+        # Sort links by text length (longest first) to handle nested links correctly
+        sorted_links = sorted(links, key=lambda x: len(x.get('text', '')), reverse=True)
+        
+        enriched_text = chunk
+        for link in sorted_links:
+            if not link.get('text') or not link.get('uri'):
+                continue
+                
+            link_text = link['text'].strip()
+            if link_text in enriched_text:
+                # Create the replacement format: text[link:url]
+                replacement = f"{link_text}[link:{link['uri']}]"
+                enriched_text = enriched_text.replace(link_text, replacement)
+        
+        return enriched_text
+
     def process_pdf(self, pdf_path: str, output_path: str) -> None:
         """Process PDF file and output TSV format with meaningful chunks."""
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                # Extract and clean text from all pages
-                all_text = ""
-                for page_num, page in enumerate(pdf.pages, 1):
-                    logger.info(f"Processing page {page_num} of {len(pdf.pages)}")
-                    page_text = page.extract_text() or ""
-                    cleaned_text = self.clean_text(page_text)
-                    if cleaned_text:
-                        all_text += cleaned_text + "\n\n"
+            # Open PDF with PyMuPDF
+            doc = fitz.open(pdf_path)
+            
+            logger.info("Processing PDF...")
+            chunks = []
+            
+            # Process page by page to maintain link context
+            for page_num in range(doc.page_count):
+                page = doc[page_num]
+                logger.info(f"Processing page {page_num + 1} of {doc.page_count}")
                 
-                # Split into major sections
-                sections = [s.strip() for s in self.section_break_pattern.split(all_text) if s.strip()]
+                # Get text and links for this page
+                page_text = page.get_text()
+                page_links = self.extract_links_from_page(page)
                 
-                # Process each section into meaningful chunks
-                chunks = []
-                for section in sections:
-                    sentences = self.split_into_sentences(section)
-                    section_chunks = self.create_meaningful_chunks(sentences)
-                    chunks.extend(section_chunks)
+                # Clean text
+                cleaned_text = self.clean_text(page_text)
+                if not cleaned_text:
+                    continue
+                    
+                # Split into sentences and create chunks
+                sentences = self.split_into_sentences(cleaned_text)
+                page_chunks = self.create_meaningful_chunks(sentences, page_links)
                 
-                # Write chunks to TSV file
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    for chunk in chunks:
-                        chunk_id = self.get_next_id()
-                        f.write(f"{chunk_id}\t{chunk}\n")
-                
-                logger.info(f"Successfully processed PDF and created {len(chunks)} chunks")
-                logger.info(f"Output saved to: {output_path}")
-                
+                # Enrich chunks with links
+                for chunk in page_chunks:
+                    chunk_links = [
+                        link for link in page_links 
+                        if link.get('text') and link['text'] in chunk
+                    ]
+                    enriched_chunk = self.enrich_chunk_with_links(chunk, chunk_links)
+                    chunks.append(enriched_chunk)
+
+            # Write to TSV
+            with open(output_path, 'w', encoding='utf-8') as f:
+                for chunk in chunks:
+                    chunk_id = self.get_next_id()
+                    f.write(f"{chunk_id}\t{chunk}\n")
+            
+            logger.info(f"Successfully processed PDF with {len(chunks)} chunks")
+            logger.info(f"Output saved to: {output_path}")
+            
+            # Close the PDF
+            doc.close()
+            
         except Exception as e:
             logger.error(f"Error processing PDF {pdf_path}: {str(e)}")
             raise
 
 def main():
-    print("\nPDF to TSV Converter")
-    print("===================")
+    print("\nPDF to TSV Converter (with hyperlink support)")
+    print("============================================")
     
     # Get PDF file path from user
     while True:
