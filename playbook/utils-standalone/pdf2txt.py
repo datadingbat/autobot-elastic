@@ -1,8 +1,9 @@
 import pdfplumber
 import re
 import unicodedata
-import uuid
 import logging
+import os
+import time
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 
@@ -20,14 +21,10 @@ class ChunkingConfig:
 
 class PDFToTSVConverter:
     def __init__(self, chunking_config: Optional[ChunkingConfig] = None):
-        """
-        Initialize the PDF to TSV converter with configuration options.
-        
-        Args:
-            chunking_config: Configuration for content chunking
-        """
+        """Initialize the PDF to TSV converter."""
         self.config = chunking_config or ChunkingConfig()
         self._compile_patterns()
+        self.doc_id_counter = int(time.time() * 1000)  # Start with current timestamp
         
     def _compile_patterns(self):
         """Compile regex patterns for text processing"""
@@ -43,16 +40,13 @@ class PDFToTSVConverter:
         # Pattern for section breaks
         self.section_break_pattern = re.compile(r'\n\n+')
     
+    def get_next_id(self) -> int:
+        """Generate the next sequential document ID."""
+        self.doc_id_counter += 1
+        return self.doc_id_counter
+    
     def clean_text(self, text: str) -> str:
-        """
-        Clean extracted text while preserving meaningful characters.
-        
-        Args:
-            text: Raw text extracted from PDF
-            
-        Returns:
-            Cleaned text with preserved special characters
-        """
+        """Clean extracted text while preserving meaningful characters."""
         if not text:
             return ""
             
@@ -81,16 +75,7 @@ class PDFToTSVConverter:
         return [s.strip() for s in sentences if s.strip()]
     
     def create_meaningful_chunks(self, sentences: List[str]) -> List[str]:
-        """
-        Create meaningful chunks from sentences, respecting size limits
-        and semantic boundaries.
-        
-        Args:
-            sentences: List of sentences to chunk
-            
-        Returns:
-            List of chunks, where each chunk is a coherent group of sentences
-        """
+        """Create meaningful chunks from sentences."""
         chunks = []
         current_chunk = []
         current_length = 0
@@ -133,17 +118,8 @@ class PDFToTSVConverter:
         return chunks
     
     def _is_good_break_point(self, current_sentence: str, next_sentence: str) -> bool:
-        """
-        Determine if this is a good point to break the text into chunks.
-        
-        Args:
-            current_sentence: The current sentence
-            next_sentence: The next sentence
-            
-        Returns:
-            Boolean indicating if this is a good break point
-        """
-        # Break if there's a significant topic shift (e.g., different paragraph)
+        """Determine if this is a good point to break the text into chunks."""
+        # Break if there's a significant topic shift
         if current_sentence.endswith('.') and next_sentence.startswith(('However', 'Moreover', 'Furthermore')):
             return True
             
@@ -156,18 +132,13 @@ class PDFToTSVConverter:
         return False
     
     def process_pdf(self, pdf_path: str, output_path: str) -> None:
-        """
-        Process PDF file and output TSV format with meaningful chunks.
-        
-        Args:
-            pdf_path: Path to the PDF file
-            output_path: Path to save the TSV output
-        """
+        """Process PDF file and output TSV format with meaningful chunks."""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 # Extract and clean text from all pages
                 all_text = ""
-                for page in pdf.pages:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    logger.info(f"Processing page {page_num} of {len(pdf.pages)}")
                     page_text = page.extract_text() or ""
                     cleaned_text = self.clean_text(page_text)
                     if cleaned_text:
@@ -186,9 +157,7 @@ class PDFToTSVConverter:
                 # Write chunks to TSV file
                 with open(output_path, 'w', encoding='utf-8') as f:
                     for chunk in chunks:
-                        # Generate a unique ID (timestamp-based UUID)
-                        chunk_id = str(uuid.uuid1())
-                        # Write the chunk with its ID in TSV format
+                        chunk_id = self.get_next_id()
                         f.write(f"{chunk_id}\t{chunk}\n")
                 
                 logger.info(f"Successfully processed PDF and created {len(chunks)} chunks")
@@ -199,9 +168,19 @@ class PDFToTSVConverter:
             raise
 
 def main():
-    # Example usage
-    pdf_path = "ml2.pdf"
-    output_path = "output.tsv"
+    print("\nPDF to TSV Converter")
+    print("===================")
+    
+    # Get PDF file path from user
+    while True:
+        pdf_path = input("\nEnter the path to your PDF file: ").strip()
+        if os.path.exists(pdf_path) and pdf_path.lower().endswith('.pdf'):
+            break
+        print("❌ Invalid file path or not a PDF file. Please try again.")
+    
+    # Generate output path
+    output_path = os.path.splitext(pdf_path)[0] + '.tsv'
+    print(f"\nOutput will be saved to: {output_path}")
     
     # Initialize converter with custom configuration
     config = ChunkingConfig(
@@ -214,11 +193,13 @@ def main():
     converter = PDFToTSVConverter(config)
     
     try:
+        print("\nProcessing PDF...")
         converter.process_pdf(pdf_path, output_path)
-        logger.info("Processing complete")
+        print("✅ Processing complete!")
+        print(f"\nOutput has been saved to: {output_path}")
         
     except Exception as e:
-        logger.error(f"Processing failed: {str(e)}")
+        print(f"\n❌ Error during processing: {str(e)}")
 
 if __name__ == "__main__":
     main()
