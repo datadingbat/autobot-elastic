@@ -1,0 +1,33 @@
+---
+- name: Generate help menu content
+  copy:
+    content: |
+      =====================================
+                    HELP MENU
+      =====================================
+      1. About
+      2. Prerequisites
+      3. Deployment Variables & Password Files
+      4. Troubleshooting
+      5. Tracking Files
+      6. Return to Main Menu
+      
+      Select a topic number (1-6):
+    dest: "/tmp/help_menu.txt"
+  
+- name: Display help menu
+  debug:
+    msg: "{{ lookup('file', '/tmp/help_menu.txt') | split('\n') }}"
+
+- name: Prompt for help topic
+  pause:
+    prompt: "Enter your choice (1-6): "
+  register: help_choice
+
+- name: Launch tracking viewer
+  include_tasks: "{{ playbook_dir }}/tools/view_tracking.yml"
+  when: help_choice.user_input == '5'
+
+- name: Include help content tasks directly
+  include_tasks: "{{ playbook_dir }}/tools/help_content.yml"
+  when: help_choice.user_input != '5'

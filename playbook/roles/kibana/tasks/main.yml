@@ -1,0 +1,133 @@
+---
+# es_cert_pass is hard-coded on line 16 - you may wish to change this
+# (it's also defined in elasticsearch/tasks/main.yml, so you'll need to change it there too)
+- name: Install and Configure Kibana
+  block:
+    - name: Install Kibana
+      apt:
+        name: kibana=8.15.4
+        state: present
+        allow_unauthenticated: no
+        update_cache: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+ # Install Kibana from local .deb package
+ # - name: Install Kibana from deb package
+ #   apt:
+ #     deb: /tmp/kibana-8.15.4-amd64.deb
+ #     state: present
+ #     allow_unauthenticated: no
+ #   become_method: sudo
+ #   environment:
+ #     DEBIAN_FRONTEND: noninteractive
+
+    - name: Set certificate password fact
+      set_fact:
+        es_cert_pass: "elastic2024"
+        
+    - name: Create Kibana certificates directory
+      file:
+        path: /etc/kibana/certs
+        state: directory
+        owner: kibana
+        group: kibana
+        mode: '0750'
+
+    # Copy both HTTP and transport certificates
+    - name: Copy certificates to Kibana
+      copy:
+        src: "/tmp/elastic-certs/{{ item.src }}"
+        dest: "/etc/kibana/certs/{{ item.dest }}"
+        owner: kibana
+        group: kibana
+        mode: '0640'
+      with_items:
+        - { src: "elastic-http.p12", dest: "elastic-http.p12" }
+        - { src: "elastic-http-ca.pem", dest: "elastic-http-ca.crt" } 
+
+    - name: Generate encryption keys
+      shell: /usr/share/kibana/bin/kibana-encryption-keys generate -q
+      register: encryption_keys
+      changed_when: false
+      
+    - name: Configure Kibana
+      copy:
+        dest: /etc/kibana/kibana.yml
+        content: |
+          # Server settings
+          server.host: "{{ ansible_host }}"
+          server.port: 5601
+
+          # SSL/TLS Configuration for Kibana
+          server.ssl.enabled: true
+          server.ssl.keystore.path: "/etc/kibana/certs/elastic-http.p12"
+          server.ssl.keystore.password: "{{ es_cert_pass }}"
+          server.ssl.truststore.path: "/etc/kibana/certs/elastic-http.p12"
+          server.ssl.truststore.password: "{{ es_cert_pass }}"
+
+          # Elasticsearch connection
+          elasticsearch.hosts: 
+            {% for host in groups['hot_nodes'] %}
+            - "https://{{ hostvars[host]['ansible_host'] }}:9200"
+            {% endfor %}
+          
+          # Elasticsearch auth
+          elasticsearch.username: "kibana_system"
+          
+          # SSL Settings for Elasticsearch connection
+          elasticsearch.ssl.verificationMode: certificate
+          elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/elastic-http-ca.crt"]
+
+          # Encryption keys
+          {{ encryption_keys.stdout }}
+    
+          # Logging
+          logging.root.level: debug
+          elasticsearch.logQueries: true
+        owner: kibana
+        group: kibana
+        mode: '0660'
+
+    - name: Reset kibana_system user password
+      shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -b -f
+      register: kibana_password
+      retries: 3
+      delay: 10
+      until: kibana_password.rc == 0
+      delegate_to: "{{ groups['master_nodes'][0] }}"
+
+    - name: Set Kibana keystore passwords
+      block:
+      - name: Add elasticsearch.password to keystore
+        shell: |
+          echo '{{ kibana_password.stdout.split("New value: ")[1] | trim }}' | /usr/share/kibana/bin/kibana-keystore add --stdin elasticsearch.password
+
+      - name: Add keystore password to keystore
+        shell: |
+          echo '{{ es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.keystore.password
+
+      - name: Add truststore password to keystore
+        shell: |
+          echo '{{ es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.truststore.password
+
+    - name: Enable and start Kibana service
+      systemd:
+        name: kibana
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Wait for package installation to settle
+      wait_for:
+        timeout: 15
+
+    - name: Save Kibana password
+      copy:
+        content: "{{ kibana_password.stdout }}"
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/kibana_password.txt"
+        mode: '0600'
+      delegate_to: localhost
+      become: no
+  become: yes

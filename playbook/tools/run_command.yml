@@ -1,0 +1,332 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+  run_once: true
+  delegate_to: localhost
+  no_log: true
+
+# Command selection and validation
+- name: Command selection
+  block:
+    - name: Display command menu
+      pause:
+        prompt: |
+          Select a command type to execute:
+          1. Add/Update Elasticsearch keystore value
+          2. Delete Elasticsearch keystore value
+          3. List all keystore values
+          4. List specific keystore value
+          5. Custom command (requires validation)
+          Enter your choice:
+      register: command_type_choice
+      run_once: true
+      delegate_to: localhost
+
+    # Handle keystore value update
+    - name: Handle keystore update
+      block:
+        - name: Get keystore key
+          pause:
+            prompt: |
+              Enter the keystore key to update (e.g., xpack.security.http.ssl.truststore.secure_password):
+          register: keystore_key
+          run_once: true
+          delegate_to: localhost
+
+        - name: Get keystore value
+          pause:
+            prompt: "Enter the value for {{ keystore_key.user_input }}:"
+          register: keystore_value
+          run_once: true
+          delegate_to: localhost
+          no_log: true
+
+        - name: Set command for keystore update
+          set_fact:
+            command_to_run: "echo '{{ keystore_value.user_input }}' | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f {{ keystore_key.user_input }}"
+            operation_type: "keystore_update"
+          no_log: true
+      when: command_type_choice.user_input == "1"
+
+    # Handle keystore value deletion
+    - name: Handle keystore deletion
+      block:
+        - name: Get keystore key to delete
+          pause:
+            prompt: |
+              Enter the keystore key to delete:
+          register: keystore_key_delete
+          run_once: true
+          delegate_to: localhost
+
+        - name: Set command for keystore deletion
+          set_fact:
+            command_to_run: "/usr/share/elasticsearch/bin/elasticsearch-keystore remove {{ keystore_key_delete.user_input }}"
+            operation_type: "keystore_delete"
+      when: command_type_choice.user_input == "2"
+
+    # Handle list all keystore values
+    - name: Handle list all keystore values
+      set_fact:
+        command_to_run: "/usr/share/elasticsearch/bin/elasticsearch-keystore list"
+        operation_type: "keystore_list_all"
+      when: command_type_choice.user_input == "3"
+
+    # Handle list specific keystore value
+    - name: Handle list specific keystore value
+      block:
+        - name: Get keystore key to list
+          pause:
+            prompt: |
+              Enter the keystore key to list:
+          register: keystore_key_list
+          run_once: true
+          delegate_to: localhost
+
+        - name: Set command for specific keystore list
+          set_fact:
+            command_to_run: "/usr/share/elasticsearch/bin/elasticsearch-keystore list | grep {{ keystore_key_list.user_input }}"
+            operation_type: "keystore_list_specific"
+      when: command_type_choice.user_input == "4"
+
+    # Handle custom command
+    - name: Handle custom command
+      block:
+        - name: Get custom command
+          pause:
+            prompt: |
+              Enter the command to execute.
+              NOTE: Command will be validated before execution.
+              WARNING: Be careful with commands that modify system state.
+          register: custom_command
+          run_once: true
+          delegate_to: localhost
+
+        - name: Ask which user to run the custom command as (default is root)
+          pause:
+            prompt: |
+              Enter the user to run the command as (leave blank for root):
+          register: custom_command_user
+          run_once: true
+          delegate_to: localhost
+
+        - name: Set command for custom execution
+          set_fact:
+            command_to_run: "{{ custom_command.user_input }}"
+            operation_type: "custom"
+            custom_user: "{{ (custom_command_user.user_input|length > 0) | ternary(custom_command_user.user_input, 'root') }}"
+      when: command_type_choice.user_input == "5"
+
+    # Command validation
+    - name: Validate command
+      fail:
+        msg: "Command contains potentially dangerous operations: {{ item }}"
+      when: command_to_run is search(item)
+      with_items:
+        - "rm -rf"
+        - "mkfs"
+        - "> /dev"
+        - "dd if"
+        - ":(){ :|:& };"
+        - "chmod -R 777"
+        - "chmod -R 666"
+      run_once: true
+      delegate_to: localhost
+
+    # Confirmation with details
+    - name: Create execution plan
+      copy:
+        content: |
+          Command Execution Plan
+          =====================
+          Operation Type: {{ operation_type | regex_replace('_', ' ') | title }}
+          {% if operation_type == 'keystore_update' %}
+          Operation: Update keystore value
+          Key: {{ keystore_key.user_input }}
+          Value: [SECURED]
+          {% elif operation_type == 'keystore_delete' %}
+          Operation: Delete keystore value
+          Key: {{ keystore_key_delete.user_input }}
+          {% elif operation_type == 'keystore_list_all' %}
+          Operation: List all keystore values
+          {% elif operation_type == 'keystore_list_specific' %}
+          Operation: List specific keystore value
+          Key: {{ keystore_key_list.user_input }}
+          {% else %}
+          Command: {{ command_to_run }}
+          Execution User: {{ custom_user }}      
+          {% endif %}
+          
+          Target Details:
+          --------------
+          Target Selection: {{ ansible_limit }}
+          Target Hosts: {{ ansible_play_hosts | join(', ') }}
+          
+          Safety Checks:
+          -------------
+          - Command has been validated for dangerous operations
+          - Execution will be performed with appropriate privileges
+          - Results will be reported for each host
+          
+          WARNING: Please verify the operation and targets carefully before proceeding.
+        dest: "/tmp/command_plan.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display execution plan
+      debug:
+        msg: "{{ lookup('file', '/tmp/command_plan.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Confirm execution
+      pause:
+        prompt: |
+          Review the execution plan above.
+          Do you want to proceed with the command execution? (yes/no):
+      register: execution_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: execution_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
+    # Command execution and reporting
+    - name: Execute command
+      block:
+        # Pre-execution check
+        - name: Check if Elasticsearch is installed
+          stat:
+            path: /usr/share/elasticsearch/bin/elasticsearch-keystore
+          register: es_keystore
+          become: yes
+          when: command_type_choice.user_input in ["1", "2", "3", "4"]
+
+        - name: Verify Elasticsearch installation
+          fail:
+            msg: "Elasticsearch keystore not found on {{ inventory_hostname }}"
+          when: >
+            command_type_choice.user_input in ["1", "2", "3", "4"] and
+            not es_keystore.stat.exists
+        
+      # Execute command
+    - name: Run command
+      shell: >
+        {% if operation_type == 'custom' %}
+        sudo -u {{ custom_user }} /bin/bash -c '{{ command_to_run }}'
+        {% else %}
+        sudo -u elasticsearch /bin/bash -c '{{ command_to_run }}'
+        {% endif %}
+      register: command_result
+      failed_when: >
+        command_result.rc != 0 and not
+        (operation_type == 'keystore_delete' and command_result.rc == 78)
+
+    - name: Store execution result
+      set_fact:
+        execution_status:
+          success: >-
+            {{ command_result.rc == 0 or
+               (operation_type == 'keystore_delete' and command_result.rc == 78) }}
+          output: "{{ command_result.stdout }}"
+          error: "{{ command_result.stderr }}"
+          rc: "{{ command_result.rc }}"
+          status_detail: >-
+            {%- if command_result.rc == 0 -%}
+              Completed successfully
+            {%- elif operation_type == 'keystore_delete' and command_result.rc == 78 -%}
+              Key not found in keystore
+            {%- else -%}
+              Failed with error
+            {%- endif -%}
+
+    # Report generation
+    - name: Create execution report
+      copy:
+        content: |
+          Command Execution Report
+          ======================
+          Operation Type: {{ operation_type | regex_replace('_', ' ') | title }}
+          {% if operation_type == 'keystore_update' %}
+          Operation: Update keystore value
+          Key: {{ keystore_key.user_input }}
+          {% elif operation_type == 'keystore_delete' %}
+          Operation: Delete keystore value
+          Key: {{ keystore_key_delete.user_input }}
+          {% elif operation_type == 'keystore_list_all' %}
+          Operation: List all keystore values
+          {% elif operation_type == 'keystore_list_specific' %}
+          Operation: List specific keystore value
+          Key: {{ keystore_key_list.user_input }}
+          {% else %}
+          Command: {{ command_to_run }}
+          Execution User: {{ custom_user }}      
+          {% endif %}
+          
+          Target Selection: {{ ansible_limit }}
+          
+          Execution Results:
+          -----------------
+          {% for host in ansible_play_hosts | sort %}
+          Host: {{ host }}
+          Status: {{ hostvars[host].execution_status.status_detail }}
+          {% if (hostvars[host].execution_status.rc | int) == 0 and hostvars[host].execution_status.output | trim | length > 0 %}
+          Output: {{ hostvars[host].execution_status.output }}
+          {% endif %}
+          {% if hostvars[host].execution_status.error | trim | length > 0 %}
+          Details: {{ hostvars[host].execution_status.error | trim }}
+          {% endif %}
+
+          {% endfor %}
+          
+          Summary:
+          --------
+          Total Hosts: {{ ansible_play_hosts | length }}
+          {% set successful = ansible_play_hosts | map('extract', hostvars) | selectattr('execution_status.rc', 'string') | selectattr('execution_status.rc', 'equalto', '0') | list %}
+          {% set not_found = ansible_play_hosts | map('extract', hostvars) | selectattr('execution_status.rc', 'string') | selectattr('execution_status.rc', 'equalto', '78') | list %}
+          {% set failed = ansible_play_hosts | map('extract', hostvars) | selectattr('execution_status.rc', 'string') | rejectattr('execution_status.rc', 'equalto', '0') | rejectattr('execution_status.rc', 'equalto', '78') | list %}
+          Successful: {{ successful | length }}
+          Not Found: {{ not_found | length }}
+          Failed: {{ failed | length }}
+          
+          Execution completed at: {{ ansible_date_time.iso8601 }}
+        dest: "/tmp/execution_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display execution report
+      debug:
+        msg: "{{ lookup('file', '/tmp/execution_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+  rescue:
+    - name: Handle execution failure
+      set_fact:
+        execution_status:
+          success: false
+          error: "{{ ansible_failed_result.msg | default('Command execution failed') }}"
+          rc: 999
+          status_detail: "Task failed"
+
+  always:
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/command_plan.txt"
+        - "/tmp/execution_report.txt"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes

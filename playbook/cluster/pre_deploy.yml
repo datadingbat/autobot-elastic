@@ -1,0 +1,650 @@
+---
+- name: Pre-deployment Setup and Validation
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    # Inventory Structure Validation
+    - name: Check required inventory groups
+      fail:
+        msg: "Missing required inventory group: {{ item }}"
+      when: item not in groups
+      with_items:
+        - master_nodes
+        - hot_nodes
+
+    # Node count validations
+    - name: Check master node count
+      fail:
+        msg: "Invalid number of master nodes. Must be either 1 or 3, found {{ groups['master_nodes'] | length }}."
+      when: groups['master_nodes'] | length not in [1, 3]
+
+    - name: Check hot node count
+      fail:
+        msg: "Must have at least 1 hot node, found {{ groups['hot_nodes'] | length }}."
+      when: groups['hot_nodes'] | length < 1
+
+    # Directory Setup
+    - name: Create required directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      with_items:
+        - "{{ lookup('env', 'HOME') }}/.elasticsearch"
+        - "/tmp/elastic-certs"
+
+    # Installation Method Selection
+    - name: Prompt for installation method
+      pause:
+        prompt: |
+          Select installation method:
+          1. APT repository (default)
+          2. Manual .deb packages
+          Enter your choice (press Enter for default):
+      register: install_method_choice
+
+    - name: Set default installation method if empty
+      set_fact:
+        install_method_choice: "{{ {'user_input': '1'} if not install_method_choice.user_input else install_method_choice }}"
+
+    - name: Handle APT repository installation
+      when: install_method_choice.user_input == '1'
+      block:
+        - name: Prompt for version
+          pause:
+            prompt: |
+              Enter the version number for Elasticsearch and Kibana, or press Enter for latest
+              Example: 8.15.4
+              This version will be used for both Elasticsearch and Kibana
+          register: version_choice
+
+        # Add repository if not already present to check latest version
+        - name: Ensure apt-transport-https is present
+          apt:
+            name: apt-transport-https
+            state: present
+          become: true
+          when: version_choice.user_input | default('latest', true) == 'latest'
+
+        - name: Add Elasticsearch GPG key
+          apt_key:
+            url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+            state: present
+          become: true
+          when: version_choice.user_input | default('latest', true) == 'latest'
+
+        - name: Add Elasticsearch repository
+          apt_repository:
+            repo: deb https://artifacts.elastic.co/packages/8.x/apt stable main
+            state: present
+          become: true
+          when: version_choice.user_input | default('latest', true) == 'latest'
+
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+          become: true
+          when: version_choice.user_input | default('latest', true) == 'latest'
+
+        - name: Get latest available version
+          shell: |
+            apt-cache policy elasticsearch | grep Candidate | awk '{print $2}' | cut -d'-' -f1
+          register: latest_version
+          changed_when: false
+          when: version_choice.user_input | default('latest', true) == 'latest'
+
+        - name: Set version fact with default
+          set_fact:
+            component_version: "{{ version_choice.user_input | default('latest', true) }}"
+            latest_available_version: "{{ latest_version.stdout | default('unknown') if version_choice.user_input | default('latest', true) == 'latest' else omit }}"
+            installation_method: "apt"
+
+
+    - name: Handle manual package installation
+      when: install_method_choice.user_input == '2'
+      block:
+        - name: Prompt for Elasticsearch package path
+          pause:
+            prompt: |
+              Enter the full path to the Elasticsearch .deb package
+              Example: /tmp/elasticsearch-8.16.1-amd64.deb
+          register: es_package_path
+
+        - name: Prompt for Kibana package path
+          pause:
+            prompt: |
+              Enter the full path to the Kibana .deb package
+              Example: /tmp/kibana-8.16.1-amd64.deb
+          register: kibana_package_path
+
+        - name: Validate package files exist
+          stat:
+            path: "{{ item }}"
+          register: package_check
+          with_items:
+            - "{{ es_package_path.user_input }}"
+            - "{{ kibana_package_path.user_input }}"
+
+        - name: Fail if packages don't exist
+          fail:
+            msg: "Package file not found: {{ item.item }}"
+          when: not item.stat.exists
+          with_items: "{{ package_check.results }}"
+          no_log: true
+  
+        - name: Verify package versions match
+          shell: |
+            dpkg-deb -f {{ es_package_path.user_input }} Version | cut -d'-' -f1 > /tmp/es_version
+            dpkg-deb -f {{ kibana_package_path.user_input }} Version | cut -d'-' -f1 > /tmp/kb_version
+            if ! diff /tmp/es_version /tmp/kb_version >/dev/null; then
+              echo "Version mismatch"
+              exit 1
+            fi
+          register: version_check
+          failed_when: version_check.rc != 0
+          changed_when: false
+
+        - name: Set package paths
+          set_fact:
+            es_deb_package_path: "{{ es_package_path.user_input }}"
+            kibana_deb_package_path: "{{ kibana_package_path.user_input }}"
+            installation_method: "local"
+
+        - name: Clean up version check files
+          file:
+            path: "{{ item }}"
+            state: absent
+          with_items:
+            - /tmp/es_version
+            - /tmp/kb_version
+          ignore_errors: yes
+
+    - name: Prompt for cluster name
+      pause:
+        prompt: |
+          Enter cluster name
+          Press enter for default (elastic-cluster):
+      register: cluster_name_choice
+
+    - name: Set cluster name fact
+      set_fact:
+        cluster_name: "{{ cluster_name_choice.user_input | default('elastic-cluster', true) }}"
+
+    # Path Configuration
+    - name: Set data path
+      set_fact:
+        es_data_path: "/var/lib/elasticsearch"  # Default path
+      
+    - name: Set log path
+      set_fact:
+        es_log_path: "/var/log/elasticsearch"  # Default path
+
+    - name: Prompt for custom paths
+      pause:
+        prompt: |
+          Do you want to use custom paths for data and logs? (yes/no)
+          Default paths are:
+          - Data: /var/lib/elasticsearch
+          - Logs: /var/log/elasticsearch
+      register: custom_paths_choice
+
+    - name: Handle custom paths
+      block:
+        - name: Prompt for data path
+          pause:
+            prompt: |
+              Enter the path for Elasticsearch data storage
+              Current: {{ es_data_path }}
+              Press enter to keep current, or specify new path:
+          register: data_path_input
+
+        - name: Prompt for log path
+          pause:
+            prompt: |
+              Enter the path for Elasticsearch logs
+              Current: {{ es_log_path }}
+              Press enter to keep current, or specify new path:
+          register: log_path_input
+
+        - name: Update paths if custom values provided
+          set_fact:
+            es_data_path: "{{ data_path_input.user_input | default(es_data_path, true) }}"
+            es_log_path: "{{ log_path_input.user_input | default(es_log_path, true) }}"
+      when: custom_paths_choice.user_input | lower == 'yes'
+
+    - name: Calculate recommended heap sizes
+      block:
+        - name: Get memory for master nodes
+          shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+          register: master_ram
+          delegate_to: "{{ groups['master_nodes'][0] }}"
+          run_once: true
+
+        - name: Get memory for hot nodes
+          shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+          register: hot_ram
+          delegate_to: "{{ groups['hot_nodes'][0] }}"
+          run_once: true
+
+        - name: Get memory for frozen nodes
+          shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+          register: frozen_ram
+          delegate_to: "{{ groups['frozen_nodes'][0] }}"
+          run_once: true
+          when: "'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0"
+
+        - name: Get memory for ML nodes
+          shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+          register: ml_ram
+          delegate_to: "{{ groups['ml_nodes'][0] }}"
+          run_once: true
+          when: "'ml_nodes' in groups and groups['ml_nodes'] | length > 0"
+
+        - name: Calculate recommended heap sizes
+          set_fact:
+            master_heap: "{{ [(master_ram.stdout|int / 2)|round|int, 128|int]|min }}"
+            hot_heap: "{{ [(hot_ram.stdout|int / 2)|round|int, 128|int]|min }}"
+            frozen_heap: "{{ [(frozen_ram.stdout|int / 2)|round|int, 128|int]|min if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 else 0 }}"
+            ml_heap: "{{ [(ml_ram.stdout|int / 2)|round|int, 128|int]|min if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 else 0 }}"
+
+        - name: Prompt for system tuning
+          pause:
+            prompt: |
+              Recommended System & Elasticsearch Tuning Parameters:
+              
+              JVM Heap Sizes (calculated based on 50% of available RAM):
+              - Master Nodes: {{ master_heap }}GB (assumes all master nodes have {{ master_ram.stdout }}GB RAM)
+              - Hot Nodes: {{ hot_heap }}GB (assumes all hot nodes have {{ hot_ram.stdout }}GB RAM)
+              {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+              - Frozen Nodes: {{ frozen_heap }}GB (assumes all frozen nodes have {{ frozen_ram.stdout }}GB RAM)
+              {% endif %}
+              {% if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 %}
+              - ML Nodes: {{ ml_heap }}GB (assumes all ML nodes have {{ ml_ram.stdout }}GB RAM)
+              {% endif %}
+              
+              Do you want to:
+              1. Apply recommended settings (default)
+              2. Specify custom heap sizes
+              3. Skip system tuning
+              
+              View detailed tuning parameters
+              
+              Enter choice (1-3, or 'view' to see detailed settings):
+          register: tuning_choice
+
+        - name: Create tuning details report
+          copy:
+            content: |
+              ELASTICSEARCH TUNING PARAMETERS
+              ============================
+
+              Memory Management
+              ----------------
+              - Swap: Disabled completely
+              - vm.max_map_count: 262144
+              - vm.swappiness: 1
+              - Transparent Huge Pages: Disabled
+
+              System Limits
+              ------------
+              - elasticsearch memlock: unlimited (soft and hard)
+              - elasticsearch file descriptors (nofile): 65535
+              - elasticsearch processes (nproc): 4096
+
+              JVM Settings
+              -----------
+              - Heap Size: Calculated per node type (shown above)
+              - Garbage Collection: G1GC
+              - G1 Reserve Percent: 25%
+              - Initial Heap Occupancy: 30%
+              - Heap Dump on OOM: Enabled
+              - DNS cache TTL: 60 seconds
+
+              Systemd Service Limits
+              --------------------
+              - LimitMEMLOCK: infinity
+              - LimitNOFILE: 65535
+              - LimitNPROC: 4096
+
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/tuning_details.txt"
+            mode: '0600'
+          when: tuning_choice.user_input | lower == 'view'
+
+        - name: Display tuning details
+          debug:
+            msg: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/tuning_details.txt').split('\n') }}"
+          when: tuning_choice.user_input | lower == 'view'
+
+        - name: Prompt again after showing details
+          pause:
+            prompt: |
+              Do you want to:
+              1. Apply recommended settings (default)
+              2. Specify custom heap sizes
+              3. Skip system tuning
+
+              Enter choice (1-3, press Enter for default):
+          register: tuning_choice_after_view
+          when: tuning_choice.user_input | lower == 'view'
+
+        - name: Set final tuning choice
+          set_fact:
+            final_tuning_choice: "{{ tuning_choice_after_view if tuning_choice.user_input | lower == 'view' else tuning_choice }}"
+
+        - name: Set default choice if empty
+          set_fact:
+            final_tuning_choice: "{{ {'user_input': '1'} if not final_tuning_choice.user_input else final_tuning_choice }}"
+
+        - name: Prompt for custom heap sizes
+          block:
+            - name: Get master heap
+              pause:
+                prompt: "Enter heap size for master nodes in GB (current recommendation: {{ master_heap }}GB):"
+              register: custom_master_heap
+
+            - name: Get hot heap
+              pause:
+                prompt: "Enter heap size for hot nodes in GB (current recommendation: {{ hot_heap }}GB):"
+              register: custom_hot_heap
+
+            - name: Get frozen heap
+              pause:
+                prompt: "Enter heap size for frozen nodes in GB (current recommendation: {{ frozen_heap }}GB):"
+              register: custom_frozen_heap
+              when: "'frozen_nodes' in groups"
+
+            - name: Get ml heap
+              pause:
+                prompt: "Enter heap size for ML nodes in GB (current recommendation: {{ ml_heap }}GB):"
+              register: custom_ml_heap
+              when: "'ml_nodes' in groups"              
+
+            - name: Set custom heap values
+              set_fact:
+                master_heap: "{{ custom_master_heap.user_input }}"
+                hot_heap: "{{ custom_hot_heap.user_input }}"
+                frozen_heap: "{{ custom_frozen_heap.user_input if 'frozen_nodes' in groups else 0 }}"
+                ml_heap: "{{ custom_ml_heap.user_input if 'ml_nodes' in groups else 0 }}"
+          when: final_tuning_choice.user_input == '2'
+
+        - name: Set tuning facts
+          set_fact:
+            apply_system_tuning: "{{ final_tuning_choice.user_input != '3' }}"
+            heap_sizes:
+              master: "{{ master_heap }}"
+              hot: "{{ hot_heap }}"
+              frozen: "{{ frozen_heap if 'frozen_nodes' in groups else 0 }}"
+              ml: "{{ ml_heap if 'ml_nodes' in groups else 0 }}"              
+
+    # Security Configuration
+    - name: Prompt for password management
+      pause:
+        prompt: |
+          How would you like to handle certificates and keystore passwords?
+          1. Generate secure random passwords (default)
+          2. Specify custom passwords
+          Enter your choice (press Enter for default):
+      register: password_choice
+
+    - name: Set default password choice if empty
+      set_fact:
+        password_choice: "{{ {'user_input': '1'} if not password_choice.user_input else password_choice }}"
+
+    - name: Handle custom passwords
+      when: password_choice.user_input == '2'
+      block:
+        - name: Prompt for certificate password
+          pause:
+            prompt: "Enter password for certificates (min 8 chars, letters/numbers/symbols):"
+            echo: no
+          register: cert_pass
+
+        - name: Validate certificate password
+          fail:
+            msg: "Password must be at least 8 characters and contain letters, numbers, and symbols"
+          when: >
+            cert_pass.user_input | length < 8 or
+            not (cert_pass.user_input is match('.*[A-Za-z].*') and 
+                 cert_pass.user_input is match('.*[0-9].*') and 
+                 cert_pass.user_input is match('.*[^A-Za-z0-9].*'))
+
+        - name: Set custom passwords
+          set_fact:
+            es_cert_pass: "{{ cert_pass.user_input }}"
+            passwords_generated: false
+
+    - name: Generate random passwords
+      when: password_choice.user_input == '1'
+      block:
+        - name: Create random password
+          command: openssl rand -base64 12
+          register: random_pass
+
+        - name: Set generated passwords
+          set_fact:
+            es_cert_pass: "{{ random_pass.stdout }}"
+            passwords_generated: true
+
+    # Export all variables to deployment_vars.yml
+    - name: Export deployment variables
+      copy:
+        content: |
+          ---
+          # Installation settings
+          installation_method: "{{ installation_method }}"
+          {% if component_version is defined %}
+          component_version: "{{ component_version }}"
+          {% endif %}
+          {% if es_deb_package_path is defined %}
+          es_deb_package_path: "{{ es_deb_package_path }}"
+          {% endif %}
+          {% if kibana_deb_package_path is defined %}
+          kibana_deb_package_path: "{{ kibana_deb_package_path }}"
+          {% endif %}
+
+          # Security settings
+          es_cert_pass: "{{ es_cert_pass }}"
+          passwords_generated: "{{ passwords_generated }}"
+
+          # Cluster settings
+          cluster_name: "{{ cluster_name }}"
+
+          # Paths
+          es_data_path: "{{ es_data_path }}"
+          es_log_path: "{{ es_log_path }}"
+
+          # System Tuning
+          apply_system_tuning: {{ apply_system_tuning }}
+          heap_sizes:
+            master: {{ heap_sizes.master }}
+            hot: {{ heap_sizes.hot }}
+            frozen: {{ heap_sizes.frozen if 'frozen_nodes' in groups else 0 }}
+            ml: {{ heap_sizes.ml if 'ml_nodes' in groups else 0 }}
+
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+        mode: '0600'
+        
+    # Get current timestamp for configuration files
+    - name: Get current timestamp
+      command: date -Iseconds
+      register: current_timestamp
+      changed_when: false
+      delegate_to: localhost
+      
+    # Export a comprehensive custom configurations file to be used by all tools
+    - name: Create custom configurations tracking file
+      copy:
+        content: |
+          ---
+          # Elasticsearch Custom Configurations
+          # Last updated: {{ current_timestamp.stdout }}
+          # This file contains all custom configurations from initial deployment and subsequent operations
+          
+          # Installation and version information
+          installation:
+            method: "{{ installation_method }}"
+            {% if component_version is defined %}
+            component_version: "{{ component_version }}"
+            {% endif %}
+            {% if es_deb_package_path is defined %}
+            es_deb_package_path: "{{ es_deb_package_path }}"
+            {% endif %}
+            {% if kibana_deb_package_path is defined %}
+            kibana_deb_package_path: "{{ kibana_deb_package_path }}"
+            {% endif %}
+            initial_deployment_date: "{{ current_timestamp.stdout }}"
+          
+          # Security settings
+          security:
+            es_cert_pass: "{{ es_cert_pass }}"
+            passwords_generated: {{ passwords_generated }}
+          
+          # Cluster settings
+          cluster:
+            name: "{{ cluster_name }}"
+            initial_masters: {{ groups['master_nodes'] | length }}
+            initial_hot_nodes: {{ groups['hot_nodes'] | length }}
+            {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+            initial_frozen_nodes: {{ groups['frozen_nodes'] | length }}
+            {% endif %}
+            {% if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 %}
+            initial_ml_nodes: {{ groups['ml_nodes'] | length }}
+            {% endif %}
+            {% if 'kibana' in groups and groups['kibana'] | length > 0 %}
+            initial_kibana_nodes: {{ groups['kibana'] | length }}
+            {% endif %}
+          
+          # Filesystem paths
+          paths:
+            # Initial paths from deployment
+            initial:
+              data: "{{ es_data_path }}"
+              logs: "{{ es_log_path }}"
+            # Node-specific paths (will be populated by add_es.yml)
+            master_nodes: {}
+            hot_nodes: {}
+            frozen_nodes: {}
+            ml_nodes: {}
+          
+          # System tuning
+          system_tuning:
+            enabled: {{ apply_system_tuning }}
+            heap_sizes:
+              master: {{ heap_sizes.master }}
+              hot: {{ heap_sizes.hot }}
+              frozen: {{ heap_sizes.frozen if 'frozen_nodes' in groups else 0 }}
+              ml: {{ heap_sizes.ml if 'ml_nodes' in groups else 0 }}
+            vm_settings:
+              max_map_count: 262144
+              swappiness: 1
+              disable_thp: true
+          
+          # Node-specific configurations
+          # This section will be populated by add_es.yml when new nodes are added
+          node_configurations: {}
+          
+          # MinIO configurations (populated by minio_setup.yml)
+          minio:
+            configured: false
+          
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+        mode: '0600'
+
+    # Display Pre-deployment Summary
+    - name: Create pre-deployment report
+      copy:
+        content: |
+          ELASTICSEARCH CLUSTER PRE-DEPLOYMENT SUMMARY
+          =========================================
+
+          Topology Overview
+          ----------------
+          Master Nodes ({{ groups['master_nodes'] | length }}):
+          {% for host in groups['master_nodes'] %}
+          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+          {% endfor %}
+
+          Hot Nodes ({{ groups['hot_nodes'] | length }}):
+          {% for host in groups['hot_nodes'] %}
+          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+          {% endfor %}
+
+          {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+          Frozen Nodes ({{ groups['frozen_nodes'] | length }}):
+          {% for host in groups['frozen_nodes'] %}
+          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+          {% endfor %}
+          {% endif %}
+
+          {% if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 %}
+          ML Nodes ({{ groups['ml_nodes'] | length }}):
+          {% for host in groups['ml_nodes'] %}
+          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+          {% endfor %}
+          {% endif %}
+
+          {% if 'kibana' in groups and groups['kibana'] | length > 0 %}
+          Kibana Nodes ({{ groups['kibana'] | length }}):
+          {% for host in groups['kibana'] %}
+          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+          {% endfor %}
+          {% endif %}
+
+          Installation Details
+          -------------------
+          Method: {{ installation_method | title }}
+          {% if installation_method == 'apt' %}
+          Version: {% if component_version == 'latest' %}Latest available ({{ latest_available_version }}){% else %}{{ component_version }}{% endif %}
+          {% else %}
+          Elasticsearch Package: {{ es_deb_package_path }}
+          Kibana Package: {{ kibana_deb_package_path }}
+          {% endif %}
+
+          Cluster Name: "{{ cluster_name }}"
+
+          Path Configuration
+          -----------------
+          Data Path: {{ es_data_path }}
+          Log Path: {{ es_log_path }}
+
+          System Tuning
+          ------------
+          Status: {% if apply_system_tuning %}Enabled{% else %}Disabled{% endif %}
+          {% if apply_system_tuning %}
+          JVM Heap Sizes:
+          - Master Nodes: {{ heap_sizes.master }}GB
+          - Hot Nodes: {{ heap_sizes.hot }}GB
+          {% if 'frozen_nodes' in groups %}
+          - Frozen Nodes: {{ heap_sizes.frozen }}GB
+          {% endif %}
+          {% if 'ml_nodes' in groups %}
+          - ML Nodes: {{ heap_sizes.ml }}GB          
+          {% endif %}
+          {% endif %}
+          
+          Security Configuration
+          ---------------------
+          Password Management: {% if passwords_generated %}Auto-generated secure passwords{% else %}Custom password provided{% endif %}
+          
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/pre_deploy_summary.txt"
+        mode: '0600'
+
+    - name: Display pre-deployment summary
+      debug:
+        msg: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/pre_deploy_summary.txt').split('\n') }}"
+
+    - name: Confirm deployment
+      pause:
+        prompt: |
+          Review the deployment plan above.
+          Do you want to proceed? (yes/no):
+      register: deploy_confirmation
+
+    - name: Validate confirmation input
+      fail:
+        msg: "Deployment cancelled by user"
+      when: deploy_confirmation.user_input | lower not in ['yes', 'y']
+      
+    - name: Exit if not confirmed
+      meta: end_play
+      when: deploy_confirmation.user_input | lower not in ['yes', 'y']

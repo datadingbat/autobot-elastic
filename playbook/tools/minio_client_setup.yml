@@ -1,0 +1,438 @@
+---
+# minio_client_setup.yml - Child play for es-toolkit to configure Minio Client (mc)
+
+# These are individual tasks, not a play (for es-toolkit compatibility)
+
+# Set default variables
+- name: Set default variables
+  set_fact:
+    minio_client_version: "latest"
+    minio_client_url: "https://dl.min.io/client/mc/release/linux-amd64/mc"
+    installation_method: "online"
+    minio_protocol: "http"
+    minio_port: "9000"
+    minio_bucket_name: "elasticsearch-snapshots"
+    known_minio_server: false
+
+# Check for existing MinIO server configuration
+- name: Check for existing MinIO server configuration
+  stat:
+    path: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_server_config.yml"
+  register: minio_server_config_file
+
+- name: Load existing MinIO server configuration if available
+  block:
+    - name: Read MinIO server configuration
+      slurp:
+        src: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_server_config.yml"
+      register: minio_server_config_raw
+      
+    - name: Parse MinIO server configuration
+      set_fact:
+        minio_server_config: "{{ minio_server_config_raw.content | b64decode | from_yaml }}"
+        known_minio_server: true
+        
+    - name: Set server details from configuration
+      set_fact:
+        minio_server_host: "{{ minio_server_config.minio_server.ip }}"
+        minio_server_hostname: "{{ minio_server_config.minio_server.host }}"
+        minio_port: "{{ minio_server_config.minio_server.port }}"
+        minio_protocol: "{{ minio_server_config.minio_server.protocol }}"
+        minio_access_key: "{{ minio_server_config.minio_server.credentials.access_key }}"
+        minio_secret_key: "{{ minio_server_config.minio_server.credentials.secret_key }}"
+  when: minio_server_config_file.stat.exists
+
+# Prompt for installation method
+- name: Create installation method menu
+  copy:
+    content: |
+      ==========================================
+           MINIO CLIENT (mc) INSTALLATION METHOD
+      ==========================================
+      1. Online installation (download from internet)
+      2. Offline installation (use local files)
+      
+      Select an option:
+    dest: "/tmp/minio_client_install_method_menu.txt"
+
+- name: Display installation method menu
+  debug:
+    msg: "{{ lookup('file', '/tmp/minio_client_install_method_menu.txt') | split('\n') }}"
+
+- name: Prompt for installation method
+  pause:
+    prompt: "Enter the number of your choice:"
+  register: install_method_choice
+
+- name: Set installation method
+  set_fact:
+    installation_method: "{{ 'online' if install_method_choice.user_input == '1' or install_method_choice.user_input == '' else 'offline' }}"
+
+# Handle offline installation paths
+- name: Handle offline installation paths
+  block:
+    - name: Prompt for Minio client binary path
+      pause:
+        prompt: "Enter the full path to the Minio client (mc) binary on this host:"
+      register: mc_binary_path
+      
+    - name: Check if binary exists
+      stat:
+        path: "{{ mc_binary_path.user_input }}"
+      register: binary_check
+      
+    - name: Fail if binary not found
+      fail:
+        msg: "Binary not found at {{ mc_binary_path.user_input }}. Please provide a valid path to the Minio client binary."
+      when: not binary_check.stat.exists
+      
+    - name: Set binary path
+      set_fact:
+        mc_binary_path: "{{ mc_binary_path.user_input }}"
+  when: installation_method == 'offline'
+
+# Prompt for MinIO server details if not known
+- name: Display known server information
+  debug:
+    msg: |
+      Found existing MinIO server configuration:
+      Server: {{ minio_server_host }} ({{ minio_server_hostname }})
+      Port: {{ minio_port }}
+      Protocol: {{ minio_protocol }}
+      Access Key: {{ minio_access_key }}
+      
+      NOTE: You can use this server or specify a different one.
+  when: known_minio_server
+
+- name: Prompt for MinIO server details
+  block:
+    - name: Prompt for server hostname or IP
+      pause:
+        prompt: "Enter the hostname or IP address of the MinIO server{{ known_minio_server | ternary(' (default: ' + minio_server_host + ')', '') }}:"
+      register: server_host_input
+      
+    - name: Prompt for server port
+      pause:
+        prompt: "Enter the MinIO server port (default: {{ minio_port }}):"
+      register: server_port_input
+      
+    - name: Prompt for protocol
+      pause:
+        prompt: |
+          Select the protocol for MinIO server:
+          1. HTTP (default)
+          2. HTTPS
+          Enter the number of your choice:
+      register: protocol_choice
+      
+    - name: Prompt for access key
+      pause:
+        prompt: "Enter the MinIO access key{{ known_minio_server | ternary(' (default: ' + minio_access_key + ')', ' (default: minioadmin)') }}:"
+      register: access_key_input
+      
+    - name: Prompt for secret key
+      pause:
+        prompt: "Enter the MinIO secret key{{ known_minio_server | ternary(' (default: ' + minio_secret_key + ')', ' (default: minioadmin)') }}:"
+      register: secret_key_input
+      
+    - name: Set server details
+      set_fact:
+        minio_server_host: "{{ server_host_input.user_input if server_host_input.user_input != '' else (minio_server_host | default('localhost')) }}"
+        minio_port: "{{ server_port_input.user_input if server_port_input.user_input != '' else minio_port }}"
+        minio_protocol: "{{ 'https' if protocol_choice.user_input == '2' else 'http' }}"
+        minio_access_key: "{{ access_key_input.user_input if access_key_input.user_input != '' else (minio_access_key | default('minioadmin')) }}"
+        minio_secret_key: "{{ secret_key_input.user_input if secret_key_input.user_input != '' else (minio_secret_key | default('minioadmin')) }}"
+
+# Prompt for bucket name
+- name: Prompt for bucket name
+  pause:
+    prompt: |
+      Enter the name for the Elasticsearch snapshots bucket
+      (default: elasticsearch-snapshots):
+  register: bucket_name_input
+
+- name: Set bucket name
+  set_fact:
+    minio_bucket_name: "{{ bucket_name_input.user_input if bucket_name_input.user_input != '' else 'elasticsearch-snapshots' }}"
+
+# Create pre-installation report
+- name: Create pre-installation report
+  copy:
+    content: |
+      Minio Client Installation Plan
+      =============================
+      Installation Method: {{ installation_method | title }}
+      
+      Target Hosts:
+      ------------
+      {{ ansible_limit | default('all') }}
+      
+      MinIO Server:
+      ------------
+      Hostname/IP: {{ minio_server_host }}
+      Port: {{ minio_port }}
+      Protocol: {{ minio_protocol }}
+      
+      Credentials:
+      -----------
+      Access Key: {{ minio_access_key }}
+      Secret Key: {{ minio_secret_key }}
+      
+      Bucket:
+      ------
+      Default Bucket: {{ minio_bucket_name }}
+      
+      Are you ready to proceed with the installation? (yes/no):
+    dest: "/tmp/minio_client_install_plan.txt"
+
+- name: Display installation plan
+  debug:
+    msg: "{{ lookup('file', '/tmp/minio_client_install_plan.txt') | split('\n') }}"
+
+- name: Prompt for confirmation
+  pause:
+    prompt: "Do you want to proceed with the installation? (yes/no):"
+  register: confirm
+
+- name: Exit if not confirmed
+  meta: end_play
+  when: confirm.user_input | lower != 'yes' and confirm.user_input | lower != 'y'
+
+# Install Minio Client on target hosts
+- name: Install Minio client
+  block:
+    - name: Create directory for Minio client
+      file:
+        path: /usr/local/bin
+        state: directory
+        mode: '0755'
+      become: yes
+      
+    - name: Install Minio client - online
+      get_url:
+        url: "{{ minio_client_url }}"
+        dest: /usr/local/bin/mc
+        mode: '0755'
+      when: installation_method == 'online'
+      become: yes
+      
+    - name: Install Minio client - offline
+      copy:
+        src: "{{ mc_binary_path }}"
+        dest: /usr/local/bin/mc
+        mode: '0755'
+      when: installation_method == 'offline'
+      become: yes
+      
+    - name: Verify Minio client installation
+      command: /usr/local/bin/mc --version
+      register: mc_version
+      changed_when: false
+      
+    - name: Display Minio client version
+      debug:
+        msg: "Minio client installed: {{ mc_version.stdout }}"
+
+# Configure Minio client on all hosts
+- name: Configure Minio client
+  block:  
+    - name: Configure Minio client
+      shell: |
+        /usr/local/bin/mc config host add minio {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }} {{ minio_access_key }} {{ minio_secret_key }}
+      register: mc_config
+      changed_when: true
+      become: yes
+      
+    - name: Test connection to MinIO server
+      shell: /usr/local/bin/mc admin info minio
+      register: minio_test
+      changed_when: false
+      ignore_errors: yes
+      become: yes
+      
+    - name: Display MinIO server info
+      debug:
+        var: minio_test.stdout_lines
+      when: minio_test is success
+      
+    - name: Display connection error
+      debug:
+        msg: "Failed to connect to MinIO server. Please check server details and credentials."
+      when: minio_test is failed
+      
+    - name: Attempt to create default bucket
+      shell: |
+        /usr/local/bin/mc mb minio/{{ minio_bucket_name }}
+      register: create_bucket
+      changed_when: create_bucket.rc == 0
+      ignore_errors: yes
+      become: yes
+      
+    - name: Verify Minio buckets
+      shell: /usr/local/bin/mc ls minio
+      register: mc_ls
+      changed_when: false
+      ignore_errors: yes
+      become: yes
+      
+    - name: Display Minio bucket listing
+      debug:
+        msg: "{{ mc_ls.stdout_lines if mc_ls.stdout_lines | default([]) else 'No buckets found or connection error' }}"
+      ignore_errors: yes
+
+# Save client configuration
+- name: Save MinIO client configuration
+  block:
+    - name: Ensure elasticsearch directory exists
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+        state: directory
+        mode: '0700'
+      
+    - name: Check if client config file exists
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml"
+      register: minio_client_config_file
+      
+    - name: Backup client config file if it exists
+      shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_client_config.yml.$(date +%Y%m%d%H%M%S)"
+      when: minio_client_config_file.stat.exists
+      
+    - name: Prompt for custom bucket name
+      pause:
+        prompt: |
+          Enter the S3 bucket name for Elasticsearch snapshots
+          (Default: elasticsearch-snapshots):
+      register: custom_bucket_name
+      
+    - name: Set bucket name based on user input
+      set_fact:
+        minio_bucket_name: "{{ custom_bucket_name.user_input if custom_bucket_name.user_input | length > 0 else 'elasticsearch-snapshots' }}"
+        
+    - name: Prompt for region configuration
+      pause:
+        prompt: |
+          Do you want to include a region in the repository configuration?
+          Region is used primarily with AWS S3, but can be included for compatibility.
+          (yes/no) [no]:
+      register: include_region_prompt
+      
+    - name: Set region inclusion flag
+      set_fact:
+        include_region: "{{ include_region_prompt.user_input | lower == 'yes' or include_region_prompt.user_input | lower == 'y' }}"
+        
+    - name: Prompt for custom region if included
+      pause:
+        prompt: |
+          Enter the S3 region to use (e.g. us-east-1):
+      register: custom_region_value
+      when: include_region
+      
+    - name: Set region value if included
+      set_fact:
+        minio_region: "{{ custom_region_value.user_input if custom_region_value.user_input | length > 0 else 'us-east-1' }}"
+      when: include_region
+
+    - name: Get real FQDN of MinIO server
+      command: hostname -f
+      register: fqdn_result
+      delegate_to: "{{ server_host }}"
+      ignore_errors: yes
+      when: server_host is defined and server_host != ""
+      
+    - name: Set hostname for repository endpoint
+      set_fact:
+        minio_endpoint_host: "{{ fqdn_result.stdout if (fqdn_result is defined and fqdn_result.stdout | length > 0) else (minio_server_host if minio_server_host is defined else server_host) }}"
+      
+    - name: Create snapshot repository command file
+      copy:
+        content: |
+          # Elasticsearch S3 Repository Configuration
+          # Created by es-toolkit on {{ ansible_date_time.iso8601 }}
+          # Use this command in Kibana Dev Tools to register the S3 repository.
+          # IMPORTANT: Before running this command, add credentials to the Elasticsearch keystore using:
+          # /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.access_key
+          # /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.secret_key
+          
+          PUT _snapshot/minio_repository
+          {
+            "type": "s3",
+            "settings": {
+              "bucket": "{{ minio_bucket_name }}"{% if include_region | default(false) %},
+              "region": "{{ minio_region }}"{% endif %},
+              "endpoint": "{{ minio_endpoint_host }}.internal:{{ minio_port | default('9001') }}",
+              "protocol": "http"
+            }
+          }
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt"
+        mode: '0600'
+        
+    - name: Create MinIO client configuration file
+      copy:
+        content: |
+          ---
+          # Minio Client Configuration
+          # Created by es-toolkit on {{ ansible_date_time.iso8601 }}
+          
+          minio_client:
+            server:
+              host: "{{ minio_server_host }}"
+              port: {{ minio_port }}
+              protocol: "{{ minio_protocol }}"
+            credentials:
+              access_key: "{{ minio_access_key }}"
+              secret_key: "{{ minio_secret_key }}"
+            bucket:
+              name: "{{ minio_bucket_name }}"
+              exists: {{ create_bucket.rc != 0 }}
+            clients:
+              installed_on: {{ ansible_play_hosts | to_json }}
+            connection_test: {{ minio_test is success }}
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml"
+        mode: '0600'
+
+# Generate final report
+- name: Generate installation report
+  debug:
+    msg: |
+      Minio Client Installation Report
+      ==============================
+      
+      Installation Status:
+      -----------------
+      Minio Client Installed on: {{ ansible_play_hosts | join(', ') }}
+      
+      MinIO Server Connection:
+      --------------------
+      Server: {{ minio_server_host }}:{{ minio_port }}
+      Protocol: {{ minio_protocol }}
+      Connection Test: {{ 'SUCCESS' if minio_test is success else 'FAILED' }}
+      
+      Bucket Information:
+      ----------------
+      Default Bucket: {{ minio_bucket_name }}
+      Bucket Creation: {{ 'Success' if create_bucket.rc == 0 else ('Already exists' if 'already own it' in create_bucket.stderr | default('')) else 'Failed' }}
+      
+      Using with Elasticsearch:
+      ---------------------
+      To use this MinIO server with Elasticsearch, add these settings to 
+      your elasticsearch.yml file on all nodes:
+      
+      s3.client.default.endpoint: {{ minio_server_host }}:{{ minio_port }}
+      s3.client.default.protocol: {{ minio_protocol }}
+      
+      Next, add the credentials to the Elasticsearch keystore on all nodes:
+      /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.access_key
+      /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.secret_key
+      
+      Finally, register the repository in Elasticsearch using the command in:
+      {{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt
+
+- name: Cleanup temporary files
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items:
+    - "/tmp/minio_client_install_method_menu.txt"
+    - "/tmp/minio_client_install_plan.txt"
+  ignore_errors: yes

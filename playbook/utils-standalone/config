@@ -1,0 +1,12 @@
+# ~/.ssh/config
+# This is a sample ssh config file that's used to allow Ansible to perform automation tasks to the cluster
+* You'll need to change the Host & IdentityFile values as per your environment & private key name.
+
+Host *.elastic.internal
+    IdentityFile ~/.ssh/your-key.pem
+    User ubuntu
+    StrictHostKeyChecking no
+
+Host *.amazonaws.com *.compute.internal ec2-* 10.* 3.* 18.*
+    IdentityFile ~/.ssh/your-key.pem
+    User ubuntu

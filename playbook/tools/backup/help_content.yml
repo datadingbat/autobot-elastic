@@ -1,0 +1,208 @@
+---
+# Help content for es-toolkit
+
+- name: Generate about content
+  copy:
+    content: |
+      =====================================
+                    ABOUT
+      =====================================
+      
+      AUTOBOT Elastic Toolkit
+      ----------------------
+      
+      This toolkit provides automated management of Elasticsearch 
+      clusters and related services through a comprehensive set 
+      of utilities. It operates using two main plays:
+
+      1. Setup Play (localhost):
+        - Handles variable setup
+        - Manages target selection
+        - Validates configurations
+        - Processes user input
+
+      2. Execution Play (target hosts):
+        - Executes selected utilities
+        - Manages service states
+        - Handles installations/upgrades
+        - Generates reports
+
+      The toolkit supports:
+      - Service state management
+      - Component installation
+      - Service upgrades
+      - Configuration tuning
+      - Backup operations
+      - Multi-host operations
+      - Both online and airgapped environments
+
+      For more information, visit: 
+      https://github.com/datadingbat/autobot-elastic
+    dest: "/tmp/about_content.txt"
+  when: help_choice.user_input == '1'
+
+- name: Generate prerequisites content
+  copy:
+    content: |
+      =====================================
+              PREREQUISITES
+      =====================================
+      
+      1. Ansible Requirements
+        - Ansible with Jinja2 integration is required
+        - Recommended: Install via 'ansible-core'
+        - Required version output should include Jinja version:
+          $ ansible --version
+          ansible [core 2.17.7]
+          ...
+          jinja version = 3.0.3
+
+      2. SSH Configuration
+        - SSH keypair authentication required
+        - Example ~/.ssh/config:
+          Host *.elastic.internal
+              IdentityFile ~/.ssh/your-key.pem
+              User ubuntu
+              StrictHostKeyChecking no
+
+      3. Sudo Access
+        - Ansible user must have sudo privileges
+        - NOPASSWD sudo configuration recommended
+        - Test with: sudo -n true
+    dest: "/tmp/prerequisites_content.txt"
+  when: help_choice.user_input == '2'
+
+- name: Generate deployment vars content
+  copy:
+    content: |
+      =====================================
+      DEPLOYMENT VARIABLES & PASSWORD FILES
+      =====================================
+      
+      ~/.elasticsearch/ Directory Contents:
+      ----------------------------------
+      - certs/: Certificate storage
+      - deployment_vars.yml: Main configuration
+      - elastic_password.txt: Elastic user password
+      - filebeat_output_apikey.txt: Filebeat API key
+      - kibana_password.txt: Kibana system password
+      - metricbeat_remote_monitoring_user.txt
+      - monitoring_cluster_metricbeat_output_apikey.txt
+      - pre_deploy_summary.txt
+      
+      deployment_vars.yml Structure:
+      ----------------------------
+      ```yaml
+      # Installation settings
+      installation_method: "apt"
+      component_version: "8.15.4"
+
+      # Security settings
+      es_cert_pass: "3mhkIsdG/ptCq0ZB"
+      passwords_generated: "True"
+
+      # Cluster settings
+      cluster_name: "elastic-cluster"
+      ```
+    dest: "/tmp/deployment_vars_content.txt"
+  when: help_choice.user_input == '3'
+
+- name: Generate troubleshooting content
+  copy:
+    content: |
+      =====================================
+            TROUBLESHOOTING GUIDE
+      =====================================
+      
+      Package Management:
+      -----------------
+      - Always use removal option (5) for packages
+      - If installation fails, run removal twice
+      - Package states tracked in status reports
+
+      Debug Output:
+      ------------
+      - For detailed output:
+        ansible-playbook -vv playbook.yml
+        ansible-playbook -vvv playbook.yml
+
+      Common Issues:
+      -------------
+      1. Certificate Issues:
+        - Check /etc/elasticsearch/certs/ permissions
+        - Verify certificate password
+
+      2. Service Start Failures:
+        - Check system logs: journalctl -u elasticsearch
+        - Verify heap size settings
+        - Check disk space and permissions
+    dest: "/tmp/troubleshooting_content.txt"
+  when: help_choice.user_input == '4'
+
+- name: Generate tracking files content
+  copy:
+    content: |
+      =====================================
+            CONFIGURATION TRACKING
+      =====================================
+      
+      The Elasticsearch toolkit manages several configuration and tracking files 
+      in the ~/.elasticsearch/ directory to maintain state and enable history tracking.
+      
+      Key Files:
+      ---------
+      - cluster_topology.yml: Current cluster node structure
+      - added_nodes.yml: History of nodes added via toolkit
+      - operations_log.yml: Record of operations performed
+      - minio_config.yml: Minio S3 configuration (if used)
+      - minio_repository_command.txt: Commands for S3 repository setup
+      
+      Backup Strategy:
+      --------------
+      All configuration files are automatically backed up before modification.
+      Backups are stored in ~/.elasticsearch/backups/ with timestamps.
+      
+      Press enter to access the tracking file viewer...
+    dest: "/tmp/tracking_files_content.txt"
+  when: help_choice.user_input == '5'
+
+- name: Display selected content
+  debug:
+    msg: "{{ lookup('file', '/tmp/' + help_files[help_choice.user_input] ) | split('\n') }}"
+  vars:
+    help_files:
+      '1': 'about_content.txt'
+      '2': 'prerequisites_content.txt'
+      '3': 'deployment_vars_content.txt'
+      '4': 'troubleshooting_content.txt'
+      '5': 'tracking_files_content.txt'
+  when: help_choice.user_input in ['1', '2', '3', '4', '5']
+
+- name: Prompt to continue
+  pause:
+    prompt: |
+      
+      Press enter to return to help menu...
+  when: help_choice.user_input in ['1', '2', '3', '4', '5']
+
+- name: Return to main menu
+  meta: end_play
+  when: help_choice.user_input == '6'
+
+- name: Loop back to help menu
+  include_tasks: "{{ playbook_dir }}/tools/help_menu.yml"
+  when: help_choice.user_input != '6'
+
+# Cleanup temporary files
+- name: Cleanup help content files
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items:
+    - "/tmp/help_menu.txt"
+    - "/tmp/about_content.txt"
+    - "/tmp/prerequisites_content.txt"
+    - "/tmp/deployment_vars_content.txt"
+    - "/tmp/troubleshooting_content.txt"
+    - "/tmp/tracking_files_content.txt"
+  ignore_errors: yes

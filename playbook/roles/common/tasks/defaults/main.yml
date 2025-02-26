@@ -1,0 +1,7 @@
+# roles/common/defaults/main.yml
+timeouts:
+  api: 60
+  service: 60
+  operation: 300
+  health_check: 60
+  stabilization: 30

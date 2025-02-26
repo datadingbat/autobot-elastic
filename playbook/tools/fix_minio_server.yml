@@ -1,0 +1,126 @@
+---
+# fix_minio_server.yml - Simple direct fix for minio server installation
+- name: Fix MinIO Server Installation 
+  hosts: helper.elastic  # Direct host specification
+  gather_facts: yes
+  become: yes
+  vars:
+    binary_path: "/home/ubuntu/minio"
+    
+  tasks:
+    - name: Check if binary exists on controller
+      stat:
+        path: "{{ binary_path }}"
+      register: binary_check_controller
+      delegate_to: localhost
+      become: no
+      
+    - name: Debug binary check on controller
+      debug:
+        msg: 
+          - "Path on controller: {{ binary_path }}"
+          - "Exists on controller: {{ binary_check_controller.stat.exists | default('not defined') }}"
+      
+    - name: Fail if binary not found on controller
+      fail:
+        msg: "Binary not found at {{ binary_path }} on the controller. Please provide a valid path to the Minio server binary."
+      when: not binary_check_controller.stat.exists
+
+    - name: Create Minio directories 
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - /usr/local/bin
+        - /minio/data
+        - /etc/minio
+
+    - name: Upload Minio binary to server
+      copy:
+        src: "{{ binary_path }}"
+        dest: /usr/local/bin/minio
+        mode: '0755'
+        remote_src: false
+        
+    - name: Create Minio environment file
+      copy:
+        content: |
+          # Minio configuration
+          MINIO_ROOT_USER=minioadmin
+          MINIO_ROOT_PASSWORD=minioadmin
+          MINIO_VOLUMES=/minio/data
+        dest: /etc/minio/minio.env
+        mode: '0600'
+        
+    - name: Create Minio systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=MinIO
+          Documentation=https://docs.min.io
+          Wants=network-online.target
+          After=network-online.target
+          AssertFileIsExecutable=/usr/local/bin/minio
+
+          [Service]
+          WorkingDirectory=/usr/local/
+          EnvironmentFile=/etc/minio/minio.env
+          User=root
+          Group=root
+          ExecStartPre=/bin/bash -c "if [ -z \"${MINIO_VOLUMES}\" ]; then echo \"Variable MINIO_VOLUMES not set in /etc/minio/minio.env\"; exit 1; fi"
+          ExecStart=/usr/local/bin/minio server --console-address :9001 --address :9000 $MINIO_OPTS
+          Restart=always
+          LimitNOFILE=65536
+          TasksMax=infinity
+          TimeoutStopSec=infinity
+          SendSIGKILL=no
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/minio.service
+        mode: '0644'
+        
+    - name: Start and enable Minio service
+      systemd:
+        name: minio
+        state: started
+        enabled: yes
+        daemon_reload: yes
+        
+    - name: Wait for Minio server to start
+      wait_for:
+        host: "127.0.0.1"
+        port: "9000"
+        timeout: 60
+      
+    - name: Get server IP address
+      shell: "hostname -I | awk '{print $1}'"
+      register: server_ip_result
+      changed_when: false
+      
+    - name: Debug server IP
+      debug:
+        msg: "Server IP address: {{ server_ip_result.stdout.strip() }}"
+        
+    - name: Generate installation report
+      debug:
+        msg: |
+          Minio Server Installation Report
+          ===============================
+          
+          Server Details:
+          --------------
+          Host: {{ inventory_hostname }}
+          IP Address: {{ server_ip_result.stdout.strip() }}
+          Status: Running
+          
+          Endpoints:
+          ---------
+          API: http://{{ inventory_hostname }}:9000
+          Console: http://{{ inventory_hostname }}:9001
+          
+          Credentials:
+          -----------
+          Access Key: minioadmin
+          Secret Key: minioadmin

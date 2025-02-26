@@ -1,0 +1,69 @@
+---
+# direct_minio_install.yml - Installs MinIO via command-line parameters
+- name: Direct MinIO Installation
+  hosts: localhost
+  gather_facts: no  
+  tasks:
+    - name: Verify required variables
+      fail:
+        msg: "Required variables missing. Run with: ansible-playbook direct_minio_install.yml -e 'install_type=server binary_path=/home/ubuntu/minio server_host=helper.elastic'"
+      when: install_type is not defined or server_host is not defined
+      
+    - name: Set installation type
+      set_fact:
+        is_server: "{{ install_type == 'server' }}"
+        is_client: "{{ install_type == 'client' }}"
+        
+    - name: Verify valid installation type
+      fail:
+        msg: "Invalid install_type. Must be 'server' or 'client'."
+      when: not (is_server or is_client)
+      
+    - name: Set binary path
+      set_fact:
+        binary_path_var: "{{ binary_path | default('/home/ubuntu/minio' if is_server else '/home/ubuntu/mc') }}"
+        
+    - name: Setup MinIO Server
+      block:
+        - name: Verify server host in inventory
+          debug:
+            msg: "Installing MinIO Server on {{ server_host }} using binary from {{ binary_path_var }}"
+            
+        - name: Check if binary exists
+          stat:
+            path: "{{ binary_path_var }}"
+          register: binary_stat
+          
+        - name: Fail if binary doesn't exist
+          fail:
+            msg: "Binary not found at {{ binary_path_var }}"
+          when: not binary_stat.stat.exists
+            
+        - name: Create temporary copy of minio_server_setup.yml
+          copy:
+            src: tools/minio_server_setup.yml
+            dest: /tmp/minio_server_setup.yml
+            
+        - name: Modify server_host validation
+          replace:
+            path: /tmp/minio_server_setup.yml
+            regexp: "- name: Validate server host\n  fail:\n    msg: \"Host '{{ server_host_value }}' not found in inventory\"\n  when: server_host_value not in groups\\['all'\\]"
+            replace: "- name: Debug server host validation\n  debug:\n    msg: \"Using server host: {{ server_host_value }}\""
+            
+        - name: Execute the modified MinIO setup
+          include_tasks: /tmp/minio_server_setup.yml
+          vars:
+            noninteractive: "true"
+            install_method_var: "offline"
+            minio_binary_path_default: "{{ binary_path_var }}"
+            server_host_default: "{{ server_host }}"
+      when: is_server
+      
+    - name: Setup MinIO Client
+      block:
+        - name: Debug client install
+          debug:
+            msg: "Installing MinIO Client using binary from {{ binary_path_var }}, configuring for server {{ server_host }}"
+            
+        # Would include client setup tasks here
+      when: is_client

@@ -1,0 +1,200 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: total_ram_gb. Please specify total RAM in gigabytes."
+      when: total_ram_gb is not defined
+
+    - name: Validate RAM value
+      fail:
+        msg: "Invalid RAM value. Must be a positive integer greater than 4GB."
+      when: not total_ram_gb|int or total_ram_gb|int < 4
+  run_once: true
+  delegate_to: localhost
+
+- name: Calculate system resources
+  block:
+    - name: Calculate heap size
+      set_fact:
+        heap_size: "{{ [(total_ram_gb|int / 2)|round|int, 128|int]|min }}"
+
+    - name: Display calculated values
+      debug:
+        msg: 
+          - "Total RAM: {{ total_ram_gb }}GB"
+          - "Calculated heap size: {{ heap_size }}GB"
+
+- name: Main utility tasks
+  block:
+    # Memory and swap configuration
+    - name: Configure memory settings
+      block:
+        - name: Disable swap
+          command: swapoff -a
+          changed_when: false
+
+        - name: Configure memlock limits
+          copy:
+            dest: /etc/security/limits.d/elasticsearch.conf
+            content: |
+              elasticsearch soft memlock unlimited
+              elasticsearch hard memlock unlimited
+              elasticsearch soft nofile 65535
+              elasticsearch hard nofile 65535
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Set vm.max_map_count
+          sysctl:
+            name: vm.max_map_count
+            value: '262144'
+            sysctl_set: yes
+            state: present
+            reload: yes
+      rescue:
+        - name: Handle memory configuration failure
+          fail:
+            msg: "Failed to configure memory settings. Check system permissions and requirements."
+      become: yes
+
+    # JVM configuration
+    - name: Configure JVM
+      block:
+        - name: Create JVM options directory
+          file:
+            path: /etc/elasticsearch/jvm.options.d
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Configure JVM heap size
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/heap.options
+            content: |
+              -Xms{{ heap_size }}g
+              -Xmx{{ heap_size }}g
+              # Additional JVM options
+              -XX:+UseG1GC
+              -XX:G1ReservePercent=25
+              -XX:InitiatingHeapOccupancyPercent=30
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+      rescue:
+        - name: Handle JVM configuration failure
+          fail:
+            msg: "Failed to configure JVM settings. Check directory permissions and elasticsearch user existence."
+      become: yes
+
+    # System limits configuration
+    - name: Configure system limits
+      block:
+        - name: Set ulimit in systemd service
+          blockinfile:
+            path: /usr/lib/systemd/system/elasticsearch.service
+            insertafter: '^\[Service\]'
+            block: |
+              LimitMEMLOCK=infinity
+              LimitNOFILE=65535
+              LimitNPROC=4096
+            backup: yes
+
+        - name: Set system limits
+          lineinfile:
+            path: /etc/security/limits.conf
+            line: "{{ item }}"
+            create: yes
+          loop:
+            - "elasticsearch  -  nofile  65535"
+            - "elasticsearch  -  nproc   4096"
+
+        - name: Reload systemd
+          systemd:
+            daemon_reload: yes
+      rescue:
+        - name: Handle system limits configuration failure
+          fail:
+            msg: "Failed to configure system limits. Check systemd service file and limits.conf permissions."
+      become: yes
+
+    # Verification tasks
+    - name: Verify configuration
+      block:
+        - name: Check memory lock limits
+          command: ulimit -l
+          register: memlock_result
+          changed_when: false
+
+        - name: Check file descriptor limits
+          shell: ulimit -n
+          register: ulimit_result
+          changed_when: false
+
+        - name: Display verification results
+          debug:
+            msg:
+              - "Memory lock limit: {{ memlock_result.stdout }}"
+              - "File descriptor limit: {{ ulimit_result.stdout }}"
+              - "Heap size configuration: {{ heap_size }}GB"
+      become: yes
+      become_user: elasticsearch
+
+  rescue:
+    - name: Handle overall tuning failure
+      fail:
+        msg: "Elasticsearch tuning failed. Check error messages above."
+
+- name: Generate tuning report
+  block:
+    - name: Create report directory
+      file:
+        path: "/tmp/es_tuning_reports"
+        state: directory
+      delegate_to: localhost
+
+    - name: Create tuning report
+      copy:
+        content: |
+          Elasticsearch Tuning Report
+          =========================
+          Host: {{ inventory_hostname }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+
+          Memory Configuration:
+          - Total System RAM: {{ total_ram_gb }}GB
+          - JVM Heap Size: {{ heap_size }}GB
+          - Swap: Disabled
+          - Memory Lock: Unlimited
+
+          System Limits:
+          - Max File Descriptors: 65535
+          - Max Processes: 4096
+          - Virtual Memory Max Map Count: 262144
+
+          JVM Configuration:
+          - Min Heap: {{ heap_size }}GB
+          - Max Heap: {{ heap_size }}GB
+          - Garbage Collector: G1GC
+          - G1GC Reserve: 25%
+          - Heap Occupancy Threshold: 30%
+
+          Verification Results:
+          - Memory Lock Limit: {{ memlock_result.stdout }}
+          - File Descriptor Limit: {{ ulimit_result.stdout }}
+        dest: "/tmp/es_tuning_reports/tuning_{{ inventory_hostname | replace('.', '_') }}.txt"
+      delegate_to: localhost
+
+    - name: Display tuning report
+      debug:
+        msg: "{{ lookup('file', '/tmp/es_tuning_reports/tuning_' + inventory_hostname | replace('.', '_') + '.txt') | split('\n') }}"
+  always:
+    - name: Cleanup report files
+      file:
+        path: "/tmp/es_tuning_reports"
+        state: absent
+      delegate_to: localhost
+      ignore_errors: yes

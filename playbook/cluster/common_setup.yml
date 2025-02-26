@@ -1,0 +1,64 @@
+---
+- name: Configure All Nodes
+  hosts: master_nodes,hot_nodes,frozen_nodes,ml_nodes,kibana
+  gather_facts: yes
+  vars_files:
+    - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  tasks:
+
+    - name: Configure APT prerequisites
+      block:
+        - name: Ensure apt-transport-https is installed
+          apt:
+            name: apt-transport-https
+            state: present
+            update_cache: yes
+
+        - name: Install necessary packages
+          apt:
+            name:
+              - gnupg
+              - curl
+              - wget
+            state: present
+
+        - name: Create keyring directory
+          file:
+            path: /usr/share/keyrings
+            state: directory
+            mode: '0755'
+
+        - name: Download Elasticsearch GPG key
+          get_url:
+            url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+            dest: /tmp/elasticsearch.asc
+            mode: '0644'
+
+        - name: Import the Elasticsearch GPG key
+          shell: |
+            cat /tmp/elasticsearch.asc | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg
+          args:
+            creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+        - name: Add Elasticsearch repository
+          copy:
+            dest: /etc/apt/sources.list.d/elastic-8.x.list
+            content: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg arch=amd64] https://artifacts.elastic.co/packages/8.x/apt stable main"
+            mode: '0644'
+
+        - name: Force apt update
+          apt:
+            update_cache: yes
+            cache_valid_time: 0
+      when: installation_method == 'apt'
+      become: yes
+
+    # Cleanup
+    - name: Clean up temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/elasticsearch.asc"
+      ignore_errors: yes
+      become: yes

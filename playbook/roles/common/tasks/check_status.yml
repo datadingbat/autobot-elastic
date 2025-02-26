@@ -1,0 +1,34 @@
+# roles/common/tasks/check_status.yml
+- name: Perform comprehensive status check
+  block:
+    - name: Check package status
+      shell: "dpkg -l {{ selected_service }} | grep '^ii'"
+      register: pkg_check
+      changed_when: false
+      failed_when: false
+      become: yes
+      no_log: true
+
+    - name: Check service status
+      systemd:
+        name: "{{ selected_service }}"
+        state: started
+      register: service_status
+      check_mode: yes
+      become: yes
+      no_log: true
+
+    - name: Include API checks if applicable
+      include_tasks: roles/common/tasks/es_api_check.yml
+      when: selected_service == 'elasticsearch'
+
+    - name: Store comprehensive status
+      set_fact:
+        component_status:
+          package:
+            installed: "{{ pkg_check.rc == 0 }}"
+            version: "{{ pkg_check.stdout.split()[2] | default('not installed') if pkg_check.rc == 0 else 'not installed' }}"
+          service:
+            state: "{{ service_status.status.ActiveState | default('unknown') }}"
+            substate: "{{ service_status.status.SubState | default('unknown') }}"
+          api: "{{ api_status | default({}) if selected_service == 'elasticsearch' else {} }}"

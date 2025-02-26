@@ -1,0 +1,570 @@
+---
+# view_tracking.yml - Child play for es-toolkit to view tracking file changes
+
+- name: Set default variables
+  set_fact:
+    tracking_dir: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+    backups_dir: "{{ lookup('env', 'HOME') }}/.elasticsearch/backups"
+    tracking_files:
+      - cluster_topology.yml
+      - added_nodes.yml
+      - operations_log.yml
+      - minio_config.yml
+      - minio_repository_command.txt
+  run_once: true
+  delegate_to: localhost
+  
+- name: Ensure tmp directory exists
+  file:
+    path: /tmp/es-toolkit-changes
+    state: directory
+    mode: '0755'
+  run_once: true
+  delegate_to: localhost
+
+- name: Check if tracking directory exists
+  stat:
+    path: "{{ tracking_dir }}"
+  register: tracking_dir_check
+  delegate_to: localhost
+  run_once: true
+
+- name: Notify if tracking directory doesn't exist
+  debug:
+    msg: "No configuration files found. Directory {{ tracking_dir }} does not exist."
+  when: not tracking_dir_check.stat.exists
+  delegate_to: localhost
+  run_once: true
+
+- name: Check if backups directory exists
+  stat:
+    path: "{{ backups_dir }}"
+  register: backups_dir_check
+  delegate_to: localhost
+  run_once: true
+  
+- name: Notify if backups directory doesn't exist
+  debug:
+    msg: "No backup files found. Directory {{ backups_dir }} does not exist."
+  when: not backups_dir_check.stat.exists and tracking_dir_check.stat.exists
+  delegate_to: localhost
+  run_once: true
+
+- name: Create tracking menu
+  copy:
+    content: |
+      =============================================
+            TRACKING & CONFIGURATION VIEWER
+      =============================================
+
+      This tool allows you to view configuration files and their change history.
+      
+      Current files in {{ tracking_dir }}:
+      {% for file in tracking_files %}
+      {% set file_path = tracking_dir + '/' + file %}
+      {% set file_exists = lookup('ansible.builtin.fileglob', file_path) | length > 0 %}
+      {{ loop.index }}. {{ file }}{% if file_exists %} [EXISTS]{% else %} [NOT FOUND]{% endif %}
+      
+      {% endfor %}
+      {{ tracking_files | length + 1 }}. List backup files
+      {{ tracking_files | length + 2 }}. Compare a file with its backup
+      {{ tracking_files | length + 3 }}. Return to help menu
+      
+      Select an option (1-{{ tracking_files | length + 3 }}):
+    dest: "/tmp/es-toolkit-changes/tracking_menu.txt"
+  delegate_to: localhost
+  run_once: true
+
+- name: Display tracking menu
+  debug:
+    msg: "{{ lookup('file', '/tmp/es-toolkit-changes/tracking_menu.txt') | split('\n') }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: Prompt for tracking option
+  pause:
+    prompt: "Enter your choice (1-{{ tracking_files | length + 3 }}):"
+  register: tracking_choice
+  run_once: true
+  delegate_to: localhost
+
+# Simplest approach: handle each option directly rather than checking ranges
+- name: Handle option 1 (cluster_topology.yml)
+  block:
+    - name: Check if file exists
+      stat:
+        path: "{{ tracking_dir }}/cluster_topology.yml"
+      register: file_check
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display file not found message
+      debug:
+        msg: "File cluster_topology.yml not found in {{ tracking_dir }}/"
+      when: not file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Read file content
+      command: "cat {{ tracking_dir }}/cluster_topology.yml"
+      register: file_content
+      when: file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      changed_when: false
+      
+    - name: Display file content
+      block:
+        - name: Create file content report
+          copy:
+            content: |
+              =============================================
+                File: {{ tracking_dir }}/cluster_topology.yml
+              =============================================
+              Last modified: {{ file_check.stat.mtime | string }}
+              Size: {{ file_check.stat.size }} bytes
+              
+              CONTENT:
+              --------
+              {{ file_content.stdout }}
+            dest: "/tmp/es-toolkit-changes/file_content.txt"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Display file content report
+          debug:
+            msg: "{{ lookup('file', '/tmp/es-toolkit-changes/file_content.txt') | split('\n') }}"
+          delegate_to: localhost
+          run_once: true
+      when: file_check.stat.exists
+      
+    - name: Wait for user to review content
+      pause:
+        prompt: "Press Enter to return to tracking menu..."
+      delegate_to: localhost
+      run_once: true
+  when: tracking_choice.user_input == "1"
+
+- name: Handle option 2 (added_nodes.yml)
+  block:
+    - name: Check if file exists
+      stat:
+        path: "{{ tracking_dir }}/added_nodes.yml"
+      register: file_check
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display file not found message
+      debug:
+        msg: "File added_nodes.yml not found in {{ tracking_dir }}/"
+      when: not file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Read file content
+      command: "cat {{ tracking_dir }}/added_nodes.yml"
+      register: file_content
+      when: file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      changed_when: false
+      
+    - name: Display file content
+      block:
+        - name: Create file content report
+          copy:
+            content: |
+              =============================================
+                File: {{ tracking_dir }}/added_nodes.yml
+              =============================================
+              Last modified: {{ file_check.stat.mtime | string }}
+              Size: {{ file_check.stat.size }} bytes
+              
+              CONTENT:
+              --------
+              {{ file_content.stdout }}
+            dest: "/tmp/es-toolkit-changes/file_content.txt"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Display file content report
+          debug:
+            msg: "{{ lookup('file', '/tmp/es-toolkit-changes/file_content.txt') | split('\n') }}"
+          delegate_to: localhost
+          run_once: true
+      when: file_check.stat.exists
+      
+    - name: Wait for user to review content
+      pause:
+        prompt: "Press Enter to return to tracking menu..."
+      delegate_to: localhost
+      run_once: true
+  when: tracking_choice.user_input == "2"
+
+- name: Handle option 3 (operations_log.yml)
+  block:
+    - name: Check if file exists
+      stat:
+        path: "{{ tracking_dir }}/operations_log.yml"
+      register: file_check
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display file not found message
+      debug:
+        msg: "File operations_log.yml not found in {{ tracking_dir }}/"
+      when: not file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Read file content
+      command: "cat {{ tracking_dir }}/operations_log.yml"
+      register: file_content
+      when: file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      changed_when: false
+      
+    - name: Display file content
+      block:
+        - name: Create file content report
+          copy:
+            content: |
+              =============================================
+                File: {{ tracking_dir }}/operations_log.yml
+              =============================================
+              Last modified: {{ file_check.stat.mtime | string }}
+              Size: {{ file_check.stat.size }} bytes
+              
+              CONTENT:
+              --------
+              {{ file_content.stdout }}
+            dest: "/tmp/es-toolkit-changes/file_content.txt"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Display file content report
+          debug:
+            msg: "{{ lookup('file', '/tmp/es-toolkit-changes/file_content.txt') | split('\n') }}"
+          delegate_to: localhost
+          run_once: true
+      when: file_check.stat.exists
+      
+    - name: Wait for user to review content
+      pause:
+        prompt: "Press Enter to return to tracking menu..."
+      delegate_to: localhost
+      run_once: true
+  when: tracking_choice.user_input == "3"
+
+- name: Handle option 4 (minio_config.yml)
+  block:
+    - name: Check if file exists
+      stat:
+        path: "{{ tracking_dir }}/minio_config.yml"
+      register: file_check
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display file not found message
+      debug:
+        msg: "File minio_config.yml not found in {{ tracking_dir }}/"
+      when: not file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Read file content
+      command: "cat {{ tracking_dir }}/minio_config.yml"
+      register: file_content
+      when: file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      changed_when: false
+      
+    - name: Display file content
+      block:
+        - name: Create file content report
+          copy:
+            content: |
+              =============================================
+                File: {{ tracking_dir }}/minio_config.yml
+              =============================================
+              Last modified: {{ file_check.stat.mtime | string }}
+              Size: {{ file_check.stat.size }} bytes
+              
+              CONTENT:
+              --------
+              {{ file_content.stdout }}
+            dest: "/tmp/es-toolkit-changes/file_content.txt"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Display file content report
+          debug:
+            msg: "{{ lookup('file', '/tmp/es-toolkit-changes/file_content.txt') | split('\n') }}"
+          delegate_to: localhost
+          run_once: true
+      when: file_check.stat.exists
+      
+    - name: Wait for user to review content
+      pause:
+        prompt: "Press Enter to return to tracking menu..."
+      delegate_to: localhost
+      run_once: true
+  when: tracking_choice.user_input == "4"
+
+- name: Handle option 5 (minio_repository_command.txt)
+  block:
+    - name: Check if file exists
+      stat:
+        path: "{{ tracking_dir }}/minio_repository_command.txt"
+      register: file_check
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display file not found message
+      debug:
+        msg: "File minio_repository_command.txt not found in {{ tracking_dir }}/"
+      when: not file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Read file content
+      command: "cat {{ tracking_dir }}/minio_repository_command.txt"
+      register: file_content
+      when: file_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      changed_when: false
+      
+    - name: Display file content
+      block:
+        - name: Create file content report
+          copy:
+            content: |
+              =============================================
+                File: {{ tracking_dir }}/minio_repository_command.txt
+              =============================================
+              Last modified: {{ file_check.stat.mtime | string }}
+              Size: {{ file_check.stat.size }} bytes
+              
+              CONTENT:
+              --------
+              {{ file_content.stdout }}
+            dest: "/tmp/es-toolkit-changes/file_content.txt"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Display file content report
+          debug:
+            msg: "{{ lookup('file', '/tmp/es-toolkit-changes/file_content.txt') | split('\n') }}"
+          delegate_to: localhost
+          run_once: true
+      when: file_check.stat.exists
+      
+    - name: Wait for user to review content
+      pause:
+        prompt: "Press Enter to return to tracking menu..."
+      delegate_to: localhost
+      run_once: true
+  when: tracking_choice.user_input == "5"
+
+- name: Handle option 6 (List backup files)
+  block:
+    - name: Check if backups directory exists
+      fail:
+        msg: "Backup directory not found at {{ backups_dir }}"
+      when: not backups_dir_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Get backup files
+      find:
+        paths: "{{ backups_dir }}"
+        patterns: "*"
+        file_type: file
+      register: backup_files
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Create simple backup file report
+      copy:
+        content: |
+          =============================================
+                BACKUP FILES LISTING
+          =============================================
+          
+          Backup directory: {{ backups_dir }}
+          
+          {% if backup_files.files | length == 0 %}
+          No backup files found.
+          {% else %}
+          Available backup files:
+          {% for file in backup_files.files | sort(attribute='path') %}
+          - {{ file.path | basename }} ({{ file.size }} bytes)
+          {% endfor %}
+          {% endif %}
+        dest: "/tmp/es-toolkit-changes/backup_files.txt"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display backup files report
+      debug:
+        msg: "{{ lookup('file', '/tmp/es-toolkit-changes/backup_files.txt') | split('\n') }}"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Wait for user to review backup files
+      pause:
+        prompt: "Press Enter to return to tracking menu..."
+      delegate_to: localhost
+      run_once: true
+  when: tracking_choice.user_input == "6"
+  
+- name: Handle option 7 (Compare file with backup)
+  block:
+    - name: Check if backups directory exists
+      fail:
+        msg: "Backup directory not found at {{ backups_dir }}"
+      when: not backups_dir_check.stat.exists
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Prompt for file to compare
+      pause:
+        prompt: |
+          Enter the base filename to compare (e.g., cluster_topology.yml, added_nodes.yml):
+      register: compare_file_input
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Check if file exists
+      stat:
+        path: "{{ tracking_dir }}/{{ compare_file_input.user_input }}"
+      register: current_file_check
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Get backup files for specified base
+      find:
+        paths: "{{ backups_dir }}"
+        patterns: "{{ compare_file_input.user_input }}*"
+        file_type: file
+      register: specific_backups
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Validate file and backups
+      fail:
+        msg: |
+          {% if not current_file_check.stat.exists %}
+          Current file {{ tracking_dir }}/{{ compare_file_input.user_input }} does not exist.
+          {% elif specific_backups.files | length == 0 %}
+          No backup files found for {{ compare_file_input.user_input }}.
+          {% endif %}
+      when: not current_file_check.stat.exists or specific_backups.files | length == 0
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Create backup selection menu
+      copy:
+        content: |
+          =============================================
+                SELECT BACKUP TO COMPARE
+          =============================================
+          
+          Current file: {{ tracking_dir }}/{{ compare_file_input.user_input }}
+          
+          Available backups:
+          {% for file in specific_backups.files | sort(attribute='mtime', reverse=true) %}
+          {{ loop.index }}. {{ file.path | basename }} ({{ file.mtime | string }})
+          {% endfor %}
+          
+          Select a backup to compare (1-{{ specific_backups.files | length }}):
+        dest: "/tmp/es-toolkit-changes/backup_selection.txt"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display backup selection menu
+      debug:
+        msg: "{{ lookup('file', '/tmp/es-toolkit-changes/backup_selection.txt') | split('\n') }}"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Prompt for backup selection
+      pause:
+        prompt: "Enter your choice (1-{{ specific_backups.files | length }}):"
+      register: backup_choice
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Get selected backup
+      set_fact:
+        selected_backup: "{{ (specific_backups.files | sort(attribute='mtime', reverse=true))[backup_choice.user_input | int - 1].path }}"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Generate diff between files
+      command: "diff -u {{ selected_backup }} {{ tracking_dir }}/{{ compare_file_input.user_input }}"
+      register: diff_result
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+      failed_when: diff_result.rc > 1  # diff returns 1 if files are different, which is expected
+      
+    - name: Create comparison report
+      copy:
+        content: |
+          =============================================
+                FILE COMPARISON REPORT
+          =============================================
+          
+          Current file: {{ tracking_dir }}/{{ compare_file_input.user_input }}
+          Backup file: {{ selected_backup }}
+          
+          CHANGES:
+          --------
+          {% if diff_result.rc == 0 %}
+          No differences found - files are identical.
+          {% else %}
+          {{ diff_result.stdout }}
+          {% endif %}
+        dest: "/tmp/es-toolkit-changes/comparison.txt"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display comparison report
+      debug:
+        msg: "{{ lookup('file', '/tmp/es-toolkit-changes/comparison.txt') | split('\n') }}"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Wait for user to review comparison
+      pause:
+        prompt: "Press Enter to return to tracking menu..."
+      delegate_to: localhost
+      run_once: true
+  when: tracking_choice.user_input == "7"
+  
+- name: Return to help menu
+  include_tasks: "{{ playbook_dir }}/tools/help_menu.yml"
+  when: tracking_choice.user_input == "8"
+  
+- name: Loop back to tracking menu
+  include_tasks: "{{ playbook_dir }}/tools/view_tracking.yml"
+  when: tracking_choice.user_input != "8"
+
+# Cleanup temporary files
+- name: Cleanup temp files
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items:
+    - "/tmp/es-toolkit-changes/tracking_menu.txt"
+    - "/tmp/es-toolkit-changes/file_content.txt"
+    - "/tmp/es-toolkit-changes/backup_files.txt"
+    - "/tmp/es-toolkit-changes/backup_selection.txt"
+    - "/tmp/es-toolkit-changes/comparison.txt"
+  ignore_errors: yes
+  delegate_to: localhost
+  run_once: true

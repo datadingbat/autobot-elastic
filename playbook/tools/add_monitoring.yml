@@ -1,0 +1,347 @@
+---
+# Input validation tasks
+- name: Include deployment variables
+  include_vars:
+    file: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  delegate_to: localhost
+  run_once: true
+
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+        - installation_method
+        - component_version
+
+    - name: Check required groups
+      fail:
+        msg: "Required group '{{ item }}' not found in inventory"
+      when: groups[item] is not defined or groups[item] | length == 0
+      with_items:
+        - master_nodes
+  run_once: true
+  delegate_to: localhost
+
+- name: Set default variables
+  set_fact:
+    first_master: "{{ groups['master_nodes'][0] }}"
+    cert_files:
+      - elastic-http-ca.pem
+      - elastic-http-ca.crt
+      - elastic-http.key
+      - elastic-http.pem
+      - elastic-http.p12
+      - elastic-certificates.p12
+
+- name: Main utility tasks
+  block:
+    - name: Install Elasticsearch
+      block:
+        - name: Install Elasticsearch from local package
+          apt:
+            deb: "{{ es_deb_package_path }}" 
+            state: present
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          become: yes
+          when: installation_method == "local"
+
+        - name: Install Elasticsearch from apt repository
+          apt:
+            name: "elasticsearch={{ component_version }}"
+            state: present
+            update_cache: yes
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          become: yes
+          when: installation_method == "apt"
+
+        - name: Wait for installation to settle
+          wait_for:
+            timeout: 10
+      rescue:
+        - name: Handle installation failure
+          fail:
+            msg: "Failed to install Elasticsearch. Check package availability and system requirements."
+      delegate_to: "{{ ansible_limit }}"
+
+    - name: Short pause after perms
+      wait_for:
+        timeout: 10
+      delegate_to: localhost
+      run_once: true
+
+    # Certificate setup
+    - name: Setup certificates
+      block:
+        - name: Create certificates directory
+          file:
+            path: /etc/elasticsearch/certs
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+          become: yes
+
+        - name: Fetch certificates from master node
+          ansible.builtin.fetch:
+            src: "/etc/elasticsearch/certs/{{ item }}"
+            dest: "/tmp/elastic-certs/{{ item }}"
+            flat: yes
+          with_items: "{{ cert_files }}"
+          run_once: true
+          delegate_to: "{{ first_master }}"
+          become: yes
+
+        - name: Copy certificates to monitoring instance
+          copy:
+            src: "/tmp/elastic-certs/{{ item }}"
+            dest: "/etc/elasticsearch/certs/{{ item }}"
+            mode: '0644'
+          with_items: "{{ cert_files }}"
+          become: yes
+          delegate_to: "{{ ansible_limit }}"
+
+        - name: Set certificate permissions
+          file:
+            path: "{{ item }}"
+            owner: root
+            group: elasticsearch
+            mode: '0660'
+          with_items:
+            - "/etc/elasticsearch/certs/elastic-certificates.p12"
+            - "/etc/elasticsearch/certs/elastic-http-ca.pem"
+            - "/etc/elasticsearch/certs/elastic-http-ca.crt"
+            - "/etc/elasticsearch/certs/elastic-http.p12"
+            - "/etc/elasticsearch/certs/elastic-http.pem"
+            - "/etc/elasticsearch/certs/elastic-http.key"
+          become: yes
+          delegate_to: "{{ ansible_limit }}"
+      rescue:
+        - name: Handle certificate setup failure
+          fail:
+            msg: "Failed to setup certificates. Check permissions and certificate existence."
+
+    # Configuration tasks
+    - name: Configure monitoring instance
+      block:
+        - name: Configure SSL passwords
+          shell: |
+            echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
+            echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password    
+            echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
+            echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.truststore.secure_password
+          become: yes
+          delegate_to: "{{ ansible_limit }}"
+
+        - name: Create elasticsearch configuration
+          copy:
+            dest: /etc/elasticsearch/elasticsearch.yml
+            content: |
+              # Elasticsearch monitoring instance configuration
+              path.data: /var/lib/elasticsearch
+              path.logs: /var/log/elasticsearch
+              bootstrap.memory_lock: true
+              cluster.name: monitoring-cluster
+              discovery.type: single-node
+              node.name: "{{ hostvars[ansible_limit].ansible_host }}"
+              network.host: "{{ hostvars[ansible_limit].ansible_host }}"
+              node.roles: [master, data, ingest, ml, remote_cluster_client]
+
+              # Monitoring configuration
+              xpack.monitoring.collection.enabled: true
+              xpack.monitoring.elasticsearch.collection.enabled: false
+
+              # Security configuration
+              xpack.security.enabled: true
+              xpack.security.enrollment.enabled: true
+
+              # HTTP SSL Configuration
+              xpack.security.http.ssl:
+                enabled: true
+                keystore.path: /etc/elasticsearch/certs/elastic-http.p12
+                truststore.path: /etc/elasticsearch/certs/elastic-http.p12
+                verification_mode: certificate 
+                client_authentication: optional
+
+              # Transport SSL Configuration
+              xpack.security.transport.ssl:
+                enabled: true
+                verification_mode: certificate
+                keystore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+                truststore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+                client_authentication: optional
+
+              # Network settings
+              transport.host: 0.0.0.0
+              transport.port: 9300
+              http.port: 9200
+            owner: elasticsearch
+            group: elasticsearch
+            mode: '0660'
+          become: yes
+          delegate_to: "{{ ansible_limit }}"
+      rescue:
+        - name: Handle configuration failure
+          fail:
+            msg: "Failed to configure Elasticsearch. Check permissions and configuration values."
+
+    # Service management
+    - name: Manage service
+      block:
+        - name: Start Elasticsearch service
+          systemd:
+            name: elasticsearch
+            state: started
+            enabled: yes
+            daemon_reload: yes
+          become: yes
+
+        - name: Wait for service startup
+          wait_for:
+            timeout: 30
+      rescue:
+        - name: Handle service start failure
+          fail:
+            msg: "Failed to start Elasticsearch service. Check logs with 'journalctl -u elasticsearch'."
+      delegate_to: "{{ ansible_limit }}"
+
+    # Security setup
+    - name: Configure security
+      block:
+        - name: Reset elastic user password
+          expect:
+            command: "/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b -s -i"
+            responses:
+              "Enter password for \\[elastic\\]:": "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}\n"
+              "Re-enter password for \\[elastic\\]:": "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}\n"
+            timeout: 30
+          become: yes
+
+        - name: Create metrics viewer role
+          uri:
+            url: "https://{{ hostvars[ansible_limit].ansible_host }}:9200/_security/role/metrics_viewer"
+            method: PUT
+            body_format: json
+            body: |
+              {
+                "indices": [
+                  {
+                    "names": ["metrics-*"],
+                    "privileges": ["read", "read_cross_cluster", "view_index_metadata"]
+                  },
+                  {
+                    "names": [".monitoring-*"],
+                    "privileges": ["read", "read_cross_cluster"]
+                  }
+                ]
+              }
+            user: "elastic"
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: no
+            status_code: [200, 201]
+            headers:
+              Content-Type: "application/json"
+
+        - name: Create monitoring user
+          uri:
+            url: "https://{{ hostvars[ansible_limit].ansible_host }}:9200/_security/user/kibana_monitoring"
+            method: PUT
+            body_format: json
+            body: |
+              {
+                "password": "elastic2024",
+                "roles": ["monitoring_user", "metrics_viewer"],
+                "full_name": "Kibana Monitoring User",
+                "email": "monitoring@your-domain.com"
+              }
+            user: "elastic"
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: no
+            status_code: [200, 201]
+            headers:
+              Content-Type: "application/json"
+      rescue:
+        - name: Handle security setup failure
+          fail:
+            msg: "Failed to configure security settings. Check Elasticsearch status and credentials."
+      delegate_to: "{{ ansible_limit }}"
+
+  rescue:
+    - name: Handle overall setup failure
+      fail:
+        msg: "Monitoring instance setup failed. Check error messages above."
+
+  always:
+    - name: Set cleanup files list
+      set_fact:
+        cleanup_files:
+          - "/tmp/es_preinstall_report.txt"
+          - "/tmp/es_install_report.txt"
+          - "{{ ansible_env.HOME }}/elasticsearch.asc"  
+          - "/tmp/es_install_report.txt"
+      run_once: true
+      delegate_to: localhost
+      #no_log: true
+
+- name: Create installation report
+  copy:
+    content: |
+      Elasticsearch Installation Report
+      ===============================
+      Installation Summary:
+      -------------------
+      Next Steps:
+      -----------
+      1. Update kibana.yml to include the following:
+
+      monitoring.ui.elasticsearch.hosts: "https://{{ hostvars[ansible_limit].ansible_host }}:9200"
+      monitoring.ui.elasticsearch.username: "kibana_monitoring"
+      monitoring.ui.elasticsearch.password: "elastic2024"
+      monitoring.ui.elasticsearch.ssl.verificationMode: certificate
+      monitoring.ui.elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/elastic-http-ca.crt"]
+
+      2. Restart Kibana
+      3. Install Metricbeat with this toolkit
+
+    dest: "/tmp/monitoring_install_report.txt"
+  run_once: true
+  delegate_to: localhost
+
+- name: Display installation report
+  debug:
+    msg: "{{ lookup('file', '/tmp/monitoring_install_report.txt') | split('\n') }}"
+  run_once: true
+  delegate_to: localhost
+
+# Cleanup tasks
+- name: Cleanup
+  block:
+    - name: Remove temporary files
+      file:
+        path: "/tmp/elastic-certs"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+    - name: Remove temporary files
+      file:
+        path: "/tmp/monitoring_install_report.txt"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+  always:
+    - name: Ensure temp files are removed
+      file:
+        path: "/tmp/elastic-certs"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes
+
+

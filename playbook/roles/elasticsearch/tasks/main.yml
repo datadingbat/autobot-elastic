@@ -1,0 +1,322 @@
+---
+# Part 1: Initial Node Install and Configuration
+# es_cert_pass is hard-coded on line 23 - you may wish to change this
+# (it's also defined in kibana/tasks/main.yml, so you'll need to change it there too)
+- name: Install and Configure Elasticsearch
+  block:
+    # Initial Installation
+    - name: Install Elasticsearch
+      apt:
+        name: elasticsearch=8.15.4
+        state: present
+        allow_unauthenticated: no
+        update_cache: yes
+      become_method: sudo
+      environment:
+        DEBIAN_FRONTEND: noninteractive        
+        
+   # Install Elasticsearch from local .deb package
+   # - name: Install Elasticsearch from deb package
+   #   apt:
+   #     deb: /tmp/elasticsearch-8.15.4-amd64.deb
+   #     state: present
+   #     allow_unauthenticated: no
+   #   become_method: sudo
+   #   environment:
+   #     DEBIAN_FRONTEND: noninteractive
+
+    - name: Wait for package installation to settle
+      wait_for:
+        timeout: 10
+
+    - name: Set certificate password fact
+      set_fact:
+        es_cert_pass: "elastic2024"
+        
+    - name: Set s3 secret key fact
+      set_fact:
+        s3_client_secret_key: "sample_secret_key"
+
+    - name: Set s3 access key fact
+      set_fact:
+        s3_client_access_key: "sample_access_key"
+
+    # Certificate generation tasks - first master only
+    - name: Create certs directory
+      file:
+        path: /etc/elasticsearch/certs
+        state: directory
+        owner: root
+        group: elasticsearch
+        mode: '0750'
+
+    - name: Generate Transport CA certificate (only on master node)
+      command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+        --out "/etc/elasticsearch/certs/elastic-stack-ca.p12"
+        --pass "{{ es_cert_pass }}"
+      args:
+        creates: "/etc/elasticsearch/certs/elastic-stack-ca.p12"
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    - name: Generate Transport certificates for all nodes (only on master node)
+      command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil cert 
+        --ca "/etc/elasticsearch/certs/elastic-stack-ca.p12"
+        --ca-pass "{{ es_cert_pass }}"
+        --out "/etc/elasticsearch/certs/elastic-certificates.p12"
+        --pass "{{ es_cert_pass }}"
+      args:
+        creates: "/etc/elasticsearch/certs/elastic-certificates.p12"
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    - name: Generate HTTP CA certificate (only on master node)
+      command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+        --out "/etc/elasticsearch/certs/elastic-http-ca.p12"
+        --pass "{{ es_cert_pass }}"
+      args:
+        creates: "/etc/elasticsearch/certs/elastic-http-ca.p12"
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    - name: Extract HTTP CA certificate as PEM (only on master node)
+      command: >
+        openssl pkcs12 -in /etc/elasticsearch/certs/elastic-http-ca.p12
+        -clcerts -nokeys -out /etc/elasticsearch/certs/elastic-http-ca.pem
+        -passin pass:"{{ es_cert_pass }}"
+      args:
+        creates: "/etc/elasticsearch/certs/elastic-http-ca.pem"
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    - name: Generate HTTP certificates for all nodes (only on master node)
+      command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+        --ca "/etc/elasticsearch/certs/elastic-http-ca.p12"
+        --ca-pass "{{ es_cert_pass }}"
+        --out "/etc/elasticsearch/certs/elastic-http.p12"
+        --pass "{{ es_cert_pass }}"
+      args:
+        creates: "/etc/elasticsearch/certs/elastic-http.p12"
+      when: inventory_hostname == groups['master_nodes'][0]
+    
+    - name: Set certificate permissions
+      file:
+        path: "{{ item }}"
+        owner: root
+        group: elasticsearch
+        mode: '0660'
+      with_items:
+        - "/etc/elasticsearch/certs/elastic-stack-ca.p12"
+        - "/etc/elasticsearch/certs/elastic-certificates.p12" 
+        - "/etc/elasticsearch/certs/elastic-http-ca.p12"
+        - "/etc/elasticsearch/certs/elastic-http-ca.pem"
+        - "/etc/elasticsearch/certs/elastic-http.p12"
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    - name: Fetch certificates to control node
+      fetch:
+        src: "/etc/elasticsearch/certs/{{ item }}"
+        dest: "/tmp/elastic-certs/"
+        flat: yes
+      with_items:
+        - "elastic-certificates.p12"
+        - "elastic-http.p12"
+        - "elastic-http-ca.pem" 
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    # Common tasks for all nodes - no conditions
+    - name: Copy certificates to other nodes
+      copy:
+        src: "/tmp/elastic-certs/elastic-certificates.p12"
+        dest: "/etc/elasticsearch/certs/elastic-certificates.p12"
+        mode: '0664'
+        owner: root
+        group: elasticsearch
+
+    - name: Copy certificates to other nodes
+      copy:
+        src: "/tmp/elastic-certs/elastic-http.p12"
+        dest: "/etc/elasticsearch/certs/elastic-http.p12"
+        mode: '0664'
+        owner: root
+        group: elasticsearch
+
+    - name: Update keystore with cert passwords & s3 keys
+      shell: |
+       echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.keystore.secure_password
+       echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.transport.ssl.truststore.secure_password    
+       echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.keystore.secure_password
+       echo "{{ es_cert_pass }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f xpack.security.http.ssl.truststore.secure_password
+       echo "{{ s3_client_secret_key }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f s3.client.default.secret_key
+       echo "{{ s3_client_access_key }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f s3.client.default.access_key
+       
+    - name: Create initial elasticsearch settings
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        content: |
+          # Elasticsearch configuration
+          path.data: /var/lib/elasticsearch
+          path.logs: /var/log/elasticsearch
+
+          # Prevent heap memory from being swapped out
+          bootstrap.memory_lock: true
+          
+          # We will need to set this once we do some benchmarks. For now keep it commented out
+          #indices.recovery.max_bytes_per_sec
+          
+          # Cluster name
+          cluster.name: elastic-cluster
+
+          # Node configuration
+          node.name: {{ hostvars[inventory_hostname]['ansible_host'] }}
+          network.host: {{ ansible_host }}  
+
+          # Node roles
+          {% if inventory_hostname in groups['master_nodes'] %}
+          node.roles: [master]
+          {% elif inventory_hostname in groups['hot_nodes'] %}
+          node.roles: [data_hot, ingest, remote_cluster_client, ml, data_content, transform]
+          {% elif inventory_hostname in groups['frozen_nodes'] %}
+          node.roles: [data_frozen, remote_cluster_client]
+          {% endif %}
+
+          # Discovery configuration
+          discovery.seed_hosts:
+          {% for host in groups['master_nodes'] %}
+            - {{ hostvars[host]['ansible_host'] }}:9300
+          {% endfor %}
+
+          # Initial master nodes (only for bootstrap)
+          {% if inventory_hostname in groups['master_nodes'] %}
+          cluster.initial_master_nodes:
+          {% for host in groups['master_nodes'] %}
+            - {{ hostvars[host]['ansible_host'] }}
+          {% endfor %}
+          {% endif %}
+          
+          # Security settings
+          xpack.security.enabled: true
+          xpack.security.enrollment.enabled: true
+
+          # HTTP SSL Configuration
+          xpack.security.http.ssl:
+            enabled: true
+            keystore.path: /etc/elasticsearch/certs/elastic-http.p12
+            truststore.path: /etc/elasticsearch/certs/elastic-http.p12
+            verification_mode: certificate 
+            client_authentication: optional
+            
+          # Transport SSL Configuration
+          xpack.security.transport.ssl:
+            enabled: true
+            verification_mode: certificate
+            keystore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+            truststore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+            client_authentication: optional
+
+          # Network settings
+          transport.host: 0.0.0.0
+          transport.port: 9300
+          http.port: 9200
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0660'
+  become: yes
+
+# Part 2: Start Master Nodes
+- name: Start master nodes
+  block:
+    - name: Start Elasticsearch service on master nodes
+      systemd:
+        name: elasticsearch
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for initial master startup
+      wait_for:
+        port: 9200
+        host: "{{ ansible_host }}"
+        timeout: 180
+
+  become: yes
+  when: inventory_hostname in groups['master_nodes']
+
+# Part 3: Start Data Nodes
+- name: Configure and start data nodes
+  block:
+    - name: Start Elasticsearch on data nodes
+      systemd:
+        name: elasticsearch
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for data node to join cluster
+      wait_for:
+        port: 9200
+        host: "{{ ansible_host }}"
+        timeout: 180
+  become: yes
+  when: inventory_hostname not in groups['master_nodes']
+
+# Part 5: Security Configuration
+- name: Configure cluster security
+  block:
+    - name: Get elastic user password
+      block:
+        - name: Reset elastic user password
+          shell: |
+            /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b -f
+          register: elastic_password
+          retries: 5
+          delay: 20
+          until: elastic_password.rc == 0
+          
+        - name: Set password fact
+          set_fact:
+            clean_password: "{{ elastic_password.stdout.split('New value: ')[1] | trim }}"
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    - name: Share password with other nodes
+      set_fact:
+        clean_password: "{{ hostvars[groups['master_nodes'][0]]['clean_password'] }}"
+      when: inventory_hostname != groups['master_nodes'][0]
+
+    - name: Create credentials directory
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      run_once: true
+      become: no
+
+    - name: Save credentials
+      block:
+        - name: Save elastic password
+          copy:
+            content: "{{ clean_password }}"
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/elastic_password.txt"
+            mode: '0600'
+          delegate_to: localhost
+          become: no
+      when: inventory_hostname == groups['master_nodes'][0]
+
+    - name: Final cluster health check with auth
+      uri:
+        url: "https://{{ ansible_host }}:9200/_cluster/health"
+        method: GET
+        return_content: yes
+        status_code: [200]
+        validate_certs: no
+        user: elastic
+        password: "{{ clean_password }}"
+        force_basic_auth: yes
+      register: final_health_check
+      until: (final_health_check.json is defined) and (final_health_check.json.status in ['green', 'yellow'])
+      retries: 60
+      delay: 5
+      when: inventory_hostname == groups['master_nodes'][0]
+  become: yes
+  when: inventory_hostname in groups['master_nodes']

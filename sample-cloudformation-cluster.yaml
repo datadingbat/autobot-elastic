@@ -1,0 +1,1180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Elasticsearch Cluster with MINIO-based S3 Storage'
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+
+  AdminIP:
+    Type: String
+    Description: Admin IP CIDR for SSH and Elasticsearch access
+    # Removed Default to enforce specification during stack creation
+
+  UbuntuAMI:
+    Type: String
+    Default: ami-086a29cf9ece2c43d
+    Description: Latest Debian AMI from Parameter Store
+  
+  UbuntuAMI:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id'
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-vpc
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-igw
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24    # Different CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']    # Different AZ
+      MapPublicIpOnLaunch: true
+
+  # Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+
+  # Default Route
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate Route Table with Subnets
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+# Base Security Group
+  BaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Base security group for external access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # SSH from AdminIP
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminIP
+        # Elasticsearch ports (9200-9300) from AdminIP
+        - IpProtocol: tcp
+          FromPort: 9200
+          ToPort: 9300
+          CidrIp: !Ref AdminIP
+        # Kibana port (5601) from AdminIP
+        - IpProtocol: tcp
+          FromPort: 5601
+          ToPort: 5601
+          CidrIp: !Ref AdminIP
+        # MinIO ports (9000-9001) from AdminIP
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9001
+          CidrIp: !Ref AdminIP
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-base-sg
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+
+  # Internal Cluster Security Group
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for internal cluster communication
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Allow all traffic from within the cluster security group
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          SourceSecurityGroupId: !Ref BaseSecurityGroup
+
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-cluster-sg
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+
+
+  # IAM Role for EC2 Instances
+  ElasticInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess # Adjust as needed
+      Path: /
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-instance-role
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+
+  # IAM Instance Profile
+  ElasticInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ElasticInstanceRole
+
+  # S3 Bucket for MinIO
+  MinioS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-frz-${AWS::Region}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-frozen-repo
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  # EC2 Instance for MinIO & Ansible
+  HelperNode:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.xlarge
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: helper.elastic.internal
+      PrivateDnsName: helper.elastic.internal                                 
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y wget systemd software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+          wget https://dl.min.io/server/minio/release/linux-amd64/minio -O /usr/local/bin/minio
+          #wget https://dl.min.io/server/minio/release/linux-amd64/archive/minio_20241013133411.0.0_amd64.deb -O minio.deb
+          #sudo dpkg -i minio.deb
+          #mkdir ~/minio
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-kibana-node" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+
+          chmod +x /usr/local/bin/minio
+          mkdir -p /minio-data
+          chmod 777 /minio-data
+          # Create systemd service for MinIO
+          sudo cat <<EOF > /etc/systemd/system/minio.service
+          [Unit]
+          Description=MinIO Service
+          After=network.target
+
+          [Service]
+          User=admin
+          ExecStart=/usr/local/bin/minio server start /minio-data --console-address ":9001"
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable minio
+          systemctl start minio
+
+
+  # EC2 Instances for Master Nodes
+  MasterNode1:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: master1.elastic.internal
+      PrivateDnsName: master1.elastic.internal          
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  MasterNode2:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: master2.elastic.internal
+      PrivateDnsName: master2.elastic.internal             
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  MasterNode3:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: master3.elastic.internal
+      PrivateDnsName: master3.elastic.internal             
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  # EC2 Instances for Hot Nodes - HotNode1 has Kibana
+
+  HotNode1:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: hot1.elastic.internal
+      PrivateDnsName: hot1.elastic.internal             
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  HotNode2:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: hot2.elastic.internal
+      PrivateDnsName: hot2.elastic.internal                       
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  HotNode3:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: hot3.elastic.internal
+      PrivateDnsName: hot3.elastic.internal                       
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  HotNode4:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: hot4.elastic.internal
+      PrivateDnsName: hot4.elastic.internal                       
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  # EC2 Instances for Frozen Nodes
+
+  FrozenNode1:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: frozen1.elastic.internal
+      PrivateDnsName: frozen1.elastic.internal                       
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  FrozenNode2:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: frozen2.elastic.internal
+      PrivateDnsName: frozen2.elastic.internal                                 
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$username$-$project$-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu          
+
+  # EC2 Instances for ML Nodes
+
+  MLNode1:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: ml1.elastic.internal
+      PrivateDnsName: ml1.elastic.internal                       
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=jessem-autobot-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu
+
+  MLNode2:
+    Type: AWS::EC2::Instance
+    DependsOn: HelperNode
+    Properties:
+      InstanceType: m6i.xlarge	
+      ImageId: !Ref UbuntuAMI
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BaseSecurityGroup
+        - !Ref ClusterSecurityGroup
+      IamInstanceProfile: !Ref ElasticInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 2000
+            VolumeType: gp3
+      Tags:
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+        - Key: Name
+          Value: ml2.elastic.internal
+      PrivateDnsName: ml2.elastic.internal                                 
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install -y software-properties-common python3
+          apt-add-repository --yes --update ppa:ansible/ansible
+          apt install -y ansible
+          # Ansible will be configured from the control node
+
+          # Set up authorized keys for Ansible
+          mkdir -p /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          
+          # Wait for controller's metadata to be available
+          while ! CONTROLLER_KEY=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=jessem-autobot-helper" \
+            --query 'Reservations[0].Instances[0].Tags[?Key==`ansible_ssh_key`].Value' \
+            --output text); do
+            sleep 10
+          done
+          
+          echo "$CONTROLLER_KEY" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh          
+          # Add ubuntu user to sudo group and configure passwordless sudo
+          usermod -aG sudo ubuntu
+          echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+          chmod 440 /etc/sudoers.d/ubuntu          
+
+  # Elastic Load Balancer for Elasticsearch
+  ElasticsearchLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "$username$-$project$-lb"
+      Subnets:
+        - !Ref PublicSubnet1    # Updated reference name
+        - !Ref PublicSubnet2    # Added second subnet
+      SecurityGroups:
+        - !Ref BaseSecurityGroup
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-elasticsearch-lb
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+
+  # Target Group for Elasticsearch
+  ElasticsearchTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: "$username$-$project$-tg"
+      Port: 9200
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '9200'
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200-299'
+      Tags:
+        - Key: Name
+          Value: $username$-$project$-elasticsearch-tg
+        - Key: division
+          Value: field
+        - Key: org
+          Value: sa
+        - Key: team
+          Value: amer-strat
+        - Key: project
+          Value: $username$-$project$
+
+  # Listener for ELB
+  ElasticsearchListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ElasticsearchLoadBalancer
+      Port: 9200
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ElasticsearchTargetGroup
+
+# Route 53 Resources - these should be at the root level, aligned with other resources
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: elastic.internal
+      VPCs:
+        - VPCId: !Ref VPC
+          VPCRegion: !Ref 'AWS::Region'
+      HostedZoneConfig:
+        Comment: Private hosted zone for Elasticsearch cluster
+
+  # DNS Records for Master Nodes
+  MasterNode1DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: master1.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt MasterNode1.PrivateIp
+
+  MasterNode2DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: master2.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt MasterNode2.PrivateIp
+
+  MasterNode3DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: master3.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt MasterNode3.PrivateIp
+
+  # DNS Records for Hot Nodes
+  HotNode1DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: hot1.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt HotNode1.PrivateIp
+
+  HotNode2DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: hot2.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt HotNode2.PrivateIp
+
+  HotNode3DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: hot3.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt HotNode3.PrivateIp
+
+  HotNode4DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: hot4.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt HotNode4.PrivateIp
+
+  # DNS Records for Frozen Nodes
+  FrozenNode1DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: frozen1.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt FrozenNode1.PrivateIp
+
+  FrozenNode2DNS:  
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: frozen2.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt FrozenNode2.PrivateIp
+
+  # DNS Records for ML Nodes
+  MLNode1DNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: ml1.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt MLNode1.PrivateIp
+
+  MLNode2DNS:  
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: ml2.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt MLNode2.PrivateIp
+
+  HelperNodeDNS:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: helper.elastic.internal
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt HelperNode.PrivateIp
+
+Outputs:
+  MinioEndpoint:
+    Description: MinIO Server Endpoint
+    Value: !Sub http://${HelperNode.PublicDnsName}:9000
+
+  MinioConsole:
+    Description: MinIO Console URL 
+    Value: !Sub http://${HelperNode.PublicDnsName}:9001
+
+  KibanaURL:
+    Description: Kibana URL
+    Value: !Sub http://${HotNode1.PublicDnsName}:5601
+
+  ElasticsearchURL:
+    Description: Elasticsearch Load Balancer URL
+    Value: !Sub http://${ElasticsearchLoadBalancer.DNSName}:9200
+

@@ -1,0 +1,27 @@
+---
+- name: Test Minio Server Setup
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Set target host
+      set_fact:
+        target_host: "helper.elastic"
+
+    - name: Set fake inventory groups for testing
+      set_fact:
+        groups:
+          all:
+            - "helper.elastic"
+            - "hot1.elastic"
+          helper_instance:
+            - "helper.elastic"
+          hot_nodes: 
+            - "hot1.elastic"
+
+    - name: Include Minio server setup tasks with non-interactive mode
+      include_tasks: minio_server_setup.yml
+      vars:
+        noninteractive: true
+        install_method: "offline"
+        minio_binary_path_default: "/home/ubuntu/minio"
+        server_host_default: "{{ target_host }}"

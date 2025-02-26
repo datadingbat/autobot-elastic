@@ -1,0 +1,552 @@
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+  run_once: true
+  delegate_to: localhost
+  no_log: true
+
+- name: Validate required groups
+  fail:
+    msg: "Required group '{{ item }}' not found in inventory"
+  when: groups[item] is not defined or groups[item] | length == 0
+  with_items:
+    - hot_nodes
+    - kibana
+  run_once: true
+  delegate_to: localhost
+
+# Set default variables from parent playbook and vars file
+- name: Set base variables
+  set_fact:
+    installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] | default('apt') }}"
+    component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}"
+    start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] | default(true) }}"
+    cert_files:
+      - elastic-http.p12
+      - elastic-http-ca.pem
+      - elastic-http-ca.crt
+  no_log: true
+
+# Load deployment variables for certificate password
+- name: Load deployment variables
+  include_vars:
+    file: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  no_log: true
+  run_once: true
+  delegate_to: localhost
+
+# Set certificate password after loading deployment vars
+- name: Set certificate password
+  set_fact:
+    es_cert_pass: "{{ es_cert_pass | default('elastic2024') }}"
+  no_log: true
+
+# Pre-flight certificate checks
+- name: Check certificates
+  block:
+    - name: Check controller certificates
+      stat:
+        path: "/tmp/kibana_certs/{{ item }}"
+      register: controller_cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Setup certificates if needed
+      block:
+        - name: Create temp cert directory
+          file:
+            path: /tmp/kibana_certs
+            state: directory
+            mode: '0755'
+            owner: "{{ ansible_user }}"
+          delegate_to: localhost
+          run_once: true
+          become: yes
+          no_log: true
+
+        - name: Fetch certificates from hot node
+          fetch:
+            src: "/etc/elasticsearch/certs/{{ item }}"
+            dest: "/tmp/kibana_certs/{{ item }}"
+            flat: yes
+            mode: '0644'
+          with_items: "{{ cert_files }}"
+          delegate_to: "{{ groups['hot_nodes'][0] }}"
+          run_once: true
+          become: yes
+          no_log: true
+      when: controller_cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+
+    - name: Verify fetched certificates
+      stat:
+        path: "/tmp/kibana_certs/{{ item }}"
+      register: cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Validate certificates exist
+      fail:
+        msg: "Required certificates not found. Please ensure certificates are generated first."
+      when: cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+      run_once: true
+      delegate_to: localhost
+
+# Pre-flight status check
+- name: Pre-flight checks
+  block:
+    - name: Check installation status
+      block:
+        - name: Check if package is installed
+          shell: "dpkg -l kibana | grep -q '^ii'"
+          register: pkg_check
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check if service is active
+          shell: "systemctl is-active kibana || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check if config directory exists
+          stat:
+            path: /etc/kibana
+          register: config_check
+          become: yes
+          no_log: true
+
+        - name: Set installation status
+          set_fact:
+            kibana_installed: "{{ pkg_check.rc == 0 or service_check.stdout == 'active' or config_check.stat.exists }}"
+            host_status:
+              installed: "{{ pkg_check.rc == 0 or service_check.stdout == 'active' or config_check.stat.exists }}"
+              pkg_status: "{{ pkg_check.rc == 0 }}"
+              service_status: "{{ service_check.stdout }}"
+              config_exists: "{{ config_check.stat.exists }}"
+          no_log: true
+
+    - name: Create installation status report
+      copy:
+        content: |
+          Pre-Installation Status Report
+          =============================
+          Installation Details:
+          -------------------
+          Component: Kibana
+          Installation Method: {{ hostvars['localhost']['selected_play_vars']['installation_method'] }}
+          {% if hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt' %}
+          Version: {% if hostvars['localhost']['selected_play_vars']['component_version'] is defined %}{% if hostvars['localhost']['selected_play_vars']['component_version'] == 'latest' %}Latest available{% else %}{{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% endif %}{% else %}Not specified{% endif %}
+          {% else %}
+          Package Path: {{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('Not specified') }}
+          {% endif %}
+
+          Target Hosts:
+          -------------
+          Total Target Hosts: {{ ansible_play_hosts | length }}
+
+          Hosts with Existing Installation (Will Skip):
+          {% for host in ansible_play_hosts %}
+          {% if hostvars[host].host_status.installed %}
+          - {{ host }}
+            Package: {% if hostvars[host].host_status.pkg_status %}Installed{% else %}Not installed{% endif %}
+            Service: {{ hostvars[host].host_status.service_status }}
+            Config Directory: {% if hostvars[host].host_status.config_exists %}Exists{% else %}Not found{% endif %}
+
+          {% endif %}
+          {% endfor %}
+
+          Hosts Ready for Installation:
+          {% for host in ansible_play_hosts %}
+          {% if not hostvars[host].host_status.installed %}
+          - {{ host }}
+          {% endif %}
+          {% endfor %}
+
+          {% if ansible_play_hosts | map('extract', hostvars) | map(attribute='host_status') | selectattr('installed', 'equalto', true) | list | length > 0 %}
+          NOTE: Some hosts have existing Kibana installations.
+          To install Kibana on these hosts:
+          1. Use [7. Backup Service] to backup your configuration
+          2. Use [5. Remove Service] to remove existing installations
+          3. Run this installation again
+          {% endif %}
+        dest: "/tmp/kibana_preinstall_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display pre-installation status
+      debug:
+        msg: "{{ lookup('file', '/tmp/kibana_preinstall_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Prompt for installation confirmation
+      pause:
+        prompt: |
+          The above report shows the current status of target hosts.
+          Do you want to proceed with installation on eligible hosts? (yes/no):
+      register: install_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: install_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
+# APT Repository Setup
+- name: Install APT prerequisites
+  when: not kibana_installed and hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt'
+  block:
+    - name: Ensure apt-transport-https is installed
+      apt:
+        name: apt-transport-https
+        state: present
+        update_cache: yes
+      no_log: true
+
+    - name: Install necessary packages
+      apt:
+        name:
+          - gnupg
+          - curl
+          - wget
+        state: present
+      no_log: true
+
+    - name: Create keyring directory
+      file:
+        path: /usr/share/keyrings
+        state: directory
+      no_log: true
+
+    - name: Download Elasticsearch GPG key
+      get_url:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        dest: "{{ ansible_env.HOME }}/elasticsearch.asc"
+        mode: '0644'
+      no_log: true
+
+    - name: Import the Elasticsearch GPG key
+      shell: |
+        cat "{{ ansible_env.HOME }}/elasticsearch.asc" | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+      no_log: true
+
+    - name: Add Elasticsearch repository
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        content: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg arch=amd64] https://artifacts.elastic.co/packages/8.x/apt stable main"
+        mode: '0644'
+      no_log: true
+
+    - name: Force apt update
+      apt:
+        update_cache: yes
+        cache_valid_time: 0
+      no_log: true
+  become: yes
+
+# Installation
+- name: Install Kibana
+  when: not kibana_installed
+  block:
+    - name: Copy deb package to target host
+      copy:
+        src: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}"
+        dest: "/tmp/kibana.deb"
+        mode: '0644'
+      when: hostvars['localhost']['selected_play_vars']['installation_method'] == 'local'
+      no_log: true
+
+    - name: Install via APT
+      apt:
+        name: "kibana{% if hostvars['localhost']['selected_play_vars']['component_version'] != 'latest' %}={{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% endif %}"
+        state: "{{ 'latest' if hostvars['localhost']['selected_play_vars']['component_version'] == 'latest' else 'present' }}"
+        allow_unauthenticated: no
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt'
+      no_log: true
+
+    - name: Install from local package
+      apt:
+        deb: "/tmp/kibana.deb"
+        state: present
+        allow_unauthenticated: no
+      when: hostvars['localhost']['selected_play_vars']['installation_method'] == 'local'
+      no_log: true
+  become: yes
+
+# Certificate and Directory Setup
+- name: Setup certificates and directories
+  when: not kibana_installed
+  block:
+    - name: Create Kibana certificates directory
+      file:
+        path: /etc/kibana/certs
+        state: directory
+        owner: kibana
+        group: kibana
+        mode: '0750'
+      no_log: true
+
+    - name: Copy certificates
+      copy:
+        src: "/tmp/kibana_certs/{{ item }}"
+        dest: "/etc/kibana/certs/{{ item }}"
+        owner: kibana
+        group: kibana
+        mode: '0640'
+      with_items: "{{ cert_files }}"
+      no_log: true
+
+    - name: Create log directory
+      file:
+        path: /var/log/kibana
+        state: directory
+        owner: kibana
+        group: kibana
+        mode: '0755'
+      no_log: true
+  become: yes
+
+# Generate encryption keys and reset password
+- name: Setup Kibana security
+  when: not kibana_installed
+  block:
+    - name: Generate encryption keys
+      shell: /usr/share/kibana/bin/kibana-encryption-keys generate -q
+      register: encryption_keys
+      changed_when: false
+      become: yes
+      no_log: true
+
+    - name: Reset kibana_system user password
+      shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -b -f
+      register: kibana_password
+      delegate_to: "{{ groups['hot_nodes'][0] }}"
+      become: yes
+      no_log: true
+
+    # Configuration
+    - name: Configure Kibana
+      block:
+        - name: Set Kibana keystore passwords
+          shell: |
+            echo '{{ kibana_password.stdout.split("New value: ")[1] | trim }}' | /usr/share/kibana/bin/kibana-keystore add --stdin elasticsearch.password
+            echo '{{ es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.keystore.password
+            echo '{{ es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.truststore.password
+          become: yes
+          #no_log: true
+
+        - name: Configure kibana.yml
+          copy:
+            dest: /etc/kibana/kibana.yml
+            content: |
+              # Server configuration
+              server.host: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+              server.port: 5601
+              server.name: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+
+              # SSL Configuration
+              server.ssl.enabled: true
+              server.ssl.keystore.path: "/etc/kibana/certs/elastic-http.p12"
+              server.ssl.truststore.path: "/etc/kibana/certs/elastic-http.p12"
+
+              # Elasticsearch connection
+              elasticsearch.hosts:
+                {% for host in groups['hot_nodes'] %}
+                - "https://{{ hostvars[host].ansible_host }}:9200"
+                {% endfor %}
+              
+              elasticsearch.username: "kibana_system"
+              
+              elasticsearch.ssl.verificationMode: certificate
+              elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/elastic-http-ca.crt"]
+
+              # Generated encryption keys
+              {{ encryption_keys.stdout }}
+              
+              # Logging configuration
+              logging.root.level: info
+              logging.appenders.default:
+                type: file
+                fileName: /var/log/kibana/kibana.log
+                layout:
+                  type: json
+              
+              # Logging
+              elasticsearch.logQueries: true
+
+              # Monitoring
+              monitoring.ui.container.elasticsearch.enabled: true
+            owner: kibana
+            group: kibana
+            mode: '0660'
+          become: yes 
+          #no_log: true
+
+    # Service management
+    - name: Manage Kibana service
+      block:
+        - name: Enable service
+          systemd:
+            name: kibana
+            enabled: yes
+            daemon_reload: yes
+
+        - name: Start service
+          systemd:
+            name: kibana
+            state: started
+          when: start_service | bool
+
+        - name: Wait for service stabilization
+          wait_for:
+            timeout: 30
+          when: start_service | bool
+      become: yes
+      no_log: true
+
+    # Save credentials
+    - name: Save Kibana credentials
+      block:
+        - name: Ensure elasticsearch directory exists
+          file:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+            state: directory
+            mode: '0700'
+          delegate_to: localhost
+
+        - name: Save Kibana password
+          copy:
+            content: "{{ kibana_password.stdout }}"
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/kibana_password.txt"
+            mode: '0600'
+          delegate_to: localhost
+          no_log: true
+      run_once: true
+
+# Generate final report
+- name: Generate installation report
+  block:
+    - name: Get final service status
+      shell: "systemctl status kibana || true"
+      register: final_status
+      changed_when: false
+      failed_when: false
+      become: yes
+      when: not kibana_installed
+      no_log: true
+
+    - name: Collect final status
+      set_fact:
+        final_status_info: "{{ final_status_info | default({}) | combine({inventory_hostname: {
+          'skipped': kibana_installed,
+          'status': final_status if not kibana_installed else omit
+        }}) }}"
+      delegate_to: localhost
+      no_log: true
+
+    - name: Create installation report
+      copy:
+        content: |
+          Kibana Installation Report
+          ========================
+          Installation Summary:
+          -------------------
+          Total Hosts: {{ ansible_play_hosts | length }}
+          Skipped (Existing): {{ final_status_info.values() | selectattr('skipped', 'true') | list | length }}
+          Attempted Install: {{ final_status_info.values() | selectattr('skipped', 'false') | list | length }}
+
+          Skipped Hosts (Existing Installation):
+          {% for host, info in final_status_info.items() if info.skipped %}
+          - {{ host }}
+          {% endfor %}
+
+          Installation Results:
+          {% for host, info in final_status_info.items() if not info.skipped %}
+          Host: {{ host }}
+          Status: {% if 'Active: active (running)' in info.status.stdout %}Successfully installed and running
+          {% elif 'Active:' in info.status.stdout %}Installed but not running
+          {% else %}Installation failed or incomplete{% endif %}
+          
+          Details:
+          {{ info.status.stdout }}
+          
+          {% endfor %}
+
+          Access Information:
+          -----------------
+          {% for host in groups['kibana'] %}
+          Kibana URL: https://{{ hostvars[host].ansible_host }}:5601
+          {% endfor %}
+          Credentials: Saved to ~/.elasticsearch/kibana_password.txt
+        dest: "/tmp/kibana_install_report.txt"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Display installation report
+      debug:
+        msg: "{{ lookup('file', '/tmp/kibana_install_report.txt') | split('\n') }}"
+      delegate_to: localhost
+      run_once: true
+
+# Cleanup
+- name: Cleanup
+  block:
+    - name: Set cleanup files list
+      set_fact:
+        cleanup_files:
+          - "/tmp/kibana_preinstall_report.txt"
+          - "/tmp/kibana_install_report.txt"
+          - "{{ ansible_env.HOME }}/elasticsearch.asc"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Add deb package to cleanup list if local installation
+      set_fact:
+        cleanup_files: "{{ cleanup_files + ['/tmp/kibana.deb'] }}"
+      when: 
+        - hostvars['localhost']['selected_play_vars']['installation_method'] is defined
+        - hostvars['localhost']['selected_play_vars']['installation_method'] == 'local'
+      run_once: true
+      delegate_to: localhost
+      
+
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items: "{{ cleanup_files }}"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes
+      become: true
+  always:
+    - name: Ensure temp files are removed
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items: "{{ cleanup_files + ['/tmp/kibana_certs'] }}"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes
+      become: true

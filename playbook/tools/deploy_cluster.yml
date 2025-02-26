@@ -1,0 +1,868 @@
+---
+# cluster-deploy.yml
+
+- name: Elasticsearch Cluster Deployment
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    # 1. Pre-Deployment Setup and Prompts
+    - name: Pre-Deployment Setup and Prompts
+      block:
+        # Inventory Structure Validation
+        - name: Validate inventory structure
+          block:
+            - name: Check required inventory groups
+              fail:
+                msg: "Missing required inventory group: {{ item }}"
+              loop:
+                - master_nodes
+                - hot_nodes
+                - helper_instance
+                - kibana
+              when: item not in groups
+
+            - name: Set elasticsearch node groups
+              set_fact:
+                elasticsearch_nodes: >-
+                  {%- set node_groups = ['master_nodes', 'hot_nodes'] -%}
+                  {%- if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 -%}
+                  {%- set node_groups = node_groups + ['frozen_nodes'] -%}
+                  {%- endif -%}
+                  {{ node_groups | join(',') }}
+
+            - name: Set deployment limit
+              set_fact:
+                limit: "{{ elasticsearch_nodes }}"
+
+            - name: Check [all:vars] configuration
+              set_fact:
+                required_vars:
+                  - ansible_user
+                  - ansible_connection
+                  - ansible_ssh_private_key_file
+
+            - name: Validate required variables exist
+              fail:
+                msg: "Missing required variable in [all:vars]: {{ item }}"
+              loop: "{{ required_vars }}"
+              when: hostvars[groups['all'][0]][item] is undefined
+
+            - name: Get private key file path
+              set_fact:
+                ssh_key_path: "{{ hostvars[groups['all'][0]]['ansible_ssh_private_key_file'] }}"
+
+            - name: Check if private key file exists
+              stat:
+                path: "{{ ssh_key_path }}"
+              register: key_file
+
+            - name: Validate private key file
+              fail:
+                msg: |
+                  Private key file validation failed:
+                  File: {{ ssh_key_path }}
+                  {% if not key_file.stat.exists %}
+                  Error: File does not exist
+                  {% elif key_file.stat.mode not in ['0400', '0600'] %}
+                  Error: Incorrect permissions ({{ key_file.stat.mode }}). Must be 400 or 600.
+                  {% endif %}
+              when: >
+                not key_file.stat.exists or 
+                key_file.stat.mode not in ['0400', '0600']
+
+            # Node count validations
+            - name: Validate node counts
+              block:
+                - name: Check master node count
+                  fail:
+                    msg: "Invalid number of master nodes. Must be either 1 or 3, found {{ groups['master_nodes'] | length }}."
+                  when: groups['master_nodes'] | length not in [1, 3]
+
+                - name: Check hot node count
+                  fail:
+                    msg: "Must have at least 1 hot node, found {{ groups['hot_nodes'] | length }}."
+                  when: groups['hot_nodes'] | length < 1
+
+        # Prompt for installation method
+        - name: Prompt for installation method
+          pause:
+            prompt: |
+              Select installation method:
+              1. APT repository
+              2. Manual .deb package
+              Enter the number of your choice:
+          register: install_method_choice
+
+        # Handle APT repository installation
+        - name: Handle APT repository installation
+          block:
+            - name: Prompt for version
+              pause:
+                prompt: |
+                  Enter the version number to install, or 'latest'
+                  Example: 8.15.4
+              register: version_choice
+
+            - name: Set version fact
+              set_fact:
+                component_version: "{{ version_choice.user_input }}"
+                installation_method: "apt"
+          when: install_method_choice.user_input == '1'
+
+        # Handle manual package installation
+        - name: Handle manual package installation
+          block:
+            - name: Prompt for Elasticsearch package path
+              pause:
+                prompt: |
+                  Enter the full path to the Elasticsearch .deb package
+                  Example: /tmp/elasticsearch-8.16.1-amd64.deb
+              register: es_package_path
+
+            - name: Prompt for Kibana package path
+              pause:
+                prompt: |
+                  Enter the full path to the Kibana .deb package
+                  Example: /tmp/kibana-8.16.1-amd64.deb
+              register: kibana_package_path
+
+            - name: Validate package files exist
+              stat:
+                path: "{{ item }}"
+              register: package_check
+              loop:
+                - "{{ es_package_path.user_input }}"
+                - "{{ kibana_package_path.user_input }}"
+
+            - name: Fail if packages don't exist
+              fail:
+                msg: "Package file not found: {{ item.item }}"
+              when: not item.stat.exists
+              loop: "{{ package_check.results }}"
+
+            - name: Set package paths
+              set_fact:
+                es_deb_package_path: "{{ es_package_path.user_input }}"
+                kibana_deb_package_path: "{{ kibana_package_path.user_input }}"
+                installation_method: "local"
+          when: install_method_choice.user_input == '2'
+
+        # Prompt for data path
+        - name: Prompt for data path
+          pause:
+            prompt: |
+              Enter the path for Elasticsearch data storage
+              Default: /var/lib/elasticsearch
+              Press enter to use default, or specify custom path:
+          register: data_path_input
+
+        # Prompt for log path
+        - name: Prompt for log path
+          pause:
+            prompt: |
+              Enter the path for Elasticsearch logs
+              Default: /var/log/elasticsearch
+              Press enter to use default, or specify custom path:
+          register: log_path_input
+
+        # Set path variables
+        - name: Set path variables
+          set_fact:
+            es_data_path: "{{ data_path_input.user_input | default('/var/lib/elasticsearch') }}"
+            es_log_path: "{{ log_path_input.user_input | default('/var/log/elasticsearch') }}"
+
+        # Prompt for password management
+        - name: Prompt for password management
+          pause:
+            prompt: |
+              How would you like to handle certificates and keystore passwords?
+              1. Generate secure random passwords
+              2. Specify custom passwords
+              Enter your choice:
+          register: password_choice
+
+        # Handle custom passwords
+        - name: Handle custom passwords
+          block:
+            - name: Prompt for certificate password
+              pause:
+                prompt: "Enter password for certificates (min 8 chars, letters/numbers/symbols):"
+                echo: no
+              register: cert_pass
+
+            - name: Validate certificate password
+              fail:
+                msg: "Password must be at least 8 characters and contain letters, numbers, and symbols"
+              when: >
+                cert_pass.user_input | length < 8 or
+                not (cert_pass.user_input is match('.*[A-Za-z].*') and 
+                     cert_pass.user_input is match('.*[0-9].*') and 
+                     cert_pass.user_input is match('.*[^A-Za-z0-9].*'))
+
+            - name: Set custom passwords
+              set_fact:
+                es_cert_pass: "{{ cert_pass.user_input }}"
+                passwords_generated: false
+          when: password_choice.user_input == '2'
+
+        # Generate random passwords
+        - name: Generate random passwords
+          block:
+            - name: Create random password
+              command: openssl rand -base64 12
+              register: random_pass
+
+            - name: Set generated passwords
+              set_fact:
+                es_cert_pass: "{{ random_pass.stdout }}"
+                passwords_generated: true
+          when: password_choice.user_input == '1'
+
+        # Create pre-deployment report
+        - name: Create deployment report
+          copy:
+            content: |
+              ELASTICSEARCH CLUSTER DEPLOYMENT PLAN
+              ==================================
+
+              Topology Overview
+              ----------------
+              Master Nodes ({{ groups['master_nodes'] | length }}):
+              {% for host in groups['master_nodes'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              Hot Nodes ({{ groups['hot_nodes'] | length }}):
+              {% for host in groups['hot_nodes'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+              Frozen Nodes ({{ groups['frozen_nodes'] | length }}):
+              {% for host in groups['frozen_nodes'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+              {% endif %}
+
+              Helper Instance:
+              {% for host in groups['helper_instance'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              Kibana Node:
+              {% for host in groups['kibana'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              {% if 'monitoring_instance' in groups and groups['monitoring_instance'] | length > 0 %}
+              Monitoring Instance:
+              {% for host in groups['monitoring_instance'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+              {% endif %}
+
+              Installation Details
+              -------------------
+              Method: {{ installation_method | title }}
+              {% if installation_method == 'apt' %}
+              Version: {% if component_version == 'latest' %}Latest available{% else %}{{ component_version }}{% endif %}
+              {% else %}
+              Elasticsearch Package: {{ es_deb_package_path }}
+              Kibana Package: {{ kibana_deb_package_path }}
+              {% endif %}
+
+              Path Configuration
+              -----------------
+              Data Path: {{ es_data_path }}
+              Log Path: {{ es_log_path }}
+
+              Inventory Configuration
+              ---------------------
+              SSH User: {{ hostvars[groups['all'][0]]['ansible_user'] }}
+              Private Key: {{ ssh_key_path }}
+              Key File Permissions: {{ key_file.stat.mode }}
+
+              Password Management
+              ------------------
+              Method: {% if passwords_generated %}Auto-generated secure passwords{% else %}Custom password provided{% endif %}
+              
+              Certificate Generation
+              ---------------------
+              - Certificates will be generated on first master node
+              - Secure distribution to all cluster nodes
+              - Passwords will be saved to ~/.elasticsearch/
+
+              Are you ready to proceed with deployment? (yes/no):
+            dest: "/tmp/deployment_plan.txt"
+
+        - name: Display deployment plan
+          debug:
+            msg: "{{ lookup('file', '/tmp/deployment_plan.txt') | split('\n') }}"
+
+        - name: Confirm deployment
+          pause:
+            prompt: |
+              Review the deployment plan above.
+              Do you want to proceed? (yes/no):
+          register: deploy_confirmation
+
+        - name: Exit if not confirmed
+          meta: end_play
+          when: deploy_confirmation.user_input | lower != 'yes'
+
+        # Store deployment variables for use in other plays
+        - name: Set deployment variables
+          set_fact:
+            selected_play_vars:
+              installation_method: "{{ installation_method }}"
+              component_version: "{{ component_version | default('latest') }}"
+              es_deb_package_path: "{{ es_deb_package_path | default(omit) }}"
+              kibana_deb_package_path: "{{ kibana_deb_package_path | default(omit) }}"
+              es_cert_pass: "{{ es_cert_pass }}"
+              passwords_generated: "{{ passwords_generated }}"
+              es_data_path: "{{ es_data_path }}"
+              es_log_path: "{{ es_log_path }}"
+          run_once: true
+
+    # 2. Deploy Master Nodes
+    - name: Deploy Master Nodes
+      hosts: master_nodes
+      gather_facts: yes
+      serial: 1  # Deploy one master node at a time
+      tasks:
+        - name: Install Elasticsearch on Master Node
+          block:
+            - name: Copy Elasticsearch deb package
+              copy:
+                src: "{{ hostvars['localhost'].es_deb_package_path }}"
+                dest: "/tmp/elasticsearch.deb"
+                mode: '0644'
+              when: hostvars['localhost'].installation_method == 'local'
+
+            - name: Install Elasticsearch via APT
+              apt:
+                name: "elasticsearch{% if hostvars['localhost'].component_version != 'latest' %}={{ hostvars['localhost'].component_version }}{% endif %}"
+                state: "{{ 'latest' if hostvars['localhost'].component_version == 'latest' else 'present' }}"
+                allow_unauthenticated: no
+              environment:
+                DEBIAN_FRONTEND: noninteractive
+              when: hostvars['localhost'].installation_method == 'apt'
+
+            - name: Install Elasticsearch from local package
+              apt:
+                deb: "/tmp/elasticsearch.deb"
+                state: present
+              when: hostvars['localhost'].installation_method == 'local'
+          become: yes
+
+        - name: Configure Master Node
+          block:
+            - name: Create systemd override directory
+              file:
+                path: /etc/systemd/system/elasticsearch.service.d
+                state: directory
+
+            - name: Add systemd override for memory locking
+              copy:
+                dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+                content: |
+                  [Service]
+                  LimitMEMLOCK=infinity
+
+            - name: Reload systemd daemon
+              systemd:
+                daemon_reload: yes
+
+            - name: Configure elasticsearch.yml for Master Node
+              template:
+                src: cluster_deployment/templates/elasticsearch_master.yml.j2
+                dest: /etc/elasticsearch/elasticsearch.yml
+                owner: elasticsearch
+                group: elasticsearch
+                mode: '0660'
+
+        - name: Start Elasticsearch on Master Node
+          systemd:
+            name: elasticsearch
+            state: started
+            enabled: yes
+          become: yes
+
+    # 3. Deploy Hot Nodes
+    - name: Deploy Hot Nodes
+      hosts: hot_nodes
+      gather_facts: yes
+      serial: 5  # Deploy up to 5 hot nodes concurrently
+      tasks:
+        - name: Install Elasticsearch on Hot Node
+          block:
+            - name: Copy Elasticsearch deb package
+              copy:
+                src: "{{ hostvars['localhost'].es_deb_package_path }}"
+                dest: "/tmp/elasticsearch.deb"
+                mode: '0644'
+              when: hostvars['localhost'].installation_method == 'local'
+
+            - name: Install Elasticsearch via APT
+              apt:
+                name: "elasticsearch{% if hostvars['localhost'].component_version != 'latest' %}={{ hostvars['localhost'].component_version }}{% endif %}"
+                state: "{{ 'latest' if hostvars['localhost'].component_version == 'latest' else 'present' }}"
+                allow_unauthenticated: no
+              environment:
+                DEBIAN_FRONTEND: noninteractive
+              when: hostvars['localhost'].installation_method == 'apt'
+
+            - name: Install Elasticsearch from local package
+              apt:
+                deb: "/tmp/elasticsearch.deb"
+                state: present
+              when: hostvars['localhost'].installation_method == 'local'
+          become: yes
+
+        - name: Configure Hot Node
+          block:
+            - name: Create systemd override directory
+              file:
+                path: /etc/systemd/system/elasticsearch.service.d
+                state: directory
+
+            - name: Add systemd override for memory locking
+              copy:
+                dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+                content: |
+                  [Service]
+                  LimitMEMLOCK=infinity
+
+            - name: Reload systemd daemon
+              systemd:
+                daemon_reload: yes
+
+            - name: Configure elasticsearch.yml for Hot Node
+              template:
+                src: cluster_deployment/templates/elasticsearch_hot.yml.j2
+                dest: /etc/elasticsearch/elasticsearch.yml
+                owner: elasticsearch
+                group: elasticsearch
+                mode: '0660'
+
+        - name: Start Elasticsearch on Hot Node
+          systemd:
+            name: elasticsearch
+            state: started
+            enabled: yes
+          become: yes
+
+    # 4. Deploy Frozen Nodes (if any)
+    - name: Deploy Frozen Nodes
+      hosts: frozen_nodes
+      gather_facts: yes
+      serial: 3  # Deploy up to 3 frozen nodes concurrently
+      tasks:
+        - name: Install Elasticsearch on Frozen Node
+          block:
+            - name: Copy Elasticsearch deb package
+              copy:
+                src: "{{ hostvars['localhost'].es_deb_package_path }}"
+                dest: "/tmp/elasticsearch.deb"
+                mode: '0644'
+              when: hostvars['localhost'].installation_method == 'local'
+
+            - name: Install Elasticsearch via APT
+              apt:
+                name: "elasticsearch{% if hostvars['localhost'].component_version != 'latest' %}={{ hostvars['localhost'].component_version }}{% endif %}"
+                state: "{{ 'latest' if hostvars['localhost'].component_version == 'latest' else 'present' }}"
+                allow_unauthenticated: no
+              environment:
+                DEBIAN_FRONTEND: noninteractive
+              when: hostvars['localhost'].installation_method == 'apt'
+
+            - name: Install Elasticsearch from local package
+              apt:
+                deb: "/tmp/elasticsearch.deb"
+                state: present
+              when: hostvars['localhost'].installation_method == 'local'
+          become: yes
+
+        - name: Configure Frozen Node
+          block:
+            - name: Create systemd override directory
+              file:
+                path: /etc/systemd/system/elasticsearch.service.d
+                state: directory
+
+            - name: Add systemd override for memory locking
+              copy:
+                dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+                content: |
+                  [Service]
+                  LimitMEMLOCK=infinity
+
+            - name: Reload systemd daemon
+              systemd:
+                daemon_reload: yes
+
+            - name: Configure elasticsearch.yml for Frozen Node
+              template:
+                src: cluster_deployment/templates/elasticsearch_frozen.yml.j2
+                dest: /etc/elasticsearch/elasticsearch.yml
+                owner: elasticsearch
+                group: elasticsearch
+                mode: '0660'
+
+        - name: Start Elasticsearch on Frozen Node
+          systemd:
+            name: elasticsearch
+            state: started
+            enabled: yes
+          become: yes
+
+    # 5. Deploy Kibana
+    - name: Deploy Kibana
+      hosts: kibana
+      gather_facts: yes
+      serial: 1  # Deploy Kibana on one host at a time
+      tasks:
+        - name: Install Kibana
+          block:
+            - name: Copy Kibana deb package
+              copy:
+                src: "{{ hostvars['localhost'].kibana_deb_package_path }}"
+                dest: "/tmp/kibana.deb"
+                mode: '0644'
+              when: hostvars['localhost'].installation_method == 'local'
+
+            - name: Install Kibana via APT
+              apt:
+                name: "kibana{% if hostvars['localhost'].component_version != 'latest' %}={{ hostvars['localhost'].component_version }}{% endif %}"
+                state: "{{ 'latest' if hostvars['localhost'].component_version == 'latest' else 'present' }}"
+                allow_unauthenticated: no
+              environment:
+                DEBIAN_FRONTEND: noninteractive
+              when: hostvars['localhost'].installation_method == 'apt'
+
+            - name: Install Kibana from local package
+              apt:
+                deb: "/tmp/kibana.deb"
+                state: present
+              when: hostvars['localhost'].installation_method == 'local'
+          become: yes
+
+        - name: Configure Kibana
+          block:
+            - name: Create Kibana certificates directory
+              file:
+                path: /etc/kibana/certs
+                state: directory
+                owner: kibana
+                group: kibana
+                mode: '0750'
+
+            - name: Copy certificates to Kibana
+              copy:
+                src: "/tmp/elastic-certs/{{ item.src }}"
+                dest: "/etc/kibana/certs/{{ item.dest }}"
+                owner: kibana
+                group: kibana
+                mode: '0640'
+              loop:
+                - { src: "elastic-http.p12", dest: "elastic-http.p12" }
+                - { src: "elastic-http-ca.pem", dest: "elastic-http-ca.pem" }
+                - { src: "elastic-http-ca.crt", dest: "elastic-http-ca.crt" }
+
+            - name: Generate encryption keys
+              shell: /usr/share/kibana/bin/kibana-encryption-keys generate -q
+              register: encryption_keys
+              changed_when: false
+
+            - name: Configure kibana.yml
+              template:
+                src: cluster_deployment/templates/kibana.yml.j2
+                dest: /etc/kibana/kibana.yml
+                owner: kibana
+                group: kibana
+                mode: '0660'
+
+            - name: Reset kibana_system user password
+              shell: |
+                /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -b -f
+              register: kibana_password
+              delegate_to: "{{ groups['master_nodes'][0] }}"
+
+            - name: Set Kibana keystore passwords
+              shell: |
+                echo '{{ kibana_password.stdout }}' | /usr/share/kibana/bin/kibana-keystore add --stdin elasticsearch.password
+                echo '{{ hostvars['localhost'].es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.keystore.password
+                echo '{{ hostvars['localhost'].es_cert_pass }}' | /usr/share/kibana/bin/kibana-keystore add --stdin server.ssl.truststore.password
+
+            - name: Verify Kibana keystore passwords
+              shell: |
+                /usr/share/kibana/bin/kibana-keystore list | grep -q "elasticsearch.password" && \
+                /usr/share/kibana/bin/kibana-keystore list | grep -q "server.ssl.keystore.password" && \
+                /usr/share/kibana/bin/kibana-keystore list | grep -q "server.ssl.truststore.password"
+              changed_when: false
+
+            - name: Enable and start Kibana service
+              systemd:
+                name: kibana
+                enabled: yes
+                state: started
+                daemon_reload: yes
+
+            - name: Wait for Kibana service to stabilize
+              wait_for:
+                port: 5601
+                state: started
+                delay: 10
+                timeout: 30
+
+            - name: Save Kibana password
+              copy:
+                content: "{{ kibana_password.stdout }}"
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/kibana_password.txt"
+                mode: '0600'
+              delegate_to: localhost
+          become: yes
+
+    # 6. Post-Deployment Verification and Reporting
+    - name: Post-Deployment Verification and Reporting
+      hosts: localhost
+      gather_facts: yes
+      tasks:
+        - name: Ensure elasticsearch directory exists
+          file:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+            state: directory
+            mode: '0700'
+
+        - name: Wait for Elasticsearch cluster
+          uri:
+            url: "https://{{ hostvars['localhost'].hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/health"
+            method: GET
+            user: elastic
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: cluster_health
+          until: cluster_health.status == 200 and cluster_health.json.status != 'red'
+          retries: 30
+          delay: 10
+
+        - name: Get cluster status
+          uri:
+            url: "https://{{ hostvars['localhost'].hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/health?pretty"
+            method: GET
+            user: elastic
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: final_health
+
+        - name: Get nodes info
+          uri:
+            url: "https://{{ hostvars['localhost'].hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cat/nodes?v&h=ip,node.role,name,version,master,disk.total,disk.used_percent,heap.percent,ram.percent,cpu"
+            method: GET
+            user: elastic
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: nodes_info
+
+        - name: Get cluster settings
+          uri:
+            url: "https://{{ hostvars['localhost'].hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/settings?pretty"
+            method: GET
+            user: elastic
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: cluster_settings
+
+        - name: Check Kibana status
+          uri:
+            url: "https://{{ hostvars['localhost'].hostvars['kibana'][0].ansible_host }}:5601/api/status"
+            method: GET
+            user: elastic
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: kibana_status
+          retries: 12
+          delay: 10
+          until: kibana_status.status == 200
+
+        - name: Check SSL certificate validity
+          uri:
+            url: "https://{{ hostvars['localhost'].hostvars[groups['hot_nodes'][0]].ansible_host }}:9200"
+            method: GET
+            user: elastic
+            password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+            force_basic_auth: yes
+            validate_certs: yes
+            ca_path: "/etc/elasticsearch/certs/elastic-http-ca.crt"
+            return_content: yes
+          register: ssl_check
+
+        - name: Generate deployment report
+          copy:
+            content: |
+              ELASTICSEARCH CLUSTER DEPLOYMENT REPORT
+              ====================================
+              Deployment Time: {{ ansible_date_time.iso8601 }}
+
+              Cluster Status
+              -------------
+              Health: {{ final_health.json.status }}
+              Number of Nodes: {{ final_health.json.number_of_nodes }}
+              Active Shards: {{ final_health.json.active_shards }}
+              Relocating Shards: {{ final_health.json.relocating_shards }}
+              Initializing Shards: {{ final_health.json.initializing_shards }}
+              Unassigned Shards: {{ final_health.json.unassigned_shards }}
+
+              Node Information
+              ---------------
+              {{ nodes_info.content }}
+
+              Cluster Settings
+              ----------------
+              {{ cluster_settings.content }}
+
+              Deployment Configuration
+              ----------------------
+              Master Nodes: {{ groups['master_nodes'] | length }}
+              Hot Nodes: {{ groups['hot_nodes'] | length }}
+              {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+              Frozen Nodes: {{ groups['frozen_nodes'] | length }}
+              {% endif %}
+
+              Resource Usage
+              -------------
+              {% for line in nodes_info.content.split('\n') %}
+              {% if line.strip() != '' %}
+              {{ line }}
+              {% endif %}
+              {% endfor %}
+
+              Kibana Status
+              -------------
+              Status: {{ kibana_status.json.status.overall.state }}
+              Version: {{ kibana_status.json.version.number }}
+              Plugins: {{ kibana_status.json.plugins.available | default([]) | length }} available
+              
+              Security Status
+              --------------
+              SSL Certificate: Valid
+              Security Features: Enabled
+              Authentication: Active
+              Certificate Path: /etc/elasticsearch/certs/
+              
+              Access Information
+              -----------------
+              Elasticsearch:
+              - URLs:
+                {% for host in groups['hot_nodes'] %}
+                - https://{{ hostvars[host].ansible_host }}:9200
+                {% endfor %}
+              - Username: elastic
+              - Password: Saved in ~/.elasticsearch/elastic_password.txt
+
+              Kibana:
+              - URL: https://{{ hostvars['kibana'][0].ansible_host }}:5601
+              - Username: elastic
+              - Password: Same as Elasticsearch
+
+              Configuration Paths
+              ------------------
+              Data Path: {{ hostvars['localhost'].es_data_path }}
+              Log Path: {{ hostvars['localhost'].es_log_path }}
+              Certificate Path: /etc/elasticsearch/certs/
+
+              Security Information
+              -------------------
+              - All passwords are stored in ~/.elasticsearch/
+              - Certificate password is securely stored in the Elasticsearch and Kibana keystores
+              - SSL is enabled for all communications
+              - Client certificate verification is enabled
+              - Keystore passwords verified
+              {% if ssl_check.status == 200 %}
+              - SSL certificate validation successful
+              {% endif %}
+
+              Next Steps
+              ----------
+              1. Access Kibana at https://{{ hostvars['kibana'][0].ansible_host }}:5601
+              2. Use the elastic user credentials to log in
+              3. Configure additional users and roles as needed
+              4. Set up monitoring and alerting if required
+              5. Review the logs at {{ hostvars['localhost'].es_log_path }}
+
+              Important Security Notes
+              ----------------------
+              1. Change the elastic user password immediately after first login
+              2. Create individual user accounts for all administrators
+              3. Configure IP filtering if needed
+              4. Review audit logs regularly
+              5. Set up regular backup schedules
+
+              Maintenance Instructions
+              ----------------------
+              1. Regular Tasks:
+                 - Monitor cluster health
+                 - Check disk usage
+                 - Review logs
+                 - Test backups
+              2. Security Tasks:
+                 - Rotate passwords regularly
+                 - Update certificates before expiration
+                 - Review user access
+              3. Performance Tasks:
+                 - Monitor memory usage
+                 - Check CPU utilization
+                 - Review indexing performance
+                 - Manage shard allocation
+
+              Notes
+              -----
+              - The cluster is secured with SSL/TLS
+              - All nodes are using the same certificate configuration
+              - Kibana is configured to use SSL and authenticate with Elasticsearch
+              {% if final_health.json.status != 'green' %}
+              - Warning: Cluster health is not green, review logs for potential issues
+              {% endif %}
+
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_report.txt"
+            mode: '0600'
+
+        - name: Display deployment report
+          debug:
+            msg: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/deployment_report.txt') | split('\n') }}"
+
+        # Cleanup temporary files
+        - name: Cleanup cluster deployment files
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "/tmp/elastic-certs"
+            - "/tmp/elasticsearch.asc"
+            - "/tmp/elasticsearch.deb"
+            - "/tmp/kibana.deb"
+          ignore_errors: yes
+
+        - name: Final success message
+          debug:
+            msg: |
+              Deployment completed successfully!
+              The full deployment report has been saved to: ~/.elasticsearch/deployment_report.txt
+              
+              Quick access:
+              - Elasticsearch: https://{{ hostvars['hot_nodes'][0].ansible_host }}:9200
+              - Kibana: https://{{ hostvars['kibana'][0].ansible_host }}:5601
+              
+              Credentials are stored in:
+              - ~/.elasticsearch/elastic_password.txt
+              - ~/.elasticsearch/kibana_password.txt

@@ -1,0 +1,22 @@
+# roles/common/tasks/cleanup.yml
+- name: Perform standard cleanup
+  block:
+    - name: Remove temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/*_report.txt"
+        - "/tmp/error_*.log"
+        - "{{ temp_files | default([]) }}"
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes
+      no_log: true
+
+    - name: Clean package cache
+      apt:
+        clean: yes
+      become: yes
+      when: cleanup_packages | default(false)
+      no_log: true

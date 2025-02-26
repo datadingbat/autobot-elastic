@@ -1,0 +1,232 @@
+---
+- name: Post-Deployment Verification and Report
+  hosts: localhost
+  gather_facts: yes
+  vars_files:
+    - "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  vars:
+    ansible_become: yes    
+    elastic_password_file: "{{ lookup('env', 'HOME') }}/.elasticsearch/elastic_password.txt"
+    kibana_host: "{{ hostvars[groups['kibana'][0]].ansible_host }}"    
+  tasks:
+    - name: Ensure elasticsearch directory exists
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+        state: directory
+        mode: '0700'
+
+    - name: Wait for Elasticsearch cluster
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: cluster_health
+      until: cluster_health.status == 200 and cluster_health.json.status != 'red'
+      retries: 30
+      delay: 10
+
+    - name: Get cluster status
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/health?pretty"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: final_health
+
+    - name: Get nodes info
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cat/nodes?v&h=ip,node.role,name,version,master,disk.total,disk.used_percent,heap.percent,ram.percent,cpu"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: nodes_info
+
+    - name: Get cluster settings
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_cluster/settings?pretty"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: cluster_settings
+
+    - name: Check Kibana status
+      uri:
+        url: "https://{{ kibana_host }}:5601/api/status"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', elastic_password_file) | trim }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: kibana_status
+      retries: 12
+      delay: 10
+      until: kibana_status.status == 200
+      when: "'kibana' in groups and groups['kibana'] | length > 0"
+
+    - name: Check SSL connectivity
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: ssl_check
+
+    - name: Generate deployment report
+      copy:
+        content: |
+          ELASTICSEARCH CLUSTER DEPLOYMENT REPORT
+          ====================================
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Cluster Overview
+          ---------------
+          Cluster Name: {{ cluster_name }}
+          Cluster Status: {{ final_health.json.status | upper }}
+          Number of Nodes: {{ final_health.json.number_of_nodes }}
+          Active Shards: {{ final_health.json.active_shards }}
+          
+          Node Status
+          -----------
+          {{ nodes_info.content }}
+
+          Topology Overview
+          ----------------
+          Master Nodes ({{ groups['master_nodes'] | length }}):
+          {% for host in groups['master_nodes'] %}
+          - {{ host }} ({{ hostvars[host].ansible_host }})
+          {% endfor %}
+
+          Hot Nodes ({{ groups['hot_nodes'] | length }}):
+          {% for host in groups['hot_nodes'] %}
+          - {{ host }} ({{ hostvars[host].ansible_host }})
+          {% endfor %}
+
+          {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+          Frozen Nodes ({{ groups['frozen_nodes'] | length }}):
+          {% for host in groups['frozen_nodes'] %}
+          - {{ host }} ({{ hostvars[host].ansible_host }})
+          {% endfor %}
+          {% endif %}
+
+          {% if 'ml_nodes' in groups and groups['ml_nodes'] | length > 0 %}
+          ML Nodes ({{ groups['ml_nodes'] | length }}):
+          {% for host in groups['ml_nodes'] %}
+          - {{ host }} ({{ hostvars[host].ansible_host }})
+          {% endfor %}
+          {% endif %}
+
+          {% if 'kibana' in groups and groups['kibana'] | length > 0 %}
+          Kibana Nodes ({{ groups['kibana'] | length }}):
+          {% for host in groups['kibana'] %}
+          - {{ host }} ({{ hostvars[host].ansible_host }})
+          {% endfor %}
+          Status: {% if kibana_status.status == 200 %}✓ Active{% else %}⚠ Not Responding{% endif %}
+          {% endif %}          
+
+          Cluster Health Details
+          ---------------------
+          Active Primary Shards: {{ final_health.json.active_primary_shards }}
+          Active Shards: {{ final_health.json.active_shards }}
+          Relocating Shards: {{ final_health.json.relocating_shards }}
+          Initializing Shards: {{ final_health.json.initializing_shards }}
+          Unassigned Shards: {{ final_health.json.unassigned_shards }}
+          Delayed Unassigned Shards: {{ final_health.json.delayed_unassigned_shards }}
+          Number of Pending Tasks: {{ final_health.json.number_of_pending_tasks }}
+          
+          Installation Details
+          -------------------
+          Method: {{ installation_method | title }}
+          {% if installation_method == 'apt' %}
+          Version: {% if component_version == 'latest' %}Latest available ({{ latest_available_version }}){% else %}{{ component_version }}{% endif %}
+          {% else %}
+          Elasticsearch Package: {{ es_deb_package_path }}
+          Kibana Package: {{ kibana_deb_package_path }}
+          {% endif %}
+
+          Configuration
+          -------------
+          Data Path: {{ es_data_path }}
+          Log Path: {{ es_log_path }}
+          SSL/TLS: {% if ssl_check.status == 200 %}✓ Properly Configured{% else %}⚠ Verification Failed{% endif %}
+          
+          Access Information
+          -----------------
+          Elasticsearch Endpoints:
+          {% for host in groups['hot_nodes'] %}
+          - https://{{ hostvars[host].ansible_host }}:9200
+          {% endfor %}
+          
+          Kibana Endpoint:
+          - https://{{ kibana_host }}:5601
+          
+          Credentials Location:
+          - Elastic Password: {{ lookup('env', 'HOME') }}/.elasticsearch/elastic_password.txt
+          - Kibana Password: {{ lookup('env', 'HOME') }}/.elasticsearch/kibana_password.txt
+          - Certificates: {{ lookup('env', 'HOME') }}/.elasticsearch/certs/
+          
+          Notes and Recommendations
+          -----------------------
+          {% if final_health.json.status != 'green' %}
+          ⚠ Cluster health is {{ final_health.json.status }}. Check the cluster health details above.
+          {% endif %}
+          - Remember to change default passwords after initial setup
+          - Review node metrics above for any resource usage concerns
+          - SSL certificates are stored in ~/.elasticsearch/certs/
+          - Backup the credential files in a secure location
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_report.txt"
+        mode: '0644'
+
+    - name: Update the deployment report SSL section
+      replace:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_report.txt"
+        regexp: 'SSL/TLS: .*'
+        replace: 'SSL/TLS: {% if ssl_check.status == 200 %}✓ HTTPS Connectivity Confirmed{% else %}⚠ HTTPS Connection Failed{% endif %}'
+        
+    - name: Display deployment report
+      debug:
+        msg: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/deployment_report.txt') | split('\n') }}"
+
+    # Cleanup
+    - name: Cleanup cluster deployment files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/elastic-certs"
+        - "/tmp/elasticsearch.asc"
+        - "/tmp/elasticsearch.deb"
+        - "/tmp/kibana.deb"
+      ignore_errors: yes
+
+    - name: Final success message
+      debug:
+        msg: |
+          Deployment completed successfully!
+          The full deployment report has been saved to: ~/.elasticsearch/deployment_report.txt
+          
+          Quick access:
+          - Elasticsearch: https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200
+          {% if 'kibana' in groups and groups['kibana'] | length > 0 %}
+          - Kibana: https://{{ kibana_host }}:5601
+          {% endif %}
+          
+          Credentials are stored in:
+          - ~/.elasticsearch/elastic_password.txt
+          - ~/.elasticsearch/kibana_password.txt

@@ -1,0 +1,168 @@
+---
+- name: Validate Prerequisites and Setup
+  import_playbook: cluster/pre_deploy.yml
+
+- name: Configure Common Settings Across All Nodes 
+  import_playbook: cluster/common_setup.yml
+
+- name: Deploy Master Nodes
+  import_playbook: cluster/master_nodes.yml
+
+- name: Wait for Master Node Cluster Formation
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Wait for master transport ports
+      wait_for:
+        host: "{{ hostvars[item].ansible_host }}"
+        port: 9300
+        timeout: 180
+      with_items: "{{ groups['master_nodes'] }}"
+
+    - name: Show master cluster status
+      debug:
+        msg: "Master nodes transport ports available - proceeding to hot nodes deployment"
+
+- name: Deploy Hot Nodes
+  import_playbook: cluster/hot_nodes.yml
+
+- name: Wait for Hot Nodes to Join
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Reset elastic user password
+      shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b -f
+      register: elastic_password
+      delegate_to: "{{ groups['hot_nodes'][0] }}"
+      become: yes
+      retries: 3
+      delay: 10
+      until: elastic_password.rc == 0
+
+    - name: Set password fact
+      set_fact:
+        clean_password: "{{ elastic_password.stdout.split('New value: ')[1] | trim }}"
+
+    - name: Save elastic password
+      copy:
+        content: "{{ clean_password }}"
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/elastic_password.txt"
+        mode: '0600'
+
+    - name: Wait for hot nodes to join cluster
+      uri:
+        url: "https://{{ hostvars[groups['master_nodes'][0]].ansible_host }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: cluster_health
+      until: >
+        cluster_health.status == 200 and
+        cluster_health.json.number_of_nodes == (groups['master_nodes'] | length + groups['hot_nodes'] | length)
+      retries: 20
+      delay: 5
+      ignore_errors: yes
+
+    - name: Show cluster status after hot nodes
+      debug:
+        msg: "Hot nodes joining {{ 'complete' if cluster_health.status == 200 else 'still in progress' }}"
+
+- name: Set Frozen Nodes Deployment Flag
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Set frozen nodes deployment flag
+      set_fact:
+        deploy_frozen_nodes: "{{ groups['frozen_nodes'] is defined and groups['frozen_nodes'] | length > 0 }}"
+
+- name: Deploy Frozen Nodes
+  import_playbook: cluster/frozen_nodes.yml
+
+- name: Wait for Frozen Nodes
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Wait for frozen nodes to join cluster
+      uri:
+        url: "https://{{ hostvars[groups['master_nodes'][0]].ansible_host }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: cluster_health
+      until: >
+        cluster_health.status == 200 and
+        cluster_health.json.number_of_nodes == (groups['master_nodes'] | length + 
+                                              groups['hot_nodes'] | length +
+                                              groups['frozen_nodes'] | length)
+      retries: 20
+      delay: 5
+      ignore_errors: yes
+      when: hostvars['localhost']['deploy_frozen_nodes'] | default(false)
+
+    - name: Show cluster status after frozen nodes
+      debug:
+        msg: "Frozen nodes joining {{ 'complete' if cluster_health.status == 200 else 'still in progress' }}"
+      when: hostvars['localhost']['deploy_frozen_nodes'] | default(false)
+
+- name: Set ML Nodes Deployment Flag
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Set ml nodes deployment flag
+      set_fact:
+        deploy_ml_nodes: "{{ groups['ml_nodes'] is defined and groups['ml_nodes'] | length > 0 }}"
+
+- name: Deploy ML Nodes
+  import_playbook: cluster/ml_nodes.yml
+  when: hostvars['localhost']['deploy_ml_nodes'] | default(false)
+
+- name: Wait for ML Nodes
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Wait for ML nodes to join cluster
+      uri:
+        url: "https://{{ hostvars[groups['master_nodes'][0]].ansible_host }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: cluster_health
+      until: >
+        cluster_health.status == 200 and
+        cluster_health.json.number_of_nodes == (groups['master_nodes'] | length + 
+                                              groups['hot_nodes'] | length +
+                                              groups['ml_nodes'] | length)
+      retries: 20
+      delay: 5
+      ignore_errors: yes
+      when: hostvars['localhost']['deploy_ml_nodes'] | default(false)
+
+    - name: Show cluster status after ML nodes
+      debug:
+        msg: "ML nodes joining {{ 'complete' if cluster_health.status == 200 else 'still in progress' }}"
+      when: hostvars['localhost']['deploy_ml_nodes'] | default(false)
+
+- name: Set Kibana Deployment Flag
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Set kibana deployment flag
+      set_fact:
+        deploy_kibana: "{{ groups['kibana'] is defined and groups['kibana'] | length > 0 }}"
+
+- name: Deploy Kibana
+  import_playbook: cluster/kibana.yml
+  when: hostvars['localhost']['deploy_kibana'] | default(false)
+
+- name: Post-Deployment Verification and Report
+  import_playbook: cluster/post_deploy.yml

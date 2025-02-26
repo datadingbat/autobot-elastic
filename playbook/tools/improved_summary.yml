@@ -1,0 +1,13 @@
+---
+# improved_summary.yml - Task list for cluster summary
+# This is included by the toolkit and just runs the improved cluster summary tasks
+
+# Get all hardware facts which includes memory
+- name: Get hardware facts
+  setup:
+    gather_subset: 
+      - hardware
+
+# Now run the improved cluster summary tasks
+- name: Include improved cluster summary tasks
+  include_tasks: "{{ playbook_dir }}/tools/cluster_summary_improved.yml"

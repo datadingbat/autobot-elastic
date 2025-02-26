@@ -1,0 +1,843 @@
+---
+# minio_setup.yml - Child play for es-toolkit to configure Minio S3 storage
+
+# This file should contain tasks, not plays, for es-toolkit compatibility
+
+# Set default variables
+- name: Set default variables
+  set_fact:
+    minio_client_version: "latest"
+    minio_server_version: "latest"
+    minio_client_url: "https://dl.min.io/client/mc/release/linux-amd64/mc"
+    minio_server_url: "https://dl.min.io/server/minio/release/linux-amd64/minio"
+    installation_method: "online"  # Default to online installation
+    client_hosts: []
+    server_host: ""
+    minio_access_key: "minioadmin"  # Default access key
+    minio_secret_key: "minioadmin"  # Default secret key
+    minio_keystore_name: "default"  # Default keystore client name
+    minio_bucket_name: "elasticsearch-snapshots"  # Default bucket name
+    minio_region: "us-east-1"  # Default region
+    minio_data_dir: "/minio/data"
+    minio_port: "9001"
+    minio_console_port: "9002"
+    minio_protocol: "http"  # Default protocol
+    install_server: false
+
+# Default to online installation for non-interactive mode
+- name: Set installation method to online for non-interactive mode
+  set_fact:
+    installation_method: "online"
+
+# Skip offline installation in non-interactive mode
+
+# Install server on the current host and print detailed debug info
+- name: Set server host to current host
+  set_fact:
+    server_host: "{{ inventory_hostname }}"
+    install_server: true
+
+- name: Debug inventory information
+  debug:
+    msg: |
+      Current inventory_hostname: {{ inventory_hostname }}
+      All inventory hostnames: {{ ansible_play_hosts_all | join(', ') }}
+      All groups: {{ groups.keys() | list | join(', ') }}
+
+# Using default values for non-interactive mode
+- name: Set defaults for non-interactive mode
+  set_fact:
+    minio_server_host: "{{ hostvars[server_host]['ansible_host'] }}"
+    minio_keystore_name: "default"
+    minio_bucket_name: "elasticsearch-snapshots"
+    minio_region: "us-east-1"
+    minio_access_key: "minioadmin"
+    minio_secret_key: "minioadmin"
+    minio_data_dir: "/minio/data"
+
+- name: Create pre-installation report
+  copy:
+    content: |
+      Minio Installation Plan
+      ======================
+      Installation Method: {{ installation_method | title }}
+      
+      Minio Client Installation:
+      ------------------------
+      Target Hosts: {{ ansible_limit | default('all') }}
+      
+      {% if install_server | default(false) %}
+      Minio Server Installation:
+      ------------------------
+      Server Host: {{ server_host }}
+      Server Data Directory: {{ minio_data_dir }}
+      Server Port: {{ minio_port }}
+      Console Port: {{ minio_console_port }}
+      {% else %}
+      External Minio Server:
+      -------------------
+      Server Host: {{ minio_server_host }}
+      Server Port: {{ minio_port }}
+      Protocol: {{ minio_protocol }}
+      {% endif %}
+      
+      Minio Credentials:
+      ----------------
+      Access Key: {{ minio_access_key }}
+      Secret Key: {{ minio_secret_key }}
+      
+      Elasticsearch Integration:
+      -----------------------
+      S3 Keystore Client Name: {{ minio_keystore_name }}
+      S3 Bucket Name: {{ minio_bucket_name }}
+      S3 Region: {{ minio_region }}
+      
+      Are you ready to proceed with the installation? (yes/no):
+    dest: "/tmp/minio_install_plan.txt"
+  delegate_to: localhost
+
+- name: Display installation plan
+  debug:
+    msg: "{{ lookup('file', '/tmp/minio_install_plan.txt') | split('\n') }}"
+  delegate_to: localhost
+
+# Install Minio Client on target hosts
+- name: Install Minio client
+  block:
+    - name: Create directory for Minio client
+      file:
+        path: /usr/local/bin
+        state: directory
+        mode: '0755'
+      become: yes
+      
+    - name: Install Minio client - online
+      get_url:
+        url: "{{ minio_client_url }}"
+        dest: /usr/local/bin/mc
+        mode: '0755'
+      when: installation_method == 'online'
+      become: yes
+      
+    - name: Install Minio client - offline
+      copy:
+        src: "{{ mc_binary_path }}"
+        dest: /usr/local/bin/mc
+        mode: '0755'
+      when: installation_method == 'offline'
+      become: yes
+      
+    - name: Verify Minio client installation
+      command: /usr/local/bin/mc --version
+      register: mc_version
+      changed_when: false
+      
+    - name: Display Minio client version
+      debug:
+        msg: "Minio client installed: {{ mc_version.stdout }}"
+  
+# Install Minio Server if requested
+- name: Install Minio server on specific host
+  block:
+    - name: Debug - show server host with details
+      debug:
+        msg: |
+          Installing MinIO server on: {{ server_host }}
+          Server IP address: {{ hostvars[server_host]['ansible_host'] | default('unknown') }}
+          Current host: {{ inventory_hostname }} ({{ ansible_host | default('unknown') }})
+          All playbook hosts: {{ ansible_play_hosts_all | join(', ') }}
+        
+    - name: Create directories for Minio server
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - /usr/local/bin
+        - "{{ minio_data_dir }}"
+        - /etc/minio
+      delegate_to: "{{ server_host }}"
+      become: yes
+      
+    - name: Install Minio server - online
+      get_url:
+        url: "{{ minio_server_url }}"
+        dest: /usr/local/bin/minio
+        mode: '0755'
+      delegate_to: "{{ server_host }}"
+      when: installation_method == 'online'
+      become: yes
+      register: minio_server_download
+      
+    - name: Debug - server download 
+      debug:
+        msg: "MinIO server download result: {{ minio_server_download }}"
+      when: installation_method == 'online'
+      
+    - name: Install Minio server - offline
+      copy:
+        src: "{{ minio_binary_path }}"
+        dest: /usr/local/bin/minio
+        mode: '0755'
+      delegate_to: "{{ server_host }}"
+      when: installation_method == 'offline'
+      become: yes
+      
+    - name: Create Minio environment file
+      copy:
+        content: |
+          # Minio configuration
+          MINIO_ROOT_USER={{ minio_access_key }}
+          MINIO_ROOT_PASSWORD={{ minio_secret_key }}
+          MINIO_VOLUMES="{{ minio_data_dir }}"
+        dest: /etc/minio/minio.env
+        mode: '0600'
+      delegate_to: "{{ server_host }}"
+      become: yes
+      
+    - name: Create Minio systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=MinIO
+          Documentation=https://docs.min.io
+          Wants=network-online.target
+          After=network-online.target
+          AssertFileIsExecutable=/usr/local/bin/minio
+
+          [Service]
+          WorkingDirectory=/usr/local/
+          EnvironmentFile=/etc/minio/minio.env
+          User=root
+          Group=root
+          ExecStartPre=/bin/bash -c "if [ -z \"${MINIO_VOLUMES}\" ]; then echo \"Variable MINIO_VOLUMES not set in /etc/minio/minio.env\"; exit 1; fi"
+          ExecStart=/usr/local/bin/minio server --console-address :{{ minio_console_port }} --address :{{ minio_port }} {{ minio_data_dir }}
+          Restart=always
+          LimitNOFILE=65536
+          TasksMax=infinity
+          TimeoutStopSec=infinity
+          SendSIGKILL=no
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/minio.service
+        mode: '0644'
+      delegate_to: "{{ server_host }}"
+      become: yes
+      
+    - name: Enable Minio service
+      systemd:
+        name: minio
+        enabled: yes
+        daemon_reload: yes
+      delegate_to: "{{ server_host }}"
+      become: yes
+      
+    - name: Check if data directory exists
+      stat:
+        path: "{{ minio_data_dir }}"
+      delegate_to: "{{ server_host }}"
+      register: data_dir_exists
+      become: yes
+      
+    - name: Show data directory status
+      debug:
+        msg: "Data directory {{ minio_data_dir }} exists: {{ data_dir_exists.stat.exists }}"
+        
+    - name: Start Minio service
+      systemd:
+        name: minio
+        state: started
+      delegate_to: "{{ server_host }}"
+      become: yes
+      register: minio_start_result
+      
+    - name: Debug - minio start result
+      debug:
+        msg: "MinIO service start result: {{ minio_start_result }}"
+        
+    - name: Check if Minio service is running
+      command: systemctl status minio
+      delegate_to: "{{ server_host }}"
+      register: minio_status
+      changed_when: false
+      ignore_errors: yes
+      become: yes
+      
+    - name: Debug - minio service status
+      debug:
+        msg: "MinIO service status: {{ minio_status.stdout_lines }}"
+      
+    - name: Wait for Minio server to start
+      wait_for:
+        host: "127.0.0.1"
+        port: "{{ minio_port }}"
+        timeout: 60
+      delegate_to: "{{ server_host }}"
+      register: minio_wait_result
+      
+    - name: Debug - wait result
+      debug:
+        msg: "MinIO wait result: {{ minio_wait_result }}"
+        
+    - name: Check network port
+      shell: "ss -tulpn | grep {{ minio_port }} || echo 'Port not found'"
+      delegate_to: "{{ server_host }}"
+      register: port_check
+      changed_when: false
+      ignore_errors: yes
+      become: yes
+      
+    - name: Debug - port check
+      debug:
+        msg: "{{ port_check.stdout_lines if port_check.stdout_lines is defined else 'Port not listening' }}"
+        
+    - name: Verify MinIO is actually running with ps
+      shell: "ps -ef | grep -v grep | grep minio || echo 'MinIO process not found'"
+      delegate_to: "{{ server_host }}"
+      register: minio_ps
+      changed_when: false
+      ignore_errors: yes
+      become: yes
+      
+    - name: Debug - ps check
+      debug:
+        msg: "{{ minio_ps.stdout_lines if minio_ps.stdout_lines is defined else 'Process not found' }}"
+        
+    - name: Force restart MinIO if not running
+      systemd:
+        name: minio
+        state: restarted
+        daemon_reload: yes
+      delegate_to: "{{ server_host }}"
+      become: yes
+      when: "'MinIO process not found' in minio_ps.stdout"
+  when: install_server | bool
+
+# Configure Minio client on all client hosts
+- name: Configure Minio clients
+  block:
+    - name: Get server hostname
+      set_fact:
+        minio_server_name: "{{ minio_server_host | default(hostvars[server_host]['ansible_host'] if server_host != '' else inventory_hostname) }}"
+      
+    - name: Configure Minio client
+      shell: |
+        /usr/local/bin/mc config host add minio {{ minio_protocol }}://{{ minio_server_name }}:{{ minio_port }} {{ minio_access_key }} {{ minio_secret_key }}
+      register: mc_config
+      changed_when: true
+      become: yes
+      
+    - name: Verify Minio client configuration
+      shell: /usr/local/bin/mc ls minio
+      register: mc_ls
+      changed_when: false
+      ignore_errors: yes
+      become: yes
+      
+    - name: Display Minio bucket listing
+      debug:
+        msg: "{{ mc_ls.stdout_lines if mc_ls.stdout_lines | default([]) else 'No buckets found or connection error' }}"
+      ignore_errors: yes
+
+# Configure Elasticsearch for S3 repository
+- name: Configure Elasticsearch S3 repository
+  block:
+    # Default to configuring ES for non-interactive mode
+    - name: Set S3 configuration default
+      set_fact:
+        configure_es_repository: true
+        
+    - name: Create default bucket for snapshots
+      shell: |
+        /usr/local/bin/mc mb minio/{{ minio_bucket_name }}
+      ignore_errors: yes
+      register: create_bucket
+      become: yes
+      
+    - name: Create repository command file
+      block:
+        - name: Ensure elasticsearch directory exists
+          file:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+            state: directory
+            mode: '0700'
+          
+        - name: Ensure backups directory exists
+          file:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/backups"
+            state: directory
+            mode: '0700'
+          
+        # Check and backup repository command file if it exists
+        - name: Check if repository command file exists
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt"
+          register: repo_cmd_file
+          
+        - name: Backup repository command file if it exists
+          shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt {{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_repository_command.txt.$(date +%Y%m%d%H%M%S)"
+          when: repo_cmd_file.stat.exists
+          
+        - name: Create snapshot repository command file
+          copy:
+            content: |
+              # Elasticsearch S3 Repository Configuration
+              # Created by es-toolkit on {{ ansible_date_time.iso8601 }}
+              # Use this command in Kibana Dev Tools to register the S3 repository.
+              
+              PUT _snapshot/minio_repository
+              {
+                "type": "s3",
+                "settings": {
+                  "bucket": "{{ minio_bucket_name }}",
+                  {% if minio_keystore_name != 'default' %}
+                  "client": "{{ minio_keystore_name }}",
+                  {% endif %}
+                  "region": "{{ minio_region }}",
+                  "endpoint": "{{ minio_server_name }}:{{ minio_port }}",
+                  "protocol": "{{ minio_protocol }}",
+                  "path_style_access": true
+                }
+              }
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt"
+            mode: '0600'
+          
+        # Check and backup minio config file if it exists
+        - name: Check if minio config file exists
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml"
+          register: minio_config_file
+          
+        - name: Backup minio config file if it exists
+          shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_config.yml.$(date +%Y%m%d%H%M%S)"
+          when: minio_config_file.stat.exists
+          
+        - name: Create minio configuration file
+          copy:
+            content: |
+              ---
+              # Minio S3 Storage Configuration
+              # Created by es-toolkit on {{ ansible_date_time.iso8601 }}
+              
+              minio:
+                server:
+                  host: "{{ minio_server_name }}"
+                  port: {{ minio_port }}
+                  protocol: "{{ minio_protocol }}"
+                  {% if install_server | default(false) %}
+                  installed_on: "{{ server_host }}"
+                  data_dir: "{{ minio_data_dir }}"
+                  console_port: {{ minio_console_port }}
+                  {% endif %}
+                credentials:
+                  access_key: "{{ minio_access_key }}"
+                  secret_key: "{{ minio_secret_key }}"
+                elasticsearch:
+                  keystore_name: "{{ minio_keystore_name }}"
+                  bucket: "{{ minio_bucket_name }}"
+                  region: "{{ minio_region }}"
+                  include_region: {{ include_region | default(false) }}
+                  endpoint: "{{ minio_endpoint_host }}.internal:{{ minio_port | default('9001') }}"
+                repository:
+                  created: {{ create_repository | default(false) }}
+                  created_date: "{{ ansible_date_time.iso8601 if create_repository | default(false) else '' }}"
+                clients:
+                  installed_on: {{ ansible_play_hosts_all | to_json }}
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml"
+            mode: '0600'
+            
+        # Update the custom configurations file with MinIO information
+        - name: Check for custom configurations file
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+          register: custom_config_check
+        
+        - name: Load existing custom configurations if available
+          include_vars:
+            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+            name: existing_custom_configs
+          when: custom_config_check.stat.exists
+        
+        - name: Create empty custom configs if file doesn't exist
+          set_fact:
+            existing_custom_configs:
+              installation: {}
+              security: {}
+              cluster: {}
+              paths: 
+                initial: {}
+                master_nodes: {}
+                hot_nodes: {}
+                frozen_nodes: {}
+                ml_nodes: {}
+              system_tuning: {}
+              node_configurations: {}
+              minio: 
+                configured: false
+          when: not custom_config_check.stat.exists
+          
+        - name: Backup custom configurations file if it exists
+          shell: |
+            mkdir -p {{ lookup('env', 'HOME') }}/.elasticsearch/backups
+            cp {{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/custom_configurations.yml.$(date +%Y%m%d%H%M%S)
+          when: custom_config_check.stat.exists
+          ignore_errors: yes
+          
+        - name: Update custom configurations with MinIO info
+          copy:
+            content: |
+              ---
+              # Elasticsearch Custom Configurations
+              # Last updated: {{ ansible_date_time.iso8601 }}
+              # This file contains all custom configurations from initial deployment and subsequent operations
+              
+              # Installation and version information
+              installation:
+              {% for key, value in existing_custom_configs.installation.items() %}
+                {{ key }}: {{ value | to_json }}
+              {% endfor %}
+              
+              # Security settings
+              security:
+              {% for key, value in existing_custom_configs.security.items() %}
+                {{ key }}: {{ value | to_json }}
+              {% endfor %}
+              
+              # Cluster settings
+              cluster:
+              {% for key, value in existing_custom_configs.cluster.items() %}
+                {{ key }}: {{ value | to_json }}
+              {% endfor %}
+              
+              # Filesystem paths
+              paths:
+                # Initial paths from deployment
+                initial:
+              {% for key, value in existing_custom_configs.paths.initial.items() %}
+                  {{ key }}: {{ value | to_json }}
+              {% endfor %}
+                # Node-specific paths
+                master_nodes:
+              {% for node, paths in existing_custom_configs.paths.master_nodes.items() %}
+                  {{ node }}: {{ paths | to_json }}
+              {% endfor %}
+                hot_nodes:
+              {% for node, paths in existing_custom_configs.paths.hot_nodes.items() %}
+                  {{ node }}: {{ paths | to_json }}
+              {% endfor %}
+                frozen_nodes:
+              {% for node, paths in existing_custom_configs.paths.frozen_nodes.items() %}
+                  {{ node }}: {{ paths | to_json }}
+              {% endfor %}
+                ml_nodes:
+              {% for node, paths in existing_custom_configs.paths.ml_nodes.items() %}
+                  {{ node }}: {{ paths | to_json }}
+              {% endfor %}
+              
+              # System tuning
+              system_tuning:
+              {% for key, value in existing_custom_configs.system_tuning.items() %}
+                {{ key }}: {{ value | to_json }}
+              {% endfor %}
+              
+              # Node-specific configurations
+              node_configurations:
+              {% for node, config in existing_custom_configs.node_configurations.items() %}
+                {{ node }}: {{ config | to_json }}
+              {% endfor %}
+              
+              # MinIO S3 Storage Configuration
+              minio:
+                configured: true
+                configuration_date: "{{ ansible_date_time.iso8601 }}"
+                server:
+                  host: "{{ minio_server_name }}"
+                  port: {{ minio_port }}
+                  protocol: "{{ minio_protocol }}"
+                  {% if install_server | default(false) %}
+                  installed_on: "{{ server_host }}"
+                  data_dir: "{{ minio_data_dir }}"
+                  console_port: {{ minio_console_port }}
+                  {% endif %}
+                credentials:
+                  access_key: "{{ minio_access_key }}"
+                  secret_key: "{{ minio_secret_key }}"
+                elasticsearch:
+                  keystore:
+                    name: "{{ minio_keystore_name }}"
+                    configured: {{ setup_keystore | default(false) }}
+                    target_nodes: "{{ keystore_target_nodes | default('none') }}"
+                  bucket: "{{ minio_bucket_name }}"
+                  region: {{ minio_region | to_json }}
+                  include_region: {{ include_region | default(false) }}
+                  endpoint: "{{ minio_endpoint_host }}.internal:{{ minio_port | default('9001') }}"
+                repository:
+                  created: {{ create_repository | default(false) }}
+                  command_file: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt"
+                  creation_date: "{{ ansible_date_time.iso8601 if create_repository | default(false) else '' }}"
+                clients:
+                  installed_on: {{ ansible_play_hosts_all | to_json }}
+              
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+            mode: '0600'
+      
+    - name: Prompt for custom bucket name
+      pause:
+        prompt: |
+          Enter the S3 bucket name for Elasticsearch snapshots
+          (Default: elasticsearch-snapshots):
+      register: custom_bucket_name
+      
+    - name: Set bucket name based on user input
+      set_fact:
+        minio_bucket_name: "{{ custom_bucket_name.user_input if custom_bucket_name.user_input | length > 0 else 'elasticsearch-snapshots' }}"
+        
+    - name: Prompt for region configuration
+      pause:
+        prompt: |
+          Do you want to include a region in the repository configuration?
+          Region is used primarily with AWS S3, but can be included for compatibility.
+          (yes/no) [no]:
+      register: include_region_prompt
+      
+    - name: Set region inclusion flag
+      set_fact:
+        include_region: "{{ include_region_prompt.user_input | lower == 'yes' or include_region_prompt.user_input | lower == 'y' }}"
+        
+    - name: Prompt for custom region if included
+      pause:
+        prompt: |
+          Enter the S3 region to use (e.g. us-east-1):
+      register: custom_region_value
+      when: include_region
+      
+    - name: Set region value if included
+      set_fact:
+        minio_region: "{{ custom_region_value.user_input if custom_region_value.user_input | length > 0 else 'us-east-1' }}"
+      when: include_region
+
+    - name: Get real FQDN of MinIO server
+      command: hostname -f
+      register: fqdn_result
+      delegate_to: "{{ server_host }}"
+      ignore_errors: yes
+      when: server_host is defined and server_host != ""
+      
+    - name: Set hostname for repository endpoint
+      set_fact:
+        minio_endpoint_host: "{{ fqdn_result.stdout if (fqdn_result is defined and fqdn_result.stdout | length > 0) else (minio_server_host if minio_server_host is defined else server_host) }}"
+      
+    - name: Update repository command file with improved settings
+      copy:
+        content: |
+          # Elasticsearch S3 Repository Configuration
+          # Created by es-toolkit on {{ ansible_date_time.iso8601 }}
+          # Use this command in Kibana Dev Tools to register the S3 repository.
+          # IMPORTANT: Before running this command, add credentials to the Elasticsearch keystore using:
+          # /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.access_key
+          # /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.secret_key
+          
+          PUT _snapshot/minio_repository
+          {
+            "type": "s3",
+            "settings": {
+              "bucket": "{{ minio_bucket_name }}"{% if include_region | default(false) %},
+              "region": "{{ minio_region }}"{% endif %},
+              "endpoint": "{{ minio_endpoint_host }}.internal:{{ minio_port | default('9001') }}",
+              "protocol": "http"
+            }
+          }
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt"
+        mode: '0600'
+          
+    - name: Prompt for keystore setup
+      pause:
+        prompt: |
+          Would you like to add the MinIO credentials to the Elasticsearch keystore now?
+          These credentials are required before creating the repository.
+          (yes/no) [yes]:
+      register: setup_keystore_prompt
+      
+    - name: Set keystore setup flag
+      set_fact:
+        setup_keystore: "{{ setup_keystore_prompt.user_input | default('yes') | lower == 'yes' or setup_keystore_prompt.user_input | default('yes') | lower == 'y' }}"
+    
+    - name: Prompt for target nodes selection
+      pause:
+        prompt: |
+          Which nodes should have the S3 credentials added to their keystore?
+          1. All Elasticsearch nodes
+          2. Only master nodes
+          3. Skip keystore setup
+          Enter your choice [1]:
+      register: keystore_nodes_choice
+      when: setup_keystore | bool
+      
+    - name: Set target nodes for keystore update
+      set_fact:
+        keystore_target_nodes: "{{ 'master_nodes' if keystore_nodes_choice.user_input == '2' else ('all' if keystore_nodes_choice.user_input == '1' or keystore_nodes_choice.user_input == '' else 'none') }}"
+      when: setup_keystore | bool
+      
+    - name: Add S3 credentials to Elasticsearch keystore (all nodes)
+      include_tasks: "{{ playbook_dir }}/tools/run_command.yml"
+      vars:
+        ansible_limit: "*:&elasticsearch"
+        non_interactive: true
+        command_type: "1"  # Add keystore value
+        keystore_key_input: "s3.client.default.access_key"
+        keystore_value_input: "{{ minio_access_key }}"
+      when: setup_keystore | bool and keystore_target_nodes == 'all'
+      
+    - name: Add S3 credentials to Elasticsearch keystore (master nodes)
+      include_tasks: "{{ playbook_dir }}/tools/run_command.yml"
+      vars:
+        ansible_limit: "master_nodes"
+        non_interactive: true
+        command_type: "1"  # Add keystore value
+        keystore_key_input: "s3.client.default.access_key"
+        keystore_value_input: "{{ minio_access_key }}"
+      when: setup_keystore | bool and keystore_target_nodes == 'master_nodes'
+      
+    - name: Add S3 secret key to Elasticsearch keystore (all nodes)
+      include_tasks: "{{ playbook_dir }}/tools/run_command.yml"
+      vars:
+        ansible_limit: "*:&elasticsearch"
+        non_interactive: true
+        command_type: "1"  # Add keystore value
+        keystore_key_input: "s3.client.default.secret_key"
+        keystore_value_input: "{{ minio_secret_key }}"
+      when: setup_keystore | bool and keystore_target_nodes == 'all'
+      
+    - name: Add S3 secret key to Elasticsearch keystore (master nodes)
+      include_tasks: "{{ playbook_dir }}/tools/run_command.yml"
+      vars:
+        ansible_limit: "master_nodes"
+        non_interactive: true
+        command_type: "1"  # Add keystore value
+        keystore_key_input: "s3.client.default.secret_key"
+        keystore_value_input: "{{ minio_secret_key }}"
+      when: setup_keystore | bool and keystore_target_nodes == 'master_nodes'
+      
+    - name: Prompt for repository creation
+      pause:
+        prompt: |
+          Would you like to create the MinIO snapshot repository in Elasticsearch now?
+          (This requires a running Elasticsearch cluster and working Kibana)
+          (yes/no) [yes]:
+      register: create_repo_prompt
+      
+    - name: Set repository creation flag
+      set_fact:
+        create_repository: "{{ create_repo_prompt.user_input | default('yes') | lower == 'yes' or create_repo_prompt.user_input | default('yes') | lower == 'y' }}"
+        
+    - name: Prompt for Kibana endpoint
+      pause:
+        prompt: |
+          Enter the Kibana endpoint URL (e.g., http://localhost:5601):
+      register: kibana_endpoint_prompt
+      when: create_repository | bool
+      
+    - name: Create snapshot repository via Elasticsearch API
+      uri:
+        url: "{{ kibana_endpoint_prompt.user_input }}/api/console/proxy?path=_snapshot%2Fminio_repository&method=PUT"
+        method: POST
+        body: |
+          {
+            "type": "s3",
+            "settings": {
+              "bucket": "{{ minio_bucket_name }}"{% if include_region | default(false) %},
+              "region": "{{ minio_region }}"{% endif %},
+              "endpoint": "{{ minio_endpoint_host }}.internal:{{ minio_port | default('9001') }}",
+              "protocol": "http"
+            }
+          }
+        body_format: json
+        headers:
+          kbn-xsrf: "true"
+          Content-Type: "application/json"
+        status_code: 200
+        validate_certs: no
+      register: repository_creation
+      ignore_errors: yes
+      when: create_repository | bool and kibana_endpoint_prompt.user_input is defined and kibana_endpoint_prompt.user_input | length > 0
+      
+    - name: Display repository creation result
+      debug:
+        msg: |
+          {% if create_repository | bool and repository_creation is defined %}
+          Repository creation {% if repository_creation.status == 200 %}successful{% else %}failed{% endif %}.
+          {% if repository_creation.status != 200 %}
+          Error: {{ repository_creation.msg | default('Unknown error') }}
+          {% endif %}
+          {% endif %}
+          
+          The repository creation command has been saved to:
+          {{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt
+          
+          Use this command in Kibana Dev Tools to create the repository manually if needed:
+          
+          PUT _snapshot/minio_repository
+          {
+            "type": "s3",
+            "settings": {
+              "bucket": "{{ minio_bucket_name }}"{% if include_region | default(false) %},
+              "region": "{{ minio_region }}"{% endif %},
+              "endpoint": "{{ minio_endpoint_host }}.internal:{{ minio_port | default('9001') }}",
+              "protocol": "http"
+            }
+          }
+  when: groups['master_nodes'] is defined
+
+# Generate final report
+- name: Generate installation report
+  debug:
+    msg: |
+      Minio S3 Storage Installation Report
+      ==================================
+      
+      Installation Status:
+      -----------------
+      Minio Client Installed on: {{ ansible_play_hosts | join(', ') }}
+      
+      {% if install_server | default(false) %}
+      Minio Server:
+      ------------
+      Installed on: {{ server_host }} ({{ hostvars[server_host]['ansible_host'] | default('IP unknown') }})
+      Current host: {{ inventory_hostname }} ({{ ansible_host | default('IP unknown') }})
+      Service Status: {% if minio_status is defined and minio_status.rc == 0 %}Running{% else %}Check Manually{% endif %}
+      Process check: {% if minio_ps is defined and minio_ps.stdout_lines | length > 0 and not 'not found' in minio_ps.stdout %}Running{% else %}Not found{% endif %}
+      Port check: {% if port_check is defined and port_check.stdout_lines | length > 0 and not 'not found' in port_check.stdout %}Listening{% else %}Not listening{% endif %}
+      Endpoint: {{ minio_protocol }}://{{ server_host }}:{{ minio_port }}
+      Console: {{ minio_protocol }}://{{ server_host }}:{{ minio_console_port }}
+      {% else %}
+      External Minio Server:
+      -------------------
+      Endpoint: {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }}
+      {% endif %}
+      
+      Access Details:
+      -------------
+      Access Key: {{ minio_access_key }}
+      Secret Key: {{ minio_secret_key }}
+      
+      Elasticsearch Configuration:
+      -------------------------
+      S3 keystore client name: {{ minio_keystore_name }}
+      Default bucket '{{ minio_bucket_name }}' already exists
+      
+      Configuration saved to:
+      - {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml
+      - {{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt
+      
+      To register the repository in Elasticsearch, use the command saved in minio_repository_command.txt
+
+- name: Cleanup temporary files
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items:
+    - "/tmp/minio_install_method_menu.txt"
+    - "/tmp/minio_install_plan.txt"
+  delegate_to: localhost
+  ignore_errors: yes

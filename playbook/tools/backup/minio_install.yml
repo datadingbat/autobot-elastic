@@ -1,0 +1,76 @@
+---
+# minio_install.yml - Direct installer for MinIO server and client
+- name: Install MinIO
+  hosts: localhost
+  gather_facts: no
+  vars_prompt:
+    - name: component
+      prompt: |
+        Which component would you like to install?
+        1. MinIO Server
+        2. MinIO Client
+        Enter your choice (1 or 2):
+      private: no
+      
+    - name: install_method
+      prompt: |
+        Select installation method:
+        1. Online (download from internet)
+        2. Offline (use local binary)
+        Enter your choice (1 or 2):
+      private: no
+      
+    - name: binary_path
+      prompt: |
+        Enter the full path to the MinIO binary on this machine:
+        (Only needed for offline installation, press Enter to skip for online):
+      private: no
+      default: ""
+      
+    - name: server_host
+      prompt: |
+        Enter the hostname where MinIO server should be installed:
+        (This must be a host in your inventory):
+      private: no
+      
+  tasks:
+    - name: Create installation report
+      debug:
+        msg: |
+          MinIO Installation Configuration
+          ===============================
+          
+          Component: {{ "Server" if component == "1" else "Client" }}
+          Method: {{ "Online" if install_method == "1" else "Offline" }}
+          {% if install_method == "2" %}
+          Binary Path: {{ binary_path }}
+          {% endif %}
+          Server Host: {{ server_host }}
+          
+    - name: Confirm installation
+      pause:
+        prompt: |
+          Do you want to proceed with the installation? (yes/no):
+      register: confirmation
+      
+    - name: Exit if not confirmed
+      meta: end_play
+      when: confirmation.user_input | lower != 'yes'
+      
+    - name: Call MinIO server setup playbook
+      include_tasks: "tools/minio_server_setup.yml"
+      vars:
+        noninteractive: true
+        install_method: "{{ 'online' if install_method == '1' else 'offline' }}"
+        minio_binary_path_default: "{{ binary_path | default('/home/ubuntu/minio') }}"
+        server_host_default: "{{ server_host }}"
+      when: component == "1"
+      
+    - name: Call MinIO client setup playbook
+      include_tasks: "tools/minio_client_setup.yml"
+      vars:
+        noninteractive: true
+        install_method: "{{ 'online' if install_method == '1' else 'offline' }}"
+        minio_binary_path_default: "{{ binary_path | default('/home/ubuntu/mc') }}"
+        server_host_default: "{{ server_host }}"
+      when: component == "2"

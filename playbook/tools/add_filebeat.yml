@@ -1,0 +1,797 @@
+---
+# Input validation tasks
+- name: Set default variables
+  set_fact:
+    first_master: "{{ groups['master_nodes'][0] }}"
+    cert_files:
+      - elastic-http-ca.pem
+      - elastic-http.key
+      - elastic-http.pem
+    installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] | default('apt') }}"
+    start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] | default(true) }}"
+    component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}"
+    deb_package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
+
+- name: Validate local installation requirements
+  assert:
+    that:
+      - deb_package_path != ''
+    fail_msg: "deb_package_path must be set for local installation method"
+  when: installation_method == 'local'
+  run_once: true
+  delegate_to: localhost
+
+- name: Pre-flight checks
+  block:
+    # Initial status checks for each host
+    - name: Check installation status
+      block:
+        - name: Check if package is installed
+          shell: "dpkg -l filebeat | grep -q '^ii'"
+          register: pkg_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check if service is active
+          shell: "systemctl is-active filebeat || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check if config directory exists
+          stat:
+            path: /etc/filebeat
+          register: config_check
+          become: yes
+
+        - name: Store host status
+          set_fact:
+            host_status:
+              installed: "{{ pkg_check.rc == 0 or service_check.stdout == 'active' or config_check.stat.exists }}"
+              pkg_status: "{{ pkg_check.rc == 0 }}"
+              service_status: "{{ service_check.stdout }}"
+              config_exists: "{{ config_check.stat.exists }}"
+
+        - name: Set filebeat installation status
+          set_fact:
+            filebeat_installed: "{{ host_status.installed }}"
+
+    # Gather all statuses on localhost
+    - name: Initialize status collection
+      set_fact:
+        all_hosts_status: {}
+      run_once: true
+      delegate_to: localhost
+
+    - name: Aggregate host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | combine({inventory_hostname: host_status}) }}"
+      delegate_to: localhost
+
+    - name: Create installation status report
+      copy:
+        content: |
+          Pre-Installation Status Report
+          =============================
+          Installation Details:
+          -------------------
+          Component: Filebeat
+          Installation Method: {{ installation_method }}
+          {% if installation_method == 'apt' %}
+          Version: {{ 'Latest available' if component_version == 'latest' else component_version }}
+          {% else %}
+          Package Path: {{ deb_package_path }}
+          {% endif %}
+
+          Total Target Hosts: {{ ansible_play_hosts | length }}
+
+          Hosts with Existing Installation (Will Skip):
+          {% for host in ansible_play_hosts %}
+          {% if hostvars[host]['host_status'].installed %}
+          - {{ host }}
+            Package: {% if hostvars[host]['host_status'].pkg_status %}Installed{% else %}Not installed{% endif %}
+            Service: {{ hostvars[host]['host_status'].service_status }}
+            Config Directory: {% if hostvars[host]['host_status'].config_exists %}Exists{% else %}Not found{% endif %}
+
+          {% endif %}
+          {% endfor %}
+
+          Hosts Ready for Installation:
+          {% for host in ansible_play_hosts %}
+          {% if not hostvars[host]['host_status'].installed %}
+          - {{ host }}
+          {% endif %}
+          {% endfor %}
+
+          {% if ansible_play_hosts | map('extract', hostvars) | map(attribute='host_status') | selectattr('installed', 'equalto', true) | list | length > 0 %}
+          NOTE: Some hosts have existing Filebeat installations.
+          To install Filebeat on these hosts:
+          1. Use [7. Backup Service] to backup your configuration
+          2. Use [5. Remove Service] to remove existing installations
+          3. Run this installation again
+          {% endif %}
+        dest: "/tmp/filebeat_preinstall_report.txt"
+      delegate_to: localhost
+      run_once: true
+
+    # Display report
+    - name: Display pre-installation status
+      debug:
+        msg: "{{ lookup('file', '/tmp/filebeat_preinstall_report.txt') | split('\n') }}"
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Pause for user to review pre-installation report
+      pause:
+        prompt: |
+          Please review the pre-installation report above.
+          Press Enter to continue...
+      run_once: true
+      delegate_to: localhost
+
+    # Check for eligible hosts
+    - name: Check for eligible hosts
+      block:
+        - name: Verify installation needed
+          fail:
+            msg: |
+              No hosts eligible for installation. All target hosts have existing Filebeat installations.
+              Use [7. Backup Service] and [5. Remove Service] first if you need to reinstall.
+          when: >
+            ansible_play_hosts | map('extract', hostvars) | 
+            map(attribute='host_status') | 
+            selectattr('installed', 'equalto', false) | 
+            list | length == 0
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Skip installation
+          meta: end_play
+
+    # Get user confirmation
+    - name: Prompt for installation confirmation
+      pause:
+        prompt: |
+          The above report shows the current status of target hosts.
+          Do you want to proceed with installation on eligible hosts? (yes/no):
+      register: install_confirmation
+      delegate_to: localhost
+      run_once: true
+
+    # Handle user response
+    - name: Exit if not confirmed
+      meta: end_play
+      when: install_confirmation.user_input | lower != 'yes'
+      delegate_to: localhost
+      run_once: true
+
+  rescue:
+    - name: Handle pre-flight check failure
+      fail:
+        msg: "Pre-flight checks failed. Please check the error messages above."
+      delegate_to: localhost
+      run_once: true
+
+- name: Certificate management
+  when: not filebeat_installed
+  block:
+    - name: Check certificates on controller
+      stat:
+        path: "/tmp/es_certs/{{ item }}"
+      register: controller_cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Create temp cert directory
+      file:
+        path: /tmp/es_certs
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"        
+      delegate_to: localhost
+      run_once: true
+      become: yes
+
+    - name: Wait for directory permissions
+      wait_for:
+        timeout: 2
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fetch certificates from master
+      fetch:
+        src: "/etc/elasticsearch/certs/{{ item }}"
+        dest: "/tmp/es_certs/{{ item }}"
+        flat: yes
+        mode: '0644'
+      with_items: "{{ cert_files }}"
+      delegate_to: "{{ first_master }}"
+      run_once: true
+      become: yes
+      when: not controller_cert_check.results[0].stat.exists
+
+    - name: Verify certificates
+      stat:
+        path: "/tmp/es_certs/{{ item }}"
+      register: cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Validate certificates exist
+      fail:
+        msg: "Required certificates not found. Please ensure certificates are generated first."
+      when: cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+      run_once: true
+      delegate_to: localhost
+
+- name: Install and configure Filebeat
+  when: not filebeat_installed
+  block:
+    # API key management
+    - name: Setup API key
+      block:
+        - name: Load elastic password
+          set_fact:
+            elastic_password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+          delegate_to: localhost
+          run_once: true
+
+        - name: Check existing API key
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/filebeat_output_apikey.txt"
+          register: api_key_file
+          delegate_to: localhost
+          run_once: true
+
+        - name: Generate and save API key
+          block:
+            - name: Generate new API key
+              uri:
+                url: "https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200/_security/api_key"
+                method: POST
+                body: |
+                  {
+                    "name": "filebeat",
+                    "role_descriptors": {
+                      "filebeat_full_access": {
+                        "cluster": [
+                          "monitor",
+                          "manage_ingest_pipelines",
+                          "manage_ilm",
+                          "read_ilm",
+                          "manage_index_templates",
+                          "cluster:admin/ilm/get",
+                          "cluster:admin/ilm/put"
+                        ],
+                        "indices": [
+                          {
+                            "names": [
+                              "filebeat-*",
+                              ".ds-filebeat-*",
+                              ".ds-.filebeat-*"
+                            ],
+                            "privileges": [
+                              "create_index",
+                              "create",
+                              "write",
+                              "manage",
+                              "read",
+                              "view_index_metadata"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  }
+                body_format: json
+                user: "elastic"
+                password: "{{ elastic_password }}"
+                force_basic_auth: yes
+                validate_certs: no
+                return_content: yes
+                headers:
+                  Content-Type: "application/json"
+              register: api_key_response
+              delegate_to: localhost
+
+            - name: Save API key
+              copy:
+                content: "{{ api_key_response.json.id }}:{{ api_key_response.json.api_key }}"
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/filebeat_output_apikey.txt"
+                mode: '0600'
+              delegate_to: localhost
+          when: not api_key_file.stat.exists
+
+        - name: Load API key
+          set_fact:
+            filebeat_api_key: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/filebeat_output_apikey.txt') | trim }}"
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Handle API key setup failure
+          fail:
+            msg: "Failed to setup API keys. Check Elasticsearch connectivity and permissions."
+
+    # Certificate setup
+    - name: Setup certificates
+      block:
+        - name: Create certs directory
+          file:
+            path: /etc/filebeat/certs
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Copy certificates
+          copy:
+            src: "/tmp/es_certs/{{ item }}"
+            dest: "/etc/filebeat/certs/{{ item }}"
+            owner: root
+            group: root
+            mode: '0644'
+          with_items: "{{ cert_files }}"
+      rescue:
+        - name: Handle certificate setup failure
+          fail:
+            msg: "Failed to setup certificates. Check permissions and certificate existence."
+      become: yes
+
+    # Filebeat installation
+    - name: Install Filebeat
+      block:
+        - name: Install via APT
+          apt:
+            name: "{{ 'filebeat=' + component_version if component_version != 'latest' else 'filebeat' }}"
+            state: "{{ 'latest' if component_version == 'latest' else 'present' }}"
+            update_cache: yes
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          when: installation_method == 'apt'
+
+        - name: Handle local package installation
+          block:
+            - name: Check package exists on controller
+              stat:
+                path: "{{ deb_package_path }}"
+              register: controller_package_check
+              delegate_to: localhost
+
+            - name: Fail if package not found on controller
+              fail:
+                msg: "Package file not found at {{ deb_package_path }} on Ansible controller. Please ensure the .deb package exists and the path is correct."
+              when: not controller_package_check.stat.exists
+              delegate_to: localhost
+
+            - name: Copy package to target
+              copy:
+                src: "{{ deb_package_path }}"
+                dest: "/tmp/{{ deb_package_path | basename }}"
+                mode: '0644'
+
+            - name: Install from local package
+              apt:
+                deb: "/tmp/{{ deb_package_path | basename }}"
+                state: present
+          when: installation_method == 'local'
+      rescue:
+        - name: Handle installation failure
+          fail:
+            msg: "Failed to install Filebeat package. Check package availability and system requirements."
+      become: yes
+
+    # Configuration
+    - name: Configure Filebeat
+      block:
+        - name: Configure main settings
+          copy:
+            dest: /etc/filebeat/filebeat.yml
+            content: |
+              name: "{{ inventory_hostname }}"
+              fields:
+                host.name: "{{ inventory_hostname }}"
+                agent.hostname: "{{ inventory_hostname }}"
+
+              filebeat.inputs:
+              - type: filestream
+                id: var-log
+                enabled: false
+                paths:
+                  - /var/log/*.log
+
+              logging.level: warning
+              logging.to_files: true
+              logging.files:
+                path: /var/log/filebeat
+                name: filebeat
+                keepfiles: 10
+                permissions: 0644
+
+              filebeat.config.modules:
+                path: /etc/filebeat/modules.d/*.yml
+                reload.enabled: false
+
+              setup.template.settings:
+                index.number_of_shards: 1
+                index.codec: best_compression
+
+              setup.kibana:
+                host: "https://{{ hostvars[groups['kibana'][0]].ansible_host }}:5601"
+                ssl.enabled: true
+                ssl.verification_mode: certificate
+                ssl.certificate_authorities: ["/etc/filebeat/certs/elastic-http-ca.pem"]
+                ssl.certificate: "/etc/filebeat/certs/elastic-http.pem"
+                ssl.key: "/etc/filebeat/certs/elastic-http.key"
+
+              output.elasticsearch:
+                hosts: ["https://{{ hostvars[groups['hot_nodes'][0]].ansible_host }}:9200"]
+                api_key: "{{ filebeat_api_key }}"
+                ssl.verification_mode: certificate
+                ssl.certificate_authorities: ["/etc/filebeat/certs/elastic-http-ca.pem"]
+                ssl.certificate: "/etc/filebeat/certs/elastic-http.pem"
+                ssl.key: "/etc/filebeat/certs/elastic-http.key"
+
+              processors:
+                - add_host_metadata:
+                    when.not.contains.tags: forwarded
+            mode: '0644'
+            owner: root
+            group: root
+
+        # Module configuration
+        - name: Enable system module
+          command: "filebeat modules enable system"
+          register: module_enable
+          changed_when: module_enable.rc == 0
+
+        - name: Configure system module
+          copy:
+            dest: /etc/filebeat/modules.d/system.yml
+            content: |
+              - module: system
+                syslog:
+                  enabled: true
+                auth:
+                  enabled: true
+            mode: '0644'
+      rescue:
+        - name: Handle configuration failure
+          fail:
+            msg: "Failed to configure Filebeat. Check file permissions and disk space."
+      become: yes
+
+    # Service management
+    - name: Manage service
+      block:
+        - name: Enable service
+          systemd:
+            name: filebeat
+            enabled: yes
+            daemon_reload: yes
+
+        - name: Start service
+          systemd:
+            name: filebeat
+            state: started
+          when: start_service | bool
+
+        - name: Wait for service
+          wait_for:
+            timeout: 10
+          when: start_service | bool
+      rescue:
+        - name: Handle service management failure
+          fail:
+            msg: "Failed to manage Filebeat service. Check 'journalctl -u filebeat' for details."
+      become: yes
+
+    # Generate final report
+    - name: Generate installation report
+      block:
+        - name: Get final service status
+          shell: "systemctl status filebeat || true"
+          register: final_status
+          changed_when: false
+          failed_when: false
+          become: yes
+          when: not filebeat_installed
+
+        - name: Collect final status
+          set_fact:
+            final_status_info: "{{ final_status_info | default({}) | combine({inventory_hostname: {
+              'skipped': filebeat_installed,
+              'status': final_status if not filebeat_installed else omit
+            }}) }}"
+          delegate_to: localhost
+
+        - name: Create installation report
+          copy:
+            content: |
+              Filebeat Installation Report
+              ===========================
+              Skipped Hosts (Existing Installation):
+              {% for host, info in final_status_info.items() if info.skipped %}
+              - {{ host }}
+              {% endfor %}
+
+              Installation Results:
+              {% for host, info in final_status_info.items() if not info.skipped %}
+              Host: {{ host }}
+              Status: {% if 'Active: active (running)' in info.status.stdout %}Successfully installed and running
+              {% elif 'Active:' in info.status.stdout %}Installed but not running
+              {% else %}Installation failed or incomplete{% endif %}
+              
+              Details:
+              {{ info.status.stdout }}
+              
+              {% endfor %}
+            dest: "/tmp/filebeat_install_report.txt"
+          run_once: true
+          delegate_to: localhost
+
+        - name: Display installation report
+          debug:
+            msg: "{{ lookup('file', '/tmp/filebeat_install_report.txt') | split('\n') }}"
+          run_once: true
+          delegate_to: localhost
+          
+        - name: Pause for user to review installation report
+          pause:
+            prompt: |
+              Please review the installation report above.
+              Press Enter to continue...
+          run_once: true
+          delegate_to: localhost
+          
+        # Set required variables for tracking
+        - name: Set tracking variables
+          set_fact:
+            component_name: "filebeat"
+            operation_type: "add_filebeat"
+            operation_verb: "installed"
+            component_modified: "{{ not filebeat_installed | default(false) }}"
+            tracking_details: "{{ {'installation_method': installation_method} | 
+                              combine({'component_version': component_version}) if installation_method == 'apt' 
+                              else {'installation_method': installation_method} | 
+                              combine({'package_path': deb_package_path}) }}"
+          delegate_to: localhost
+          run_once: true
+        
+        # Tracking functionality
+        - name: Update operations tracking
+          block:
+            # Create ~/.elasticsearch directory if it doesn't exist
+            - name: Ensure directories exist
+              file:
+                path: "{{ item }}"
+                state: directory
+                mode: '0700'
+              with_items:
+                - "{{ lookup('env', 'HOME') }}/.elasticsearch"
+                - "{{ lookup('env', 'HOME') }}/.elasticsearch/backups"
+              delegate_to: localhost
+              run_once: true
+
+            # Check for operations_log file
+            - name: Check if operations_log file exists
+              stat:
+                path: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+              register: operations_log_file
+              delegate_to: localhost
+              run_once: true
+
+            # Initialize operations_log file if it doesn't exist
+            - name: Initialize operations_log file if it doesn't exist
+              copy:
+                content: |
+                  ---
+                  # Elasticsearch operations log
+                  # Created: {{ ansible_date_time.iso8601 }}
+                  
+                  operations: []
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+                mode: '0600'
+              when: not operations_log_file.stat.exists
+              delegate_to: localhost
+              run_once: true
+
+            # Backup operations_log file if it exists
+            - name: Backup operations_log file if it exists
+              shell: |
+                cp {{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/operations_log.yml.$(date +%Y%m%d%H%M%S)
+              when: operations_log_file.stat.exists
+              delegate_to: localhost
+              run_once: true
+
+            # Process installation results
+            - name: Create status file for each host
+              copy:
+                dest: "/tmp/filebeat_install_status_{{ inventory_hostname }}.txt"
+                content: "{{ 'modified' if component_modified | default(false) else 'skipped' }}"
+              delegate_to: localhost
+                
+            - name: Find all status files for modified hosts
+              find:
+                paths: /tmp
+                patterns: "filebeat_install_status_*.txt"
+                contains: "modified"
+              register: modified_status_files
+              delegate_to: localhost
+              run_once: true
+              
+            - name: Extract hostnames from modified status files
+              set_fact:
+                successful_hosts: "{{ modified_status_files.files | map(attribute='path') | 
+                                   map('regex_replace', '^/tmp/filebeat_install_status_(.+)\\.txt$', '\\1') | list }}"
+              delegate_to: localhost
+              run_once: true
+              
+            - name: Cleanup status files
+              file:
+                path: "/tmp/filebeat_install_status_{{ item }}.txt"
+                state: absent
+              loop: "{{ ansible_play_hosts }}"
+              delegate_to: localhost
+              run_once: true
+
+            - name: Debug successful hosts
+              debug:
+                msg: "Successfully installed filebeat on: {{ successful_hosts | join(', ') }}"
+              delegate_to: localhost
+              run_once: true
+              when: successful_hosts | length > 0
+              
+            # Create individual operation log file
+            - name: Generate timestamp
+              command: date +%Y%m%d%H%M%S
+              register: timestamp_raw
+              delegate_to: localhost
+              run_once: true
+              changed_when: false
+              
+            - name: Create operation log file
+              copy:
+                content: |
+                  ---
+                  # Filebeat Operation Record
+                  # Created: {{ ansible_date_time.iso8601 }}
+                  
+                  Operation: add_filebeat
+                  Timestamp: {{ ansible_date_time.iso8601 }}
+                  Hosts: {{ successful_hosts | join(', ') }}
+                  Status: {{ 'No new hosts were added (all hosts had existing installations)' if successful_hosts | length == 0 else 'Successfully installed on ' + (successful_hosts | length | string) + ' host(s)' }}
+                  
+                  Configuration: 
+                    Installation Method: {{ tracking_details.installation_method }}
+                    {% if tracking_details.installation_method == 'apt' %}
+                    Component Version: {{ tracking_details.component_version }}
+                    {% else %}
+                    Package Path: {{ tracking_details.package_path }}
+                    {% endif %}
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operation_filebeat_{{ timestamp_raw.stdout }}.log"
+                mode: '0600'
+              delegate_to: localhost
+              run_once: true
+              
+            # Update main operations log file
+            - name: Load existing operations log
+              block:
+                - name: Try to load operations log
+                  include_vars:
+                    file: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+                    name: current_operations
+                  delegate_to: localhost
+                  run_once: true
+              rescue:
+                - name: Backup corrupted operations log
+                  shell: |
+                    mkdir -p {{ lookup('env', 'HOME') }}/.elasticsearch/backups
+                    cp {{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/operations_log.yml.corrupted.$(date +%Y%m%d%H%M%S)
+                  delegate_to: localhost
+                  run_once: true
+                  
+                - name: Create fresh operations log
+                  copy:
+                    content: |
+                      ---
+                      # Elasticsearch operations log
+                      # Created: {{ ansible_date_time.iso8601 }}
+                      
+                      operations: []
+                    dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+                    mode: '0600'
+                  delegate_to: localhost
+                  run_once: true
+                  
+                - name: Set empty operations list
+                  set_fact:
+                    current_operations:
+                      operations: []
+                  delegate_to: localhost
+                  run_once: true
+              when: operations_log_file.stat.exists
+                
+            - name: Create empty operations list if file doesn't exist
+              set_fact:
+                current_operations:
+                  operations: []
+              delegate_to: localhost
+              run_once: true
+              when: not operations_log_file.stat.exists
+                
+            - name: Append new operation to log
+              copy:
+                content: |
+                  ---
+                  # Elasticsearch operations log
+                  # Updated: {{ ansible_date_time.iso8601 }}
+                  
+                  operations:
+                  {% for op in current_operations.operations %}
+                    - {{ op | to_yaml(indent=2) | regex_replace('^-', '') }}
+                  {% endfor %}
+                    - 
+                      operation: add_filebeat
+                      component: filebeat
+                      timestamp: "{{ ansible_date_time.iso8601 }}"
+                      hosts: "{{ successful_hosts | join(', ') }}"
+                      status: "{{ 'No new hosts added' if successful_hosts | length == 0 else 'Added ' + (successful_hosts | length | string) + ' host(s)' }}"
+                      configuration:
+                        installation_method: "{{ tracking_details.installation_method }}"
+                        {% if tracking_details.installation_method == 'apt' %}
+                        component_version: "{{ tracking_details.component_version }}"
+                        {% else %}
+                        package_path: "{{ tracking_details.package_path }}"
+                        {% endif %}
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+                mode: '0600'
+              delegate_to: localhost
+              run_once: true
+          delegate_to: localhost
+          run_once: true
+
+# Cleanup tasks
+- name: Cleanup
+  block:
+    - name: Remove installation temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/filebeat_preinstall_report.txt"
+        - "/tmp/filebeat_install_report.txt"
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes
+      
+    # Find and remove any remaining status files
+    - name: Find any remaining status files
+      find:
+        paths: /tmp
+        patterns: "filebeat_install_status_*.txt"
+      register: remaining_status_files
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes
+      
+    - name: Remove any remaining status files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      with_items: "{{ remaining_status_files.files }}"
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes
+  always:
+    - name: Ensure cert temp files are removed
+      file:
+        path: "/tmp/es_certs"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      ignore_errors: yes

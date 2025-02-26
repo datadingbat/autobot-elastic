@@ -1,0 +1,1414 @@
+---
+- name: Toolkit for Elasticsearch Utilities - Setup Variables
+  hosts: localhost
+  gather_facts: no
+  vars:
+    utility_paths:
+      'get_state': get_state
+      'set_state': set_state
+      'install': add_es
+      'upgrade': upgrade_component
+      'remove': remove_component
+      'tune': tune_service
+      'backup': backup_component 
+      'run_command': run_command     
+      'help': help_menu 
+      'summary': improved_summary
+      'minio_server': minio_server_setup
+      'minio_client': minio_client_setup
+    service_options:
+      '1': elasticsearch
+      '2': kibana
+      '3': filebeat
+      '4': metricbeat
+      '5': monitoring
+      '6': minio
+    menu_to_utility_map:
+      '1': 'get_state'
+      '2': 'set_state'
+      '3': 'install'
+      '4': 'upgrade'
+      '5': 'remove'
+      '6': 'tune'
+      '7': 'backup'     
+      '8': 'run_command'  
+      '9': 'help'
+    help_menu_options:
+      '1': 'about'
+      '2': 'prerequisites'
+      '3': 'deployment_vars'
+      '4': 'troubleshooting'  
+      '5': 'tracking_files'
+    install_utility_map:
+      '1': add_es
+      '2': add_kibana
+      '3': add_filebeat
+      '4': add_metricbeat
+      '5': add_monitoring
+      '6': minio_setup
+    upgrade_modes:
+      '1': 'automatic'
+      '2': 'managed'
+      '3': 'intelligent'
+  vars_prompt:
+    - name: selected_utility
+      prompt: |
+        Select a utility to run:
+        1. Get Service State
+        2. Change Service State
+        3. Install Service
+        4. Upgrade Service
+        5. Remove Service
+        6. Tune Service
+        7. Backup Service
+        8. Run Command
+        9. Help
+        Enter the number of your choice:
+      private: no
+
+  tasks:
+    - name: Validate utility selection
+      fail:
+        msg: "Invalid utility selection. Please enter a number between 1 and 9."
+      when: selected_utility not in ['1','2','3','4','5','6','7','8','9']
+
+    - name: Set initial utility mapping
+      set_fact:
+        utility_file: "{{ utility_paths[menu_to_utility_map[selected_utility]] }}"
+
+    - name: Handle Help Menu
+      block:
+        - name: Generate help menu content
+          copy:
+            content: |
+              =====================================
+                        HELP MENU
+              =====================================
+              1. About
+              2. Prerequisites
+              3. Deployment Variables & Password Files
+              4. Troubleshooting
+              5. Configuration Tracking & History
+              6. Return to Main Menu
+              
+              Select a topic number (1-6):
+            dest: "/tmp/help_menu.txt"
+          
+        - name: Display help menu
+          debug:
+            msg: "{{ lookup('file', '/tmp/help_menu.txt') | split('\n') }}"
+
+        - name: Prompt for help topic
+          pause:
+            prompt: "Enter your choice (1-6): "
+          register: help_choice
+
+        - name: Generate about content
+          copy:
+            content: |
+              =====================================
+                          ABOUT
+              =====================================
+              
+              AUTOBOT Elastic Toolkit
+              ----------------------
+              
+              This toolkit provides automated management of Elasticsearch 
+              clusters and related services through a comprehensive set 
+              of utilities. It operates using two main plays:
+
+              1. Setup Play (localhost):
+                - Handles variable setup
+                - Manages target selection
+                - Validates configurations
+                - Processes user input
+
+              2. Execution Play (target hosts):
+                - Executes selected utilities
+                - Manages service states
+                - Handles installations/upgrades
+                - Generates reports
+
+              The toolkit supports:
+              - Service state management
+              - Component installation
+              - Service upgrades
+              - Configuration tuning
+              - Backup operations
+              - Multi-host operations
+              - Both online and airgapped environments
+
+              For more information, visit: 
+              https://github.com/datadingbat/autobot-elastic
+            dest: "/tmp/about_content.txt"
+          when: help_choice.user_input == '1'
+
+        - name: Generate prerequisites content
+          copy:
+            content: |
+              =====================================
+                      PREREQUISITES
+              =====================================
+              
+              1. Ansible Requirements
+                - Ansible with Jinja2 integration is required
+                - Recommended: Install via 'ansible-core'
+                - Required version output should include Jinja version:
+                  $ ansible --version
+                  ansible [core 2.17.7]
+                  ...
+                  jinja version = 3.0.3
+
+              2. SSH Configuration
+                - SSH keypair authentication required
+                - Example ~/.ssh/config:
+                  Host *.elastic.internal
+                      IdentityFile ~/.ssh/your-key.pem
+                      User ubuntu
+                      StrictHostKeyChecking no
+
+              3. Sudo Access
+                - Ansible user must have sudo privileges
+                - NOPASSWD sudo configuration recommended
+                - Test with: sudo -n true
+            dest: "/tmp/prerequisites_content.txt"
+          when: help_choice.user_input == '2'
+
+        - name: Generate deployment vars content
+          copy:
+            content: |
+              =====================================
+              DEPLOYMENT VARIABLES & PASSWORD FILES
+              =====================================
+              
+              ~/.elasticsearch/ Directory Contents:
+              ----------------------------------
+              - certs/: Certificate storage
+              - deployment_vars.yml: Main configuration
+              - elastic_password.txt: Elastic user password
+              - filebeat_output_apikey.txt: Filebeat API key
+              - kibana_password.txt: Kibana system password
+              - metricbeat_remote_monitoring_user.txt
+              - monitoring_cluster_metricbeat_output_apikey.txt
+              - pre_deploy_summary.txt
+              
+              deployment_vars.yml Structure:
+              ----------------------------
+              ```yaml
+              # Installation settings
+              installation_method: "apt"
+              component_version: "8.15.4"
+
+              # Security settings
+              es_cert_pass: "3mhkIsdG/ptCq0ZB"
+              passwords_generated: "True"
+
+              # Cluster settings
+              cluster_name: "elastic-cluster"
+              ```
+            dest: "/tmp/deployment_vars_content.txt"
+          when: help_choice.user_input == '3'
+
+        - name: Generate troubleshooting content
+          copy:
+            content: |
+              =====================================
+                    TROUBLESHOOTING GUIDE
+              =====================================
+              
+              Package Management:
+              -----------------
+              - Always use removal option (5) for packages
+              - If installation fails, run removal twice
+              - Package states tracked in status reports
+
+              Debug Output:
+              ------------
+              - For detailed output:
+                ansible-playbook -vv playbook.yml
+                ansible-playbook -vvv playbook.yml
+
+              Common Issues:
+              -------------
+              1. Certificate Issues:
+                - Check /etc/elasticsearch/certs/ permissions
+                - Verify certificate password
+
+              2. Service Start Failures:
+                - Check system logs: journalctl -u elasticsearch
+                - Verify heap size settings
+                - Check disk space and permissions
+            dest: "/tmp/troubleshooting_content.txt"
+          when: help_choice.user_input == '4'
+
+        - name: Display selected content
+          debug:
+            msg: "{{ lookup('file', '/tmp/' + help_files[help_choice.user_input] ) | split('\n') }}"
+          vars:
+            help_files:
+              '1': 'about_content.txt'
+              '2': 'prerequisites_content.txt'
+              '3': 'deployment_vars_content.txt'
+              '4': 'troubleshooting_content.txt'
+              '5': 'tracking_files_content.txt'
+          when: help_choice.user_input in ['1', '2', '3', '4', '5']
+
+        - name: Prompt to continue
+          pause:
+            prompt: |
+              
+              Press enter to return to help menu...
+          when: help_choice.user_input in ['1', '2', '3', '4', '5']
+
+        - name: Loop back to help menu
+          include_tasks: "{{ playbook_dir }}/tools/help_menu.yml"
+          when: help_choice.user_input != '6' and help_choice.user_input != '5'
+
+        - name: Exit help menu
+          meta: end_play
+          when: help_choice.user_input == '6'
+          
+        - name: Generate tracking files content
+          copy:
+            content: |
+              =====================================
+                    CONFIGURATION TRACKING
+              =====================================
+              
+              The Elasticsearch toolkit manages several configuration and tracking files 
+              in the ~/.elasticsearch/ directory to maintain state and enable history tracking.
+              
+              Key Files:
+              ---------
+              - cluster_topology.yml: Current cluster node structure
+              - added_nodes.yml: History of nodes added via toolkit
+              - operations_log.yml: Record of operations performed
+              - minio_config.yml: Minio S3 configuration (if used)
+              - minio_repository_command.txt: Commands for S3 repository setup
+              
+              Backup Strategy:
+              --------------
+              All configuration files are automatically backed up before modification.
+              Backups are stored in ~/.elasticsearch/backups/ with timestamps.
+              
+              Press enter to access the tracking file viewer...
+            dest: "/tmp/tracking_files_content.txt"
+          when: help_choice.user_input == '5'
+          
+        - name: Launch tracking viewer
+          include_tasks: "{{ playbook_dir }}/tools/view_tracking.yml"
+          when: help_choice.user_input == '5'
+
+        # Cleanup temporary files
+        - name: Cleanup help content files
+          file:
+            path: "{{ item }}"
+            state: absent
+          with_items:
+            - "/tmp/help_menu.txt"
+            - "/tmp/about_content.txt"
+            - "/tmp/prerequisites_content.txt"
+            - "/tmp/deployment_vars_content.txt"
+            - "/tmp/troubleshooting_content.txt"
+            - "/tmp/tracking_files_content.txt"
+          ignore_errors: yes
+
+      when: selected_utility == '9'
+
+    # New block for cluster deployment
+    - name: Handle cluster deployment
+      block:
+        # Inventory Structure Validation
+        - name: Validate inventory structure
+          block:
+            - name: Check required inventory groups
+              fail:
+                msg: "Missing required inventory group: {{ item }}"
+              when: item not in groups
+              when: item not in groups
+              with_items:
+                - master_nodes
+                - hot_nodes
+                - helper_instance
+                - kibana
+
+            - name: Set elasticsearch node groups
+              set_fact:
+                elasticsearch_nodes: >-
+                  {%- set node_groups = ['master_nodes', 'hot_nodes'] -%}
+                  {%- if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 -%}
+                  {%- set node_groups = node_groups + ['frozen_nodes'] -%}
+                  {%- endif -%}
+                  {{ node_groups | join(',') }}
+
+            - name: Set deployment limit
+              set_fact:
+                limit: "{{ elasticsearch_nodes }}"
+
+            - name: Check [all:vars] configuration
+              set_fact:
+                required_vars:
+                  - ansible_user
+                  - ansible_connection
+                  - ansible_ssh_private_key_file
+
+            - name: Validate required variables exist
+              fail:
+                msg: "Missing required variable in [all:vars]: {{ item }}"
+              when: hostvars[groups['all'][0]][item] is undefined
+              with_items: "{{ required_vars }}"
+
+            - name: Get private key file path
+              set_fact:
+                ssh_key_path: "{{ hostvars[groups['all'][0]]['ansible_ssh_private_key_file'] }}"
+
+            - name: Check if private key file exists
+              stat:
+                path: "{{ ssh_key_path }}"
+              register: key_file
+
+            - name: Validate private key file
+              fail:
+                msg: |
+                  Private key file validation failed:
+                  File: {{ ssh_key_path }}
+                  {% if not key_file.stat.exists %}
+                  Error: File does not exist
+                  {% elif key_file.stat.mode not in ['0400', '0600'] %}
+                  Error: Incorrect permissions ({{ key_file.stat.mode }}). Must be 400 or 600.
+                  {% endif %}
+              when: >
+                not key_file.stat.exists or 
+                key_file.stat.mode not in ['0400', '0600']
+
+            # Node count validations
+            - name: Validate node counts
+              block:
+                - name: Check master node count
+                  fail:
+                    msg: "Invalid number of master nodes. Must be either 1 or 3, found {{ groups['master_nodes'] | length }}."
+                  when: groups['master_nodes'] | length not in [1, 3]
+
+                - name: Check hot node count
+                  fail:
+                    msg: "Must have at least 1 hot node, found {{ groups['hot_nodes'] | length }}."
+                  when: groups['hot_nodes'] | length < 1
+
+        - name: Prompt for installation method
+          pause:
+            prompt: |
+              Select installation method:
+              1. APT repository
+              2. Manual .deb package
+              Enter the number of your choice:
+          register: install_method_choice
+
+        - name: Handle APT repository installation
+          block:
+            - name: Prompt for version
+              pause:
+                prompt: |
+                  Enter the version number to install, or 'latest'
+                  Example: 8.15.4
+              register: version_choice
+
+            - name: Set version fact
+              set_fact:
+                component_version: "{{ version_choice.user_input }}"
+                installation_method: "apt"
+          when: install_method_choice.user_input == '1'
+
+        - name: Handle manual package installation
+          block:
+            - name: Prompt for Elasticsearch package path
+              pause:
+                prompt: |
+                  Enter the full path to the Elasticsearch .deb package
+                  Example: /tmp/elasticsearch-8.16.1-amd64.deb
+              register: es_package_path
+
+            - name: Prompt for Kibana package path
+              pause:
+                prompt: |
+                  Enter the full path to the Kibana .deb package
+                  Example: /tmp/kibana-8.16.1-amd64.deb
+              register: kibana_package_path
+
+            - name: Validate package files exist
+              stat:
+                path: "{{ item }}"
+              register: package_check
+              with_items:
+                - "{{ es_package_path.user_input }}"
+                - "{{ kibana_package_path.user_input }}"
+
+            - name: Fail if packages don't exist
+              fail:
+                msg: "Package file not found: {{ item.item }}"
+              when: not item.stat.exists
+              with_items: "{{ package_check.results }}"
+
+            - name: Set package paths
+              set_fact:
+                es_deb_package_path: "{{ es_package_path.user_input }}"
+                kibana_deb_package_path: "{{ kibana_package_path.user_input }}"
+                installation_method: "local"
+          when: install_method_choice.user_input == '2'
+
+        - name: Prompt for data path
+          pause:
+            prompt: |
+              Enter the path for Elasticsearch data storage
+              Default: /var/lib/elasticsearch
+              Press enter to use default, or specify custom path:
+          register: data_path_input
+
+        - name: Prompt for log path
+          pause:
+            prompt: |
+              Enter the path for Elasticsearch logs
+              Default: /var/log/elasticsearch
+              Press enter to use default, or specify custom path:
+          register: log_path_input
+
+        - name: Set path variables
+          set_fact:
+            es_data_path: "{{ data_path_input.user_input | default('/var/lib/elasticsearch') }}"
+            es_log_path: "{{ log_path_input.user_input | default('/var/log/elasticsearch') }}"
+
+        - name: Prompt for password management
+          pause:
+            prompt: |
+              How would you like to handle certificates and keystore passwords?
+              1. Generate secure random passwords
+              2. Specify custom passwords
+              Enter your choice:
+          register: password_choice
+
+        - name: Handle custom passwords
+          block:
+            - name: Prompt for certificate password
+              pause:
+                prompt: "Enter password for certificates (min 8 chars, letters/numbers/symbols):"
+                echo: no
+              register: cert_pass
+
+            - name: Validate certificate password
+              fail:
+                msg: "Password must be at least 8 characters and contain letters, numbers, and symbols"
+              when: >
+                cert_pass.user_input | length < 8 or
+                not (cert_pass.user_input is match('.*[A-Za-z].*') and 
+                     cert_pass.user_input is match('.*[0-9].*') and 
+                     cert_pass.user_input is match('.*[^A-Za-z0-9].*'))
+
+            - name: Set custom passwords
+              set_fact:
+                es_cert_pass: "{{ cert_pass.user_input }}"
+                passwords_generated: false
+          when: password_choice.user_input == '2'
+
+        - name: Generate random passwords
+          block:
+            - name: Create random password
+              command: openssl rand -base64 12
+              register: random_pass
+
+            - name: Set generated passwords
+              set_fact:
+                es_cert_pass: "{{ random_pass.stdout }}"
+                passwords_generated: true
+          when: password_choice.user_input == '1'
+
+        # Create pre-deployment report
+        - name: Create deployment report
+          copy:
+            content: |
+              ELASTICSEARCH CLUSTER DEPLOYMENT PLAN
+              ==================================
+
+              Topology Overview
+              ----------------
+              Master Nodes ({{ groups['master_nodes'] | length }}):
+              {% for host in groups['master_nodes'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              Hot Nodes ({{ groups['hot_nodes'] | length }}):
+              {% for host in groups['hot_nodes'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              {% if 'frozen_nodes' in groups and groups['frozen_nodes'] | length > 0 %}
+              Frozen Nodes ({{ groups['frozen_nodes'] | length }}):
+              {% for host in groups['frozen_nodes'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+              {% endif %}
+
+              Helper Instance:
+              {% for host in groups['helper_instance'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              Kibana Node:
+              {% for host in groups['kibana'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+
+              {% if 'monitoring_instance' in groups and groups['monitoring_instance'] | length > 0 %}
+              Monitoring Instance:
+              {% for host in groups['monitoring_instance'] %}
+                - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+              {% endfor %}
+              {% endif %}
+
+              Installation Details
+              -------------------
+              Method: {{ installation_method | title }}
+              {% if installation_method == 'apt' %}
+              Version: {% if component_version == 'latest' %}Latest available{% else %}{{ component_version }}{% endif %}
+              {% else %}
+              Elasticsearch Package: {{ es_deb_package_path }}
+              Kibana Package: {{ kibana_deb_package_path }}
+              {% endif %}
+
+              Path Configuration
+              -----------------
+              Data Path: {{ es_data_path }}
+              Log Path: {{ es_log_path }}
+
+              Inventory Configuration
+              ---------------------
+              SSH User: {{ hostvars[groups['all'][0]]['ansible_user'] }}
+              Private Key: {{ ssh_key_path }}
+              Key File Permissions: {{ key_file.stat.mode }}
+
+              Password Management
+              ------------------
+              Method: {% if passwords_generated %}Auto-generated secure passwords{% else %}Custom password provided{% endif %}
+              
+              Certificate Generation
+              ---------------------
+              - Certificates will be generated on first master node
+              - Secure distribution to all cluster nodes
+              - Passwords will be saved to ~/.elasticsearch/
+
+              Are you ready to proceed with deployment? (yes/no):
+            dest: "/tmp/deployment_plan.txt"
+
+        - name: Display deployment plan
+          debug:
+            msg: "{{ lookup('file', '/tmp/deployment_plan.txt') | split('\n') }}"
+            
+        - name: Pause for user to review deployment plan
+          pause:
+            prompt: |
+              Please review the deployment plan above.
+              Press Enter to continue...
+
+        - name: Confirm deployment
+          pause:
+            prompt: |
+              Do you want to proceed with deployment? (yes/no):
+          register: deploy_confirmation
+
+        - name: Exit if not confirmed
+          meta: end_play
+          when: deploy_confirmation.user_input | lower != 'yes'
+
+        # Store deployment variables
+        - name: Set deployment variables
+          set_fact:
+            selected_play_vars:
+              installation_method: "{{ installation_method }}"
+              component_version: "{{ component_version | default(omit) }}"
+              es_deb_package_path: "{{ es_deb_package_path | default(omit) }}"
+              kibana_deb_package_path: "{{ kibana_deb_package_path | default(omit) }}"
+              es_cert_pass: "{{ es_cert_pass }}"
+              passwords_generated: "{{ passwords_generated }}"
+              es_data_path: "{{ es_data_path }}"
+              es_log_path: "{{ es_log_path }}"              
+      when: selected_utility == '9'
+
+    # Handle Install Service sub-menu
+    - name: Prompt for service to install
+      pause:
+        prompt: |
+          Select the service to install:
+          1. Elasticsearch (Adds to data cluster)
+          2. Kibana (Connects to data cluster)
+          3. Filebeat (Sends local filebeat data to data cluster)
+          4. Metricbeat (Sends cluster metrics to monitoring instance)
+          5. Monitoring Instance (Standalone Elasticsearch)
+          6. MinIO (S3-compatible storage for frozen tier)
+          Enter the number of your choice:
+      register: install_choice
+      when: selected_utility == '3'
+
+    - name: Validate install choice
+      fail:
+        msg: "Invalid installation choice. Please enter a number between 1 and 6."
+      when: >
+        selected_utility == '3' and 
+        install_choice.user_input not in ['1','2','3','4','5','6']
+
+    - name: Override utility file for installation
+      set_fact:
+        utility_file: "{{ install_utility_map[install_choice.user_input] }}"
+      when: selected_utility == '3' and install_choice is defined
+
+    - name: Set service for installation
+      set_fact:
+        selected_service: "{{ service_options[install_choice.user_input] }}"
+      when: selected_utility == '3'
+
+    - name: Prompt for installation method
+      pause:
+        prompt: |
+          Select {% if selected_utility == '4' %}upgrade{% else %}installation{% endif %} method:
+          1. APT repository
+          2. Manual .deb package
+          Enter the number of your choice:
+      register: method_choice
+      when: selected_utility in ['3', '4']
+
+    - name: Set the appropriate variable name
+      set_fact:
+        "{% if selected_utility == '4' %}upgrade_method_choice{% else %}install_method_choice{% endif %}": "{{ method_choice.user_input }}"
+      when: selected_utility in ['3', '4']
+
+    - name: Validate installation/upgrade method
+      fail:
+        msg: "Invalid method selection. Please enter 1 or 2."
+      when: >
+        selected_utility in ['3', '4'] and method_choice.user_input not in ['1','2']
+
+    - name: Handle APT options
+      block:
+        - name: Prompt for version
+          pause:
+            prompt: |
+              Enter the version number to {% if selected_utility == '4' %}upgrade to{% else %}install{% endif %}, or 'latest'
+              Example: 8.15.4
+          register: version_choice
+
+        - name: Set version fact
+          set_fact:
+            component_version: "{{ version_choice.user_input }}"
+            installation_method: "apt"
+      when: >
+        (selected_utility == '3' and install_method_choice == '1') or
+        (selected_utility == '4' and upgrade_method_choice == '1')
+
+    - name: Handle manual package
+      block:
+        - name: Prompt for package path
+          pause:
+            prompt: |
+              Enter the full path to the .deb package (.deb package in this path should exist on the Ansible Controller)
+              Example: /tmp/elasticsearch-8.16.1-amd64.deb
+          register: package_path
+
+        - name: Set package path fact
+          set_fact:
+            deb_package_path: "{{ package_path.user_input }}"
+            installation_method: "local"
+      when: >
+        (selected_utility == '3' and install_method_choice == '2') or
+        (selected_utility == '4' and upgrade_method_choice == '2')
+
+    - name: Prompt to start service after installation
+      pause:
+        prompt: |
+          Do you want to start the service after installation? (yes/no):
+      register: start_service_prompt
+      when: selected_utility == '3'
+
+    - name: Set start_service variable
+      set_fact:
+        start_service: "{{ start_service_prompt.user_input | lower == 'yes' }}"
+      when: selected_utility == '3'
+
+    # Handle Upgrade Service selections
+    - name: Prompt for service to upgrade
+      pause:
+        prompt: |
+          Select the service to upgrade:
+          1. Elasticsearch
+          2. Kibana
+          3. Filebeat
+          4. Metricbeat
+          Enter the number of your choice:
+      register: upgrade_choice
+      when: selected_utility == '4'
+
+    - name: Validate upgrade choice
+      fail:
+        msg: "Invalid upgrade choice. Please enter a number between 1 and 4."
+      when: >
+        selected_utility == '4' and 
+        upgrade_choice.user_input not in ['1','2','3','4']
+
+    - name: Set service for upgrade
+      set_fact:
+        selected_service: "{{ service_options[upgrade_choice.user_input] }}"
+      when: selected_utility == '4'
+
+    - name: Prompt for upgrade mode
+      pause:
+        prompt: |
+          Select upgrade mode:
+          1. Automatic (Proceeds automatically after health checks)
+          2. Managed (Requires confirmation between each host)
+          3. Intelligent (Automatic, switches to managed if errors detected)
+          Enter the number of your choice:
+      register: upgrade_mode_choice
+      when: selected_utility == '4'
+
+    - name: Set upgrade mode
+      set_fact:
+        upgrade_mode: "{{ upgrade_modes[upgrade_mode_choice.user_input] }}"
+      when: selected_utility == '4'
+
+    - name: Validate upgrade mode
+      fail:
+        msg: "Invalid upgrade mode selection. Please enter 1, 2, or 3."
+      when: >
+        selected_utility == '4' and 
+        upgrade_mode_choice.user_input not in ['1','2','3']
+
+    # Handle service selection for state management and removal
+    - name: Prompt for service selection
+      pause:
+        prompt: |
+          {% if selected_utility == '1' %}
+          Select the service to manage:
+          1. Cluster Summary (writes to ~/.elasticsearch/cluster_summary_latest.txt)
+          2. Elasticsearch
+          3. Kibana
+          4. Filebeat
+          5. Metricbeat
+          6. MinIO (S3 storage for frozen tier)
+          {% else %}
+          Select the service to manage:
+          1. Elasticsearch
+          2. Kibana
+          3. Filebeat
+          4. Metricbeat
+          5. MinIO (S3 storage for frozen tier)
+          {% endif %}
+          Enter the number of your choice:
+      register: service_choice
+      when: selected_utility in ['1', '2', '5']
+
+    - name: Validate service selection
+      fail:
+        msg: "Invalid service selection. Please enter a number between 1 and {{ '6' if selected_utility == '1' else '5' }}."
+      when: >
+        selected_utility in ['1', '2', '5'] and 
+        (
+          (selected_utility == '1' and service_choice.user_input not in ['1','2','3','4','5','6']) or
+          (selected_utility != '1' and service_choice.user_input not in ['1','2','3','4','5'])
+        )
+
+    - name: Prompt for backup service selection
+      pause:
+        prompt: |
+          Select service to backup:
+          1. Elasticsearch
+          2. Kibana
+          3. Filebeat
+          4. Metricbeat
+          Enter the number of your choice:
+      register: backup_choice
+      when: selected_utility == '7'
+
+    - name: Set backup service
+      set_fact:
+        selected_service: "{{ service_options[backup_choice.user_input] }}"
+      when: selected_utility == '7'  
+
+    - name: Set selected service and utility file for summary
+      set_fact:
+        selected_service: "cluster_summary"
+        utility_file: "{{ utility_paths['summary'] }}"
+      when: selected_utility == '1' and service_choice.user_input == '1'
+      
+    - name: Debug selected utility
+      debug:
+        msg: "Selected utility: {{ utility_file }}"
+      when: selected_utility == '1' and service_choice.user_input == '1'
+      
+    - name: Set selected service and utility file for MinIO
+      set_fact:
+        selected_service: "minio"
+        utility_file: "remove_minio"
+      when: >
+        (selected_utility == '5' and service_choice.user_input == '5') or
+        (selected_utility == '1' and service_choice.user_input == '6')
+
+    - name: Set limit for cluster summary
+      set_fact:
+        limit: "all"
+      when: selected_utility == '1' and service_choice.user_input == '1'
+
+    - name: Set selected service for regular services
+      set_fact:
+        selected_service: "{{ service_options[service_choice.user_input if selected_utility != '1' else (service_choice.user_input | int - 1) | string] }}"
+      when: >
+        (selected_utility == '1' and service_choice.user_input not in ['1', '6']) or
+        (selected_utility in ['2', '5'] and service_choice.user_input not in ['5'])
+
+    # Handle service to tune
+    - name: Prompt for service to tune
+      pause:
+        prompt: |
+          Select the service to tune:
+          1. Elasticsearch
+          2. Kibana
+          Enter the number of your choice:
+      register: tune_choice
+      when: selected_utility == '6'
+
+    - name: Set tuning service
+      set_fact:
+        selected_service: "{{ service_options[tune_choice.user_input] }}"
+      when: selected_utility == '6'
+
+    # Handle state selection for set_state utility
+    - name: Prompt for service state
+      pause:
+        prompt: |
+          Select desired state:
+          1. Start service
+          2. Stop service
+          3. Restart service
+          Enter the number of your choice:
+      register: state_choice
+      when: selected_utility == '2'
+
+    - name: Validate state selection
+      fail:
+        msg: "Invalid state selection. Please enter a number between 1 and 3."
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input not in ['1','2','3']
+
+    - name: Set target state
+      set_fact:
+        target_state: "{{ state_map[state_choice.user_input] }}"
+      vars:
+        state_map:
+          '1': 'started'
+          '2': 'stopped'
+          '3': 'restarted'
+      when: selected_utility == '2'
+
+# Target selection prompt
+    - name: Select target hosts
+      block:
+        # Monitor target (utility 8)
+        - name: Prompt for monitor target
+          pause:
+            prompt: "Enter the hostname for the monitoring instance:"
+          register: monitoring_host
+          when: selected_utility == '3' and install_choice.user_input == '5'
+
+      
+        # Standard target (utilities 1-6, 8)
+        - name: Prompt for standard target selection
+          pause:
+            prompt: |
+              Select target hosts:
+              {% if not (selected_utility == '4' and selected_service == 'elasticsearch') %}
+              1. All hosts
+              {% endif %}
+              2. Host group
+              3. Specific host
+              Enter the number of your choice:
+          register: standard_target_type
+          when: >
+            selected_utility not in ['7','9'] and
+            not (selected_utility == '3' and install_choice is defined and install_choice.user_input == '5') and
+            not (selected_service is defined and selected_service == 'cluster_summary')
+            
+        # Backup target (utility 7)
+        - name: Prompt for backup target selection
+          pause:
+            prompt: |
+              Select target hosts to backup:
+              1. All hosts
+              2. Host group
+              3. Specific host
+              Enter the number of your choice:
+          register: backup_target_type
+          when: selected_utility == '7'
+
+        # Handle monitoring setup (utility 8)
+        - name: Handle monitoring instance setup
+          block:
+            - name: Set monitoring host as limit
+              set_fact:
+                limit: "{{ monitoring_host.user_input }}"
+                
+            - name: Validate monitoring host exists
+              fail:
+                msg: "Invalid host. The specified host was not found in inventory."
+              when: monitoring_host.user_input not in groups['all']
+          when: selected_utility == '3' and install_choice.user_input == '5'
+
+        # Handle standard targeting (utilities 1-6)
+        - name: Handle standard target selection
+          block:
+            # Handle 'all hosts' selection
+            - name: Handle all hosts selection
+              block:
+                - name: Count total hosts
+                  set_fact:
+                    total_hosts_count: "{{ groups['all'] | length }}"
+
+                - name: Convert count to integer
+                  set_fact:
+                    total_hosts_int: "{{ total_hosts_count | int }}"
+
+                - name: Confirm all hosts modification
+                  pause:
+                    prompt: |
+                      {% if selected_utility == '3' %}
+                      WARNING: This will install {{ selected_service }} on {{ total_hosts_int }} hosts.
+                      {% elif selected_utility == '2' %}
+                      WARNING: This will change {{ selected_service }} state to {{ target_state }} on {{ total_hosts_int }} hosts.
+                      {% elif selected_utility == '5' %}
+                      WARNING: This will remove {{ selected_service }} from {{ total_hosts_int }} hosts.
+                      {% elif selected_utility == '8' %}
+                      WARNING: This will execute the specified command on {{ total_hosts_int }} hosts.
+                      {% else %}
+                      WARNING: This will modify {{ selected_service }} on {{ total_hosts_int }} hosts.
+                      {% endif %}
+                      Would you like to see the list of target hosts? (yes/no):
+                  register: show_hosts_prompt
+                  when: 
+                    - total_hosts_int | int > 0
+                    - selected_utility != '1'
+
+                - name: Display all hosts
+                  block:
+                    - name: Create host report
+                      copy:
+                        content: |
+                          Target Hosts Overview
+                          ====================
+                          Total Hosts: {{ total_hosts_int }}
+
+                          Hosts by Group:
+                          {% for group in groups | sort if group != 'all' and group != 'ungrouped' %}
+                          {{ group }}:
+                          {% for host in groups[group] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endfor %}{% if groups['ungrouped'] | length > 0 %}
+                          Ungrouped Hosts:
+                          {% for host in groups['ungrouped'] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endif %}
+                        dest: "/tmp/hosts_report.txt"
+
+                    - name: Display hosts report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/hosts_report.txt') | split('\n') }}"
+                        
+                    - name: Pause for user to review hosts report
+                      pause:
+                        prompt: |
+                          Please review the hosts report above.
+                          Press Enter to continue...
+                      when: selected_utility != '1'
+                  when: >
+                    selected_utility == '1' or 
+                    (show_hosts_prompt is defined and show_hosts_prompt.user_input | lower == 'yes')
+
+                - name: Set all hosts limit
+                  set_fact:
+                    limit: all
+              when: standard_target_type.user_input == '1'
+
+            # Handle host group selection 
+            - name: Handle host group selection
+              block:
+                - name: Get available groups
+                  set_fact:
+                    available_groups: "{{ groups | dict2items | map(attribute='key') | 
+                                      select('ne', 'all') | select('ne', 'ungrouped') | list | sort }}"
+
+                - name: Display available groups
+                  block:
+                    - name: Create groups report
+                      copy:
+                        content: |
+                          Target Hosts Overview
+                          ====================
+                          {% for group in available_groups %}
+                          {{ group }}:
+                          {% for host in groups[group] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}{% endfor %}
+                        dest: "/tmp/groups_report.txt"
+
+                    - name: Display groups report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/groups_report.txt') | split('\n') }}"
+
+                - name: Prompt for host group selection
+                  pause:
+                    prompt: |
+                      Enter the name of the host group you want to target:
+                  register: host_group_input
+
+                - name: Validate group exists
+                  fail:
+                    msg: "Group '{{ host_group_input.user_input }}' not found in inventory"
+                  when: host_group_input.user_input not in groups
+                
+                # Set default service and variables for minio server and client setup
+                - name: Set selected_service for minio utilities
+                  set_fact:
+                    selected_service: "minio"
+                  when: utility_file in ["minio_setup", "minio_server_setup", "minio_client_setup"]
+                  
+                - name: Set defaults for minio server setup
+                  set_fact:
+                    server_host_default: "{{ host_group_input.user_input }}"
+                    noninteractive: true
+                    install_method: "{{ 'offline' if offline_installation is defined and offline_installation else 'online' }}"
+                    minio_binary_path_default: "/home/ubuntu/minio"
+                  when: utility_file == "minio_server_setup"
+                  
+                - name: Set defaults for minio client setup
+                  set_fact:
+                    server_host_default: "{{ server_host | default(host_group_input.user_input) }}"
+                    noninteractive: true
+                    install_method: "{{ 'offline' if offline_installation is defined and offline_installation else 'online' }}"
+                    minio_binary_path_default: "/home/ubuntu/mc"
+                  when: utility_file == "minio_client_setup"
+
+                # For non-get_state utilities, show confirmation
+                - name: Confirm group hosts modification
+                  pause:
+                    prompt: |
+                      {% if selected_utility == '3' %}
+                      WARNING: This will install {{ selected_service }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% elif selected_utility == '2' %}
+                      WARNING: This will change {{ selected_service }} state to {{ target_state }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% elif selected_utility == '5' %}
+                      WARNING: This will remove {{ selected_service }} from {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% elif selected_utility == '8' %}
+                      WARNING: This will execute the specified command on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% else %}
+                      WARNING: This will modify {{ selected_service | default('minio') }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% endif %}
+                      Would you like to see the list of target hosts? (yes/no):
+                  register: show_group_hosts_prompt
+                  when: selected_utility != '1'
+
+                # Always show host list for get_state, conditionally for others
+                - name: Display group hosts
+                  block:
+                    - name: Create group hosts report
+                      copy:
+                        content: |
+                          Host Group: {{ host_group_input.user_input }}
+                          ======================={{ '=' * host_group_input.user_input | length }}
+                          Total Hosts: {{ groups[host_group_input.user_input] | length }}
+
+                          {% if selected_utility in ['3', '4'] %}
+                          Installation Details:
+                          -------------------
+                          Component: {{ selected_service }}
+                          {% if installation_method == 'apt' %}
+                          Version: {% if component_version == 'latest' %}Latest available{% else %}{{ component_version }}{% endif %}
+
+                          Installation Method: APT repository
+                          {% else %}
+                          Installation Method: Manual package
+                          Package Path: {{ deb_package_path }}
+                          {% endif %}
+                          {% endif %}
+
+                          Target Hosts:
+                          {% for host in groups[host_group_input.user_input] | sort %}
+                          - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                        dest: "/tmp/group_hosts_report.txt"
+
+                    - name: Display group hosts report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/group_hosts_report.txt') | split('\n') }}"
+                        
+                    - name: Pause for user to review group hosts report
+                      pause:
+                        prompt: |
+                          Please review the group hosts report above.
+                          Press Enter to continue...
+                      when: selected_utility != '1'
+                  when: >
+                    selected_utility == '1' or 
+                    (show_group_hosts_prompt is defined and show_group_hosts_prompt.user_input | lower == 'yes')
+
+                - name: Final confirmation for group modification
+                  pause:
+                    prompt: |
+                      Do you want to proceed with modifying these hosts? (yes/no):
+                  register: final_confirmation
+                  when: selected_utility != '1'
+
+                - name: Exit if not confirmed
+                  meta: end_play
+                  when: >
+                    selected_utility != '1' and
+                    final_confirmation.user_input | lower != 'yes'
+
+                - name: Set group limit
+                  set_fact:
+                    limit: "{{ host_group_input.user_input }}"
+              when: standard_target_type.user_input == '2'
+
+            # Handle specific host selection
+            - name: Handle specific host selection
+              block:
+                - name: Prompt for specific host
+                  pause:
+                    prompt: |
+                      Enter the hostname you want to target
+                      (or type 'view' to see full inventory):
+                  register: host_prompt
+
+                - name: Display full inventory and reprompt
+                  block:
+                    - name: Create inventory report
+                      copy:
+                        content: |
+                          Full Inventory Overview
+                          ======================
+                          {% for group in groups | sort if group != 'all' and group != 'ungrouped' %}
+                          {{ group }}:
+                          {% for host in groups[group] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endfor %}{% if groups['ungrouped'] | length > 0 %}
+                          Ungrouped Hosts:
+                          {% for host in groups['ungrouped'] | sort %}
+                            - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+
+                          {% endfor %}
+                          {% endif %}
+                        dest: "/tmp/inventory_report.txt"
+
+                    - name: Display inventory report
+                      debug:
+                        msg: "{{ lookup('file', '/tmp/inventory_report.txt') | split('\n') }}"
+                        
+                    - name: Pause for user to review inventory report
+                      pause:
+                        prompt: |
+                          Please review the inventory report above.
+                          Press Enter to continue...
+
+                    - name: Prompt for host after viewing inventory
+                      pause:
+                        prompt: "Enter the hostname you want to target:"
+                      register: host_prompt_after_view
+                  when: host_prompt.user_input | lower == 'view'
+
+                - name: Set final host input
+                  set_fact:
+                    final_host_input: "{{ host_prompt_after_view.user_input | default(host_prompt.user_input) }}"
+                  when: host_prompt.user_input | lower != 'view' or host_prompt_after_view is defined
+
+                - name: Set specific host limit
+                  set_fact:
+                    limit: "{{ final_host_input }}"
+              when: standard_target_type.user_input == '3'
+
+            # Validate target selection
+            - name: Validate target selection
+              fail:
+                msg: "Invalid target. Host or group not found in inventory."
+              when: >
+                (standard_target_type.user_input == '2' and host_group_input.user_input not in groups) or
+                (standard_target_type.user_input == '3' and final_host_input not in groups['all'])
+
+          when: >
+            selected_utility not in ['7','9'] and
+            not (selected_utility == '3' and install_choice is defined and install_choice.user_input == '5') and
+            not (selected_service is defined and selected_service == 'cluster_summary') and
+            standard_target_type is defined
+
+          # when: >
+          #   selected_utility not in ['7','9'] and
+          #   not (selected_utility == '3' and install_choice.user_input == '5') and
+          #   not (selected_service == 'cluster_summary') and
+          #   standard_target_type is defined
+            
+
+
+        # Handle backup targeting (utility 7)
+        - name: Handle backup selection
+          block:
+            - name: Set all hosts limit for backup
+              set_fact:
+                limit: all
+              when: backup_target_type.user_input == '1'
+
+            - name: Handle backup group selection
+              block:
+                - name: Get available groups
+                  set_fact:
+                    available_groups: "{{ groups | dict2items | map(attribute='key') | 
+                                      select('ne', 'all') | select('ne', 'ungrouped') | list | sort }}"
+
+                - name: Display available groups
+                  debug:
+                    msg: "{{ available_groups }}"
+
+                - name: Prompt for host group selection
+                  pause:
+                    prompt: |
+                      Enter the name of the host group you want to target:
+                  register: backup_group_input
+
+                - name: Validate group exists
+                  fail:
+                    msg: "Group '{{ host_group_input.user_input }}' not found in inventory"
+                  when: host_group_input.user_input not in groups
+
+                - name: Set group limit for backup
+                  set_fact:
+                    limit: "{{ backup_group_input.user_input }}"
+
+                - name: Validate group selection
+                  fail:
+                    msg: "Invalid target. Group not found in inventory."
+                  when: backup_group_input.user_input not in groups
+              when: backup_target_type.user_input == '2'
+
+            - name: Handle backup host selection
+              block:
+                - name: Prompt for host
+                  pause:
+                    prompt: "Enter the hostname you want to target:"
+                  register: backup_host_input
+
+                - name: Set host limit for backup
+                  set_fact:
+                    limit: "{{ backup_host_input.user_input }}"
+
+                - name: Validate host selection
+                  fail:
+                    msg: "Invalid target. Host not found in inventory."
+                  when: backup_host_input.user_input not in groups['all']
+              when: backup_target_type.user_input == '3'
+          when: selected_utility == '7'
+
+      always:
+        - name: Validate limit is set
+          fail:
+            msg: "Target selection failed - no limit was set"
+          when: limit is not defined
+
+    # Store variables for next play
+    - name: Set play variables
+      set_fact:
+        selected_play_vars:
+          utility_file: "{{ utility_file }}"
+          limit: "{{ limit }}"
+          selected_service: "{{ selected_service | default(omit) }}"
+          target_state: "{{ target_state | default(omit) }}"
+          installation_method: "{{ installation_method | default(omit) }}"
+          es_version: "{{ es_version | default(omit) }}"
+          component_version: "{{ component_version | default(omit) }}"  # Added for upgrades
+          deb_package_path: "{{ deb_package_path | default(omit) }}"
+          upgrade_mode: "{{ upgrade_mode | default(omit) }}"  # Added for upgrades
+          start_service: "{{ start_service | default(omit)}}"
+          
+    # Debug for cluster_summary
+    - name: Debug play variables for cluster_summary
+      debug:
+        msg: |
+          utility_file: {{ utility_file | default('not set') }}
+          limit: {{ limit | default('not set') }}
+          selected_service: {{ selected_service | default('not set') }}
+      when: utility_file is defined and utility_file == 'cluster_summary'
+      tags: cluster_summary
+      
+    # Run the improved cluster summary
+    - name: Run improved cluster summary 
+      include_tasks: tools/cluster_summary_improved.yml
+      when: (utility_file is defined and utility_file == 'improved_summary') or 
+            (selected_service is defined and selected_service == 'cluster_summary') or
+            (selected_utility is defined and selected_utility == '1' and service_choice is defined and service_choice.user_input == '1')
+      tags: cluster_summary
+      
+    # Signal that we've already run the cluster summary
+    - name: Set cluster summary completion flag
+      set_fact:
+        cluster_summary_completed: true
+      when: (utility_file is defined and utility_file == 'improved_summary') or 
+            (selected_service is defined and selected_service == 'cluster_summary') or
+            (selected_utility is defined and selected_utility == '1' and service_choice is defined and service_choice.user_input == '1')
+      tags: cluster_summary
+
+    # Cleanup temporary files
+    - name: Cleanup temp files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/hosts_report.txt"
+        - "/tmp/group_hosts_report.txt"
+        - "/tmp/inventory_report.txt"
+      ignore_errors: yes
+      
+# Second play to execute the selected utility
+- name: Execute Selected Utility
+  hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
+  gather_facts: "{{ hostvars['localhost']['selected_play_vars']['utility_file'] != 'get_state_play' }}"
+  vars:
+    selected_service: "{{ hostvars['localhost']['selected_play_vars']['selected_service'] }}"
+    target_state: "{{ hostvars['localhost']['selected_play_vars']['target_state'] }}"
+    installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] }}"
+    es_version: "{{ hostvars['localhost']['selected_play_vars']['es_version'] }}"
+    component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] }}"
+    deb_package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}"
+    upgrade_mode: "{{ hostvars['localhost']['selected_play_vars']['upgrade_mode'] }}"
+    start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] }}"
+    hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
+    serial: "{{ '1' if hostvars['localhost']['selected_play_vars']['utility_file'] == 'upgrade_component' else '0' }}"
+  tasks:
+    - name: Include selected utility
+      include_tasks: "tools/{{ hostvars['localhost']['selected_play_vars']['utility_file'] }}.yml"
+      vars:
+        ansible_limit: "{{ hostvars['localhost']['selected_play_vars']['limit'] }}"
+      when: >
+        hostvars['localhost']['selected_play_vars']['utility_file'] != 'deploy_cluster' and 
+        (hostvars['localhost']['selected_play_vars']['utility_file'] != 'improved_summary' or 
+         not hostvars['localhost'] is defined or 
+         not hostvars['localhost']['cluster_summary_completed'] | default(false))
+
+    # Cleanup temporary files
+    - name: Cleanup temp files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/hosts_report.txt"
+        - "/tmp/group_hosts_report.txt"
+        - "/tmp/inventory_report.txt"
+        - "/tmp/deployment_plan.txt"        
+      ignore_errors: yes

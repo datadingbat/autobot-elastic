@@ -1,0 +1,608 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+        - selected_service
+  run_once: true
+  delegate_to: localhost
+  no_log: true
+
+# Set up initial variables and prepare for status collection
+- name: Initialize status collection
+  block:
+    - name: Check for elastic password file
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/elastic_password.txt"
+      register: password_file
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Load elastic password for API checks if available
+      set_fact:
+        elastic_password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+        elastic_credentials_available: true
+      when: 
+        - selected_service == 'elasticsearch'
+        - password_file.stat.exists
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Set credentials status when password file is missing
+      set_fact:
+        elastic_credentials_available: false
+        elastic_password: ''
+      when: 
+        - selected_service == 'elasticsearch'
+        - not password_file.stat.exists
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Initialize host status
+      set_fact:
+        local_host_info: {}
+        log_status: 
+          startup_log: []
+          has_errors: false
+          errors: []
+
+    # Add warning about missing credentials if needed
+    - name: Warn about missing credentials
+      debug:
+        msg: "Note: Elasticsearch credentials file not found at ~/.elasticsearch/elastic_password.txt. API health checks will be skipped. This is expected if Elasticsearch is not installed or was recently removed."
+      when: 
+        - selected_service == 'elasticsearch'
+        - not elastic_credentials_available
+      delegate_to: localhost
+      run_once: true
+
+# Comprehensive state collection
+- name: Collect service state
+  block:
+    # Package status with special handling for Elasticsearch and related packages
+    - name: Check standard package installation
+      shell: "dpkg -l {{ selected_service }} | grep '^ii'"
+      register: pkg_check
+      changed_when: false
+      failed_when: false
+      become: yes
+      
+    - name: Debug package check
+      debug:
+        msg: |
+          Service: {{ selected_service }}
+          Command: dpkg -l {{ selected_service }} | grep '^ii'
+          RC: {{ pkg_check.rc }}
+          Stdout: {{ pkg_check.stdout }}
+          
+    # Special package checks for Elasticsearch-related services
+    - name: Check all elasticsearch-related packages if this is an elastic service
+      shell: "dpkg -l '*elastic*' | grep '^ii'"
+      register: elastic_pkgs
+      changed_when: false
+      failed_when: false
+      become: yes
+      when: selected_service in ['elasticsearch', 'kibana']
+      
+    - name: Debug all elasticsearch packages
+      debug:
+        msg: |
+          All Elasticsearch packages: {{ elastic_pkgs.stdout_lines | default([]) }}
+      when: selected_service in ['elasticsearch', 'kibana']
+      
+    # Override for Elasticsearch - check if elastic service is running regardless of package name
+    - name: Check if Elasticsearch service is running
+      shell: "systemctl is-active elasticsearch.service || echo 'not-active'"
+      register: es_service_check
+      changed_when: false
+      failed_when: false
+      become: yes
+      when: selected_service == 'elasticsearch' and pkg_check.rc != 0
+      
+    - name: Debug Elasticsearch service check
+      debug:
+        msg: "Elasticsearch service check: {{ es_service_check.stdout }}"
+      when: selected_service == 'elasticsearch' and pkg_check.rc != 0
+      
+    # Handle properly packaged installations
+    - name: Get standard package version
+      set_fact:
+        pkg_version: "{{ pkg_check.stdout.split()[2] | default('not installed') if pkg_check.rc == 0 else 'not installed' }}"
+        pkg_installed: "{{ pkg_check.rc == 0 }}"
+      when: pkg_check.rc == 0
+      
+    # Handle case where Elasticsearch is running but package name doesn't match
+    - name: Set package info for active Elasticsearch
+      set_fact:
+        pkg_version: "{{ 'active-service' }}"
+        pkg_installed: true
+      when: >
+        selected_service == 'elasticsearch' and 
+        pkg_check.rc != 0 and 
+        es_service_check is defined and 
+        es_service_check.stdout == 'active'
+        
+    # Default case when no package or service is found
+    - name: Set default package info
+      set_fact:
+        pkg_version: "not installed"
+        pkg_installed: false
+      when: pkg_installed is not defined
+
+    # Service status check
+    - name: Initialize service info
+      set_fact:
+        service_info:
+          exists: false
+          state: "not installed"
+          substate: "not installed"
+          enabled: false
+ 
+    # Check both standard and alternate systemd paths
+    - name: Check if service exists
+      stat:
+        path: "{{ item }}"
+      register: service_files
+      with_items:
+        - "/lib/systemd/system/{{ selected_service }}.service"
+        - "/etc/systemd/system/{{ selected_service }}.service"
+        - "/usr/lib/systemd/system/{{ selected_service }}.service"
+      become: yes
+        
+    - name: Debug service file check
+      debug:
+        msg: |
+          Service: {{ selected_service }}
+          Service file paths:
+          {% for result in service_files.results %}
+          - {{ result.item }}: {{ result.stat.exists | default(false) }}
+          {% endfor %}
+          
+    # Combine service file results
+    - name: Set service_file fact
+      set_fact:
+        service_file:
+          stat:
+            exists: "{{ service_files.results | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | list | length > 0 }}"
+            path: "{{ service_files.results | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | map(attribute='item') | first | default('') }}"
+
+    - name: Get service status
+      block:
+        - name: Check systemctl status
+          shell: "systemctl status {{ selected_service }} || true"
+          register: systemctl_status
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Parse service state
+          set_fact:
+            service_info:
+              exists: true
+              state: >-
+                {%- if 'Active: active' in systemctl_status.stdout -%}active
+                {%- elif 'Active: inactive' in systemctl_status.stdout -%}inactive
+                {%- elif 'Active: failed' in systemctl_status.stdout -%}failed
+                {%- else -%}unknown{%- endif -%}
+              substate: >-
+                {%- if 'running' in systemctl_status.stdout -%}running
+                {%- elif 'dead' in systemctl_status.stdout -%}dead
+                {%- elif 'failed' in systemctl_status.stdout -%}failed
+                {%- else -%}unknown{%- endif -%}
+              enabled: "{{ 'enabled' in systemctl_status.stdout }}"
+          when: service_file.stat.exists
+      when: service_file.stat.exists
+      no_log: true
+
+    # Configuration check with alternate paths for elasticsearch
+    - name: Check standard configuration directory
+      stat:
+        path: "/etc/{{ selected_service }}"
+      register: config_check
+      become: yes
+      
+    - name: Check alternative elasticsearch configuration paths
+      stat:
+        path: "{{ item }}"
+      register: es_alt_config_check
+      with_items:
+        - "/etc/elasticsearch"
+        - "/opt/elasticsearch/config"
+        - "/usr/share/elasticsearch/config"
+      when: selected_service == 'elasticsearch' and not config_check.stat.exists
+      become: yes
+      
+    - name: Debug configuration path
+      debug:
+        msg: |
+          Checking config path: /etc/{{ selected_service }}
+          Exists: {{ config_check.stat.exists | default(false) }}
+          {% if selected_service == 'elasticsearch' and not config_check.stat.exists %}
+          Alt paths: 
+          {% for result in es_alt_config_check.results | default([]) %}
+          - {{ result.item }}: {{ result.stat.exists | default(false) }}
+          {% endfor %}
+          {% endif %}
+          
+    # Update config_check with alt path if main path doesn't exist
+    - name: Set alternative elasticsearch config if found
+      set_fact:
+        config_check: 
+          stat:
+            exists: true
+            path: "{{ es_alt_config_check.results | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | map(attribute='item') | first }}"
+      when: >
+        selected_service == 'elasticsearch' and 
+        not config_check.stat.exists and 
+        es_alt_config_check.results | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | list | length > 0
+
+    # Log status
+    - name: Initialize log status
+      set_fact:
+        recent_logs:
+          stdout: ""
+          stdout_lines: []
+      no_log: true
+
+# Collect service logs and settings
+    - name: Collect service logs
+      block:
+        - name: Get service startup logs
+          shell: |
+            journalctl -u {{ selected_service }} --since "$(systemctl show {{ selected_service }} -P ActiveEnterTimestamp)"
+          register: service_logs
+          changed_when: false
+          failed_when: false
+          become: yes
+          when: service_info.exists | bool
+          no_log: true
+
+        # Elasticsearch-specific collection
+        - name: Collect Elasticsearch-specific information
+          block:
+            - name: Debug Elasticsearch service check
+              debug:
+                msg: "Running Elasticsearch-specific checks on {{ inventory_hostname }}"
+
+            - name: Get Elasticsearch specific logs
+              shell: |
+                grep -iE 'error|fail|fatal|warn' /var/log/elasticsearch/elastic-cluster.log | 
+                grep -v "JVM arguments" || true
+              register: es_logs
+              changed_when: false
+              failed_when: false
+
+            - name: Get JVM heap settings
+              shell: |
+                grep "Xm[sx]" /var/log/elasticsearch/elastic-cluster.log | tail -1 | 
+                grep -o "\-Xm[sx][0-9]\+m" || echo "Not found"
+              register: heap_settings
+              changed_when: false
+              failed_when: false
+              no_log: true
+
+            - name: Get total system memory
+              shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+              register: total_ram_gb
+              changed_when: false
+              no_log: true
+
+            - name: Calculate recommended heap
+              set_fact:
+                recommended_heap: "{{ [(total_ram_gb.stdout|int / 2)|round|int, 128|int]|min }}"
+              no_log: true
+
+            - name: Get LimitMEMLOCK setting
+              shell: grep LimitMEMLOCK /usr/lib/systemd/system/elasticsearch.service || echo "LimitMEMLOCK not set"
+              register: limit_memlock
+              changed_when: false
+              no_log: true
+
+            - name: Get limits.conf settings
+              shell: grep elasticsearch /etc/security/limits.conf || echo "No elasticsearch settings in limits.conf"
+              register: limits_conf
+              changed_when: false
+              no_log: true
+
+            - name: Get elasticsearch limits.d settings
+              shell: grep elasticsearch /etc/security/limits.d/elasticsearch.conf 2>/dev/null || echo "No elasticsearch.conf found"
+              register: limits_d
+              changed_when: false
+              no_log: true
+
+            - name: Get sysctl max_map_count
+              shell: grep vm.max_map_count /etc/sysctl.conf || echo "vm.max_map_count not set"
+              register: max_map_count
+              changed_when: false
+              no_log: true
+          become: yes
+          when: selected_service == 'elasticsearch' and service_info.exists | bool
+
+        # Set appropriate log status based on service type
+        - name: Set basic log status
+          set_fact:
+            log_status:
+              startup_log: "{{ service_logs.stdout_lines | default([]) }}"
+          no_log: true
+
+        - name: Set elasticsearch-specific log status
+          set_fact:
+            log_status: "{{ log_status | combine({
+              'error_logs': es_logs.stdout_lines | default([]),
+              'heap_settings': heap_settings.stdout_lines | default([]),
+              'system_settings': {
+                'memlock': limit_memlock.stdout_lines | default([]),
+                'limits_conf': limits_conf.stdout_lines | default([]),
+                'limits_d': limits_d.stdout_lines | default([]),
+                'max_map_count': max_map_count.stdout_lines | default([])
+              },
+              'recommended_heap_gb': recommended_heap | default('unknown')
+            }) }}"
+          when: selected_service == 'elasticsearch'
+          no_log: true
+
+    # API health check for Elasticsearch
+    - name: Check Elasticsearch API health
+      block:
+        - name: Skip API checks when credentials are missing
+          debug:
+            msg: "Skipping API health checks due to missing credentials"
+          when: not elastic_credentials_available
+
+        - name: Perform API health checks
+          block:
+            - name: Wait for Elasticsearch API
+              uri:
+                url: "https://{{ hostvars[inventory_hostname].ansible_host }}:9200/_cluster/health"
+                method: GET
+                user: elastic
+                password: "{{ elastic_password }}"
+                force_basic_auth: yes
+                validate_certs: no
+                return_content: yes
+              register: es_health
+              until: es_health.status == 200
+              retries: 3
+              delay: 5
+              no_log: true
+
+            - name: Get node information
+              uri:
+                url: "https://{{ hostvars[inventory_hostname].ansible_host }}:9200/"
+                method: GET
+                user: elastic
+                password: "{{ elastic_password }}"
+                force_basic_auth: yes
+                validate_certs: no
+                return_content: yes
+              register: node_info
+              no_log: true
+
+            - name: Get cluster nodes
+              uri:
+                url: "https://{{ hostvars[inventory_hostname].ansible_host }}:9200/_cat/nodes?v&h=ip,node.role,version"
+                method: GET
+                user: elastic
+                password: "{{ elastic_password }}"
+                force_basic_auth: yes
+                validate_certs: no
+                return_content: yes
+              register: cluster_nodes
+              no_log: true
+
+            - name: Store API status
+              set_fact:
+                api_status:
+                  available: true
+                  health: "{{ es_health.json }}"
+                  version: "{{ node_info.json.version.number }}"
+                  cluster_name: "{{ node_info.json.cluster_name }}"
+                  node_name: "{{ node_info.json.name }}"
+                  nodes: "{{ cluster_nodes.content.split('\n') | reject('equalto', '') | list | length }}"
+          when: elastic_credentials_available
+          rescue:
+            - name: Handle API check failure
+              set_fact:
+                api_status:
+                  available: false
+                  error: "{{ ansible_failed_result.msg | default('API check failed') }}"
+      when: "selected_service == 'elasticsearch' and service_info.state == 'active'"
+
+    # Resource usage - Updated with existence check
+    - name: Initialize resource usage
+      set_fact:
+        resource_usage:
+          stdout: ""
+          stdout_lines: []
+          
+    - name: Get resource usage
+      shell: "systemctl show {{ selected_service }} -p MemoryCurrent,CPUUsageNSec"
+      register: resource_usage
+      changed_when: false
+      failed_when: false
+      become: yes
+      no_log: true
+      when: service_info.exists | bool
+
+    # Calculate memory usage
+    - name: Calculate memory usage
+      set_fact:
+        memory_mb: >-
+          {%- if resource_usage.stdout | default('') | length > 0 -%}
+          {{ ((resource_usage.stdout_lines[0].split('=')[1] | int) / 1024 / 1024) | round(2) }}
+          {%- else -%}
+          unknown
+          {%- endif -%}
+      no_log: true
+
+    # Calculate CPU time
+    - name: Calculate CPU time
+      set_fact:
+        cpu_time_sec: >-
+          {%- if resource_usage.stdout | default('') | length > 0 -%}
+          {{ ((resource_usage.stdout_lines[1].split('=')[1] | int) / 1000000000) | round(2) }}
+          {%- else -%}
+          unknown
+          {%- endif -%}
+      no_log: true
+
+    # Override state if package is installed
+    - name: Update service state for installed package
+      set_fact:
+        service_info:
+          exists: "{{ service_info.exists }}"
+          state: "{{ 'active' if service_info.state == 'active' else 'installed' }}"
+          substate: "{{ service_info.substate if service_info.state == 'active' else 'installed' }}"
+          enabled: "{{ service_info.enabled }}"
+      when: pkg_installed | default(false) | bool
+
+    # Compile comprehensive status
+    - name: Set comprehensive service status
+      set_fact:
+        local_host_info:
+          state: "{{ service_info.state }}"
+          substate: "{{ service_info.substate }}"
+          package:
+            installed: "{{ pkg_installed | default(false) }}"
+            version: "{{ pkg_version }}"
+          config:
+            exists: "{{ config_check.stat.exists | default(false) }}"
+            path: "{{ config_check.stat.path | default('/etc/' + selected_service) }}"
+          service:
+            exists: "{{ service_info.exists }}"
+            enabled: "{{ service_info.enabled }}"
+          resources:
+            memory: "{{ memory_mb }} MB"
+            cpu_time: "{{ cpu_time_sec }} seconds"
+          logs: "{{ log_status }}"
+          api: "{{ api_status | default({}) }}"
+
+# Status aggregation and reporting
+- name: Generate status report
+  block:
+    - name: Create status report
+      copy:
+        content: |
+          SERVICE STATUS REPORT
+          ====================
+
+          COMMAND DETAILS
+          ==============
+          Operation: Get State
+          Component: {{ selected_service | title }}
+          Target Selection: {{ ansible_limit }}
+          Target Hosts: {{ ansible_play_hosts | join(', ') }}
+          Execution Time: {{ ansible_date_time.iso8601 }}
+
+
+          STATUS DETAILS
+          {% for host in ansible_play_hosts | sort %}
+          ===========================
+          HOST: {{ host }}
+          ===========================
+
+          Package Status
+          -------------
+            Installed: {{ hostvars[host].local_host_info.package.installed }}
+            Version: {{ hostvars[host].local_host_info.package.version }}
+          
+          Service Status
+          -------------
+            State: {{ hostvars[host].local_host_info.state }}
+            SubState: {{ hostvars[host].local_host_info.substate }}
+          
+          {% if hostvars[host].local_host_info.service.exists %}
+          Resource Usage
+          -------------
+            Memory: {{ hostvars[host].local_host_info.resources.memory }}
+            CPU Time: {{ hostvars[host].local_host_info.resources.cpu_time }}
+
+          Service Startup Log
+          ------------------
+            {{ hostvars[host].local_host_info.logs.startup_log | join('\n            ') }}
+          {% endif %}
+
+          {% if selected_service == 'elasticsearch' and hostvars[host].local_host_info.service.exists %}
+          Elasticsearch Settings
+          --------------------
+            JVM Heap:
+              Current: {{ hostvars[host].local_host_info.logs.heap_settings | join(', ') }}
+              Recommended: {{ hostvars[host].local_host_info.logs.recommended_heap_gb }}GB
+            
+            System Settings:
+              Memory Lock: {{ hostvars[host].local_host_info.logs.system_settings.memlock | join('\n              ') }}
+              Limits Config: {{ hostvars[host].local_host_info.logs.system_settings.limits_conf | join('\n              ') }}
+              Limits.d: {{ hostvars[host].local_host_info.logs.system_settings.limits_d | join('\n              ') }}
+              Max Map Count: {{ hostvars[host].local_host_info.logs.system_settings.max_map_count | join('\n              ') }}
+
+          {% if hostvars[host].local_host_info.logs.error_logs %}
+          Recent Error Logs
+          ----------------
+            {{ hostvars[host].local_host_info.logs.error_logs | join('\n            ') }}
+          {% endif %}
+          {% endif %}
+
+          {% if selected_service == 'elasticsearch' and hostvars[host].local_host_info.api.available | default(false) %}
+          Elasticsearch API Status
+          ----------------------
+            Cluster: {{ hostvars[host].local_host_info.api.cluster_name }}
+            Node: {{ hostvars[host].local_host_info.api.node_name }}
+            Health: {{ hostvars[host].local_host_info.api.health.status }}
+            Nodes: {{ hostvars[host].local_host_info.api.nodes | length }}
+          {% endif %}
+
+          {% endfor %}
+
+          SUMMARY
+          =======
+          Total Hosts: {{ ansible_play_hosts | length }}
+          Active Services: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.state', 'equalto', 'active') | list | length }}
+          Inactive Services: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.state', 'equalto', 'inactive') | list | length }}
+          Not Installed: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.state', 'equalto', 'not installed') | list | length }}
+          Failed Services: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.state', 'equalto', 'failed') | list | length }}
+
+
+          RECOMMENDATIONS
+          ==============
+          {% for host in ansible_play_hosts | sort %}
+          {% if hostvars[host].local_host_info.service.exists %}
+          {% if hostvars[host].local_host_info.state != 'active' %}
+          - Check service on {{ host }}: Service is {{ hostvars[host].local_host_info.state }}
+          {% endif %}
+          {% if selected_service == 'elasticsearch' and hostvars[host].local_host_info.logs.error_logs | length > 0 %}
+          - Review Elasticsearch logs on {{ host }}: {{ hostvars[host].local_host_info.logs.error_logs | length }} recent issues found
+          {% endif %}
+          {% if selected_service == 'elasticsearch' and hostvars[host].local_host_info.logs.heap_settings and hostvars[host].local_host_info.logs.recommended_heap_gb != hostvars[host].local_host_info.logs.heap_settings %}
+          - Review heap settings on {{ host }}: Current heap differs from recommended {{ hostvars[host].local_host_info.logs.recommended_heap_gb }}GB
+          {% endif %}
+          {% else %}
+          - Service not installed on {{ host }}
+          {% endif %}
+          {% endfor %}
+        dest: "/tmp/service_status_report.txt"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Display status report
+      debug:
+        msg: "{{ lookup('file', '/tmp/service_status_report.txt') | split('\n') }}"
+      delegate_to: localhost
+      run_once: true
+
+  always:
+    - name: Cleanup temporary files
+      file:
+        path: "/tmp/service_status_report.txt"
+        state: absent
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes

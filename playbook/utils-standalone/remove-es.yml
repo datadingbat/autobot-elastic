@@ -1,0 +1,66 @@
+---
+- name: Clean up Elasticsearch installation
+  hosts: all  
+  tasks:  
+    - name: Remove Elasticsearch package
+      apt:
+        name: elasticsearch
+        state: absent
+        purge: yes
+        autoremove: yes
+        autoclean: yes
+      become: yes
+
+    - name: Remove Elasticsearch configuration directory
+      file:
+        path: /etc/elasticsearch
+        state: absent
+      become: yes
+
+    - name: Remove Elasticsearch configuration directory2
+      file:
+        path: /var/lib/elasticsearch
+        state: absent
+      become: yes
+
+    # Kibana cleanup
+    #- name: Remove Kibana package
+    #  apt:
+    #    name: kibana
+    #    state: absent
+    #    purge: yes
+    #    autoremove: yes
+    #   autoclean: yes
+    #  become: yes
+    #  when: inventory_hostname in groups['kibana']
+
+    #- name: Remove Kibana directories
+    #  file:
+    #    path: "{{ item }}"
+    #    state: absent
+    #  with_items:
+    #    - /etc/kibana
+    #    - /var/lib/kibana
+    #    - /var/log/kibana
+    #    - /usr/share/kibana
+    #  become: yes
+    #  when: inventory_hostname in groups['kibana']
+
+    # Common cleanup
+    #- name: Remove local credentials directory
+    #  file:
+    #    path: /home/ubuntu/.elasticsearch
+    #    state: absent
+    #  become: yes
+
+    # Clean systemd
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+      become: yes
+
+    # Clean apt cache
+    - name: Clean apt cache
+      apt:
+        clean: yes
+      become: yes

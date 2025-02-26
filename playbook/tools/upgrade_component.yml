@@ -1,0 +1,664 @@
+---
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+        - selected_service
+        - installation_method
+        - upgrade_mode 
+  run_once: true
+  delegate_to: localhost
+
+- name: Load elastic password
+  set_fact:
+    elastic_password: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/elastic_password.txt') | trim }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Initialize host status tracking
+  set_fact:
+    upgrade_hosts_status: {}
+  run_once: true
+  delegate_to: localhost
+
+- name: Pre-upgrade checks
+  block:
+    - name: Display upgrade checklist
+      pause:
+        prompt: |
+          UPGRADE CHECKLIST
+          ================
+          Please acknowledge the following upgrade requirements:
+
+          1. Backup Recommendation
+             It is STRONGLY recommended to backup your cluster before upgrading.
+             Have you taken appropriate backups? (yes/no)
+
+          {% if selected_service == 'elasticsearch' %}
+          2. Upgrade Documentation
+             Please review the official upgrade documentation:
+             https://www.elastic.co/guide/en/elasticsearch/reference/current/setup-upgrade.html
+             
+          3. Upgrade Order Requirements
+             For data clusters, upgrades MUST follow this order:
+             a. Monitoring cluster/nodes first (if present)
+             b. Data nodes in order: frozen -> cold -> warm -> hot -> unassigned
+             c. Other nodes (ML, ingest, coordinating)
+             d. Master nodes last
+
+             Have you reviewed the documentation and confirm you're upgrading 
+             the correct nodes in the proper order? (yes/no)
+          {% endif %}
+      register: checklist_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Validate checklist confirmation
+      fail:
+        msg: "Upgrade cancelled - checklist requirements not acknowledged"
+      when: "'no' in checklist_confirmation.user_input.lower()"
+      run_once: true
+      delegate_to: localhost
+
+    # Get current version and status for each host
+    - name: Include status check tasks
+      include_tasks: get_state.yml
+
+    # Set timeout values
+    - name: Get service stabilization timeout
+      pause:
+        prompt: |
+          Enter timeout in seconds for service to stabilize after start
+          (Default: 60, press enter to use default):
+      register: stabilize_timeout
+      run_once: true
+      delegate_to: localhost
+
+    - name: Get health check timeout
+      pause:
+        prompt: |
+          Enter timeout in seconds for service health checks
+          (Default: 60, press enter to use default):
+      register: health_timeout
+      run_once: true
+      delegate_to: localhost
+
+    - name: Get cluster health timeout
+      pause:
+        prompt: |
+          Enter timeout in seconds for Elasticsearch cluster health checks
+          (Default: 60, press enter to use default):
+      register: cluster_timeout
+      run_once: true
+      delegate_to: localhost
+      when: selected_service == 'elasticsearch'
+
+    - name: Set timeout values
+      set_fact:
+        timeouts:
+          stabilize: "{{ (stabilize_timeout.user_input | default('60', true)) | int }}"
+          health: "{{ (health_timeout.user_input | default('60', true)) | int }}"
+          cluster: "{{ (cluster_timeout.user_input | default('60', true)) | int if selected_service == 'elasticsearch' else 60 }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Create pre-upgrade report
+      copy:
+        content: |
+          Pre-Upgrade Status Report
+          ========================
+          {% for host in ansible_play_hosts | sort %}
+          Host: {{ hostvars[host].ansible_host | default(host) }}
+          Current Status: {{ hostvars[host].local_host_info.state }}
+          Service State: {{ hostvars[host].local_host_info.substate }}
+          {% if hostvars[host].local_host_info.state == 'failed' %}
+          WARNING: Service is in failed state on this host
+          Details: {{ hostvars[host].local_host_info.full_status }}
+          {% endif %}
+          {% endfor %}
+
+          Component Details:
+          ----------------
+          Package: {{ selected_service }}
+          Current Version: {{ current_version.stdout | default('unknown') }}
+          {% if selected_service == 'elasticsearch' and component_versions is defined %}
+          Related Components:
+          - Kibana: {{ component_versions.kibana }}
+          - Filebeat: {{ component_versions.filebeat }}
+          - Metricbeat: {{ component_versions.metricbeat }}
+          {% endif %}
+
+          Upgrade Configuration:
+          --------------------
+          Upgrade Mode: {{ upgrade_mode }}
+          Installation Method: {{ hostvars['localhost']['selected_play_vars']['installation_method'] }}
+          {% if hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt' %}
+          Target Version: {{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}
+          {% else %}
+          Package Path: {{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}
+          {% endif %}
+
+          Timeout Values:
+          --------------
+          Service Stabilization: {{ timeouts.stabilize }} seconds
+          Health Check: {{ timeouts.health }} seconds
+          {% if selected_service == 'elasticsearch' %}
+          Cluster Health: {{ timeouts.cluster }} seconds
+          {% endif %}
+        dest: "/tmp/pre_upgrade_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display pre-upgrade status
+      debug:
+        msg: "{{ lookup('file', '/tmp/pre_upgrade_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Confirm upgrade
+      pause:
+        prompt: |
+          Review the pre-upgrade status above.
+          Do you want to proceed with the upgrade? (yes/no)
+      register: upgrade_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: upgrade_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
+# Version checks
+    - name: Gather component versions
+      block:
+        - name: Check installed version
+          shell: "dpkg -l {{ selected_service }} | grep '^ii' | awk '{print $3}'"
+          register: current_version
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        # Only for Elasticsearch upgrades, check related components
+        - name: Check related component versions
+          block:
+            - name: Get Kibana version
+              shell: "dpkg -l kibana | grep '^ii' | awk '{print $3}'"
+              register: kibana_version
+              changed_when: false
+              failed_when: false
+
+            - name: Get Filebeat version
+              shell: "dpkg -l filebeat | grep '^ii' | awk '{print $3}'"
+              register: filebeat_version
+              changed_when: false
+              failed_when: false
+
+            - name: Get Metricbeat version
+              shell: "dpkg -l metricbeat | grep '^ii' | awk '{print $3}'"
+              register: metricbeat_version
+              changed_when: false
+              failed_when: false
+
+            - name: Store component versions
+              set_fact:
+                component_versions:
+                  elasticsearch: "{{ current_version.stdout | default('not installed') }}"
+                  kibana: "{{ kibana_version.stdout | default('not installed') }}"
+                  filebeat: "{{ filebeat_version.stdout | default('not installed') }}"
+                  metricbeat: "{{ metricbeat_version.stdout | default('not installed') }}"
+          when: selected_service == 'elasticsearch'
+          become: yes
+          ignore_errors: yes
+
+    # Display version information
+    - name: Show version information
+      debug:
+        msg: |
+          Current {{ selected_service }} version: {{ current_version.stdout | default('not installed') }}
+          {% if selected_service == 'elasticsearch' %}
+          Related component versions:
+          - Kibana: {{ component_versions.kibana }}
+          - Filebeat: {{ component_versions.filebeat }}
+          - Metricbeat: {{ component_versions.metricbeat }}
+          {% endif %}
+      run_once: true
+
+    - name: Set default log status
+      set_fact:
+        log_status:
+          has_errors: false
+          errors: []
+
+- name: Debug play hosts
+  debug:
+    msg: "Processing upgrade for host {{ inventory_hostname }} (Index: {{ ansible_play_hosts.index(inventory_hostname) }})"
+
+# Perform host upgrade
+- name: Upgrade service on host
+  block:
+    # Set initial host status
+    - name: Set host upgrade status
+      set_fact:
+        host_upgrade_status:
+          started: true
+          current_version: "{{ current_version.stdout | default('unknown') }}"
+          hostname: "{{ inventory_hostname }}"
+
+    - name: Stop service
+      systemd:
+        name: "{{ selected_service }}"
+        state: stopped
+      become: yes
+
+    - name: Copy deb package to target host
+      copy:
+        src: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}"
+        dest: "/tmp/{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | basename }}"
+        mode: '0644'
+      when: hostvars['localhost']['selected_play_vars']['installation_method'] == 'local'
+
+    - name: Upgrade via APT
+      apt:
+        name: "{{ selected_service }}{% if hostvars['localhost']['selected_play_vars']['component_version'] != 'latest' %}={{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% endif %}"
+        state: "{{ 'latest' if hostvars['localhost']['selected_play_vars']['component_version'] == 'latest' else 'present' }}"
+        update_cache: yes
+        only_upgrade: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt'
+      become: yes
+
+    - name: Upgrade from local package
+      apt:
+        deb: "/tmp/{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | basename }}"
+        state: present
+      when: hostvars['localhost']['selected_play_vars']['installation_method'] == 'local'
+      become: yes
+
+    - name: Start service
+      systemd:
+        name: "{{ selected_service }}"
+        state: started
+        daemon_reload: yes
+      become: yes
+
+    # Service verification with timeouts
+    - name: Wait for service to stabilize
+      wait_for:
+        timeout: "{{ timeouts.stabilize }}"
+
+    - name: Check service status
+      include_tasks: get_state.yml
+
+    # Additional ES-specific checks
+    - name: Perform Elasticsearch health checks
+      block:
+        - name: Wait for Elasticsearch to start responding
+          uri:
+            url: "https://{{ hostvars[inventory_hostname].ansible_host }}:9200/_cluster/health"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            status_code: 200
+          register: es_health
+          until: es_health.status == 200
+          retries: "{{ timeouts.cluster | int // 5 }}"
+          delay: 5
+          when: selected_service == 'elasticsearch'
+          ignore_errors: yes
+
+        - name: Check cluster health status
+          uri:
+            url: "https://{{ hostvars[inventory_hostname].ansible_host }}:9200/_cluster/health"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: cluster_health
+          failed_when: >
+            cluster_health.json.status == 'red' or
+            (cluster_health.json.status != 'green' and upgrade_mode == 'automatic')
+          when: selected_service == 'elasticsearch'
+          ignore_errors: "{{ upgrade_mode != 'automatic' }}"
+      when: selected_service == 'elasticsearch'
+      ignore_errors: "{{ upgrade_mode != 'automatic' }}"
+
+    - name: Verify new version
+      shell: "dpkg -l {{ selected_service }} | grep '^ii' | awk '{print $3}'"
+      register: new_version
+      changed_when: false
+      failed_when: false
+      become: yes
+
+    - name: Verify Elasticsearch version and operation
+      block:
+        - name: Wait for Elasticsearch to be fully operational
+          uri:
+            url: "https://{{ hostvars[inventory_hostname].ansible_host }}:9200/"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: es_info
+          until: >
+            es_info.status == 200 and
+            es_info.json.version.number is defined and
+            es_info.json.version.number == new_version.stdout
+          retries: "{{ timeouts.health | int // 5 }}"
+          delay: 5
+          when: selected_service == 'elasticsearch'
+
+        - name: Verify cluster operations
+          uri:
+            url: "https://{{ hostvars[inventory_hostname].ansible_host }}:9200/_cat/nodes?v&h=ip,node.role,version"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: es_nodes
+          when: selected_service == 'elasticsearch'
+
+        # Update host status with API check results
+        - name: Update host status with API verification
+          set_fact:
+            host_upgrade_status: "{{ host_upgrade_status | combine({
+              'api_verification': {
+                'version_matches': es_info.json.version.number == new_version.stdout,
+                'cluster_name': es_info.json.cluster_name,
+                'node_name': es_info.json.name,
+                'nodes_info': es_nodes.content
+              }
+            }) }}"
+          when: selected_service == 'elasticsearch'
+
+        # Additional wait if this isn't the last host
+        - name: Additional stabilization period before next host
+          wait_for:
+            timeout: 30
+          when: ansible_play_hosts.index(inventory_hostname) < ansible_play_hosts | length - 1
+      when: selected_service == 'elasticsearch'
+      ignore_errors: no  # We want this to fail if verification fails
+
+    # Log checking
+    - name: Check service logs for errors
+      shell: |
+        journalctl -u {{ selected_service }} -n 50 --no-pager | 
+        grep -iE 'error|fail|fatal' || true
+      register: recent_logs
+      changed_when: false
+      failed_when: false
+      become: yes
+
+    - name: Process log check results
+      set_fact:
+        log_status:
+          has_errors: "{{ recent_logs.stdout | length > 0 }}"
+          errors: "{{ recent_logs.stdout_lines | default([]) }}"
+
+    # Update host status after upgrade
+    - name: Update host upgrade status
+      set_fact:
+        host_upgrade_status: "{{ host_upgrade_status | combine({
+          'completed': true,
+          'success': true,
+          'new_version': new_version.stdout | default('unknown'),
+          'service_state': local_host_info.state | default('unknown'),
+          'service_substate': local_host_info.substate | default('unknown'),
+          'log_status': log_status
+        }) }}"
+
+    # Handle rolling upgrade process
+    - name: Handle rolling upgrade process
+      block:
+        - name: Verify service health
+          fail:
+            msg: "Service failed to start properly after upgrade"
+          when: >
+            local_host_info.state != 'active' or
+            'failed' in local_host_info.substate
+
+        # Switch to managed mode if errors found in intelligent mode
+        - name: Switch to managed mode if errors found
+          set_fact:
+            upgrade_mode: managed
+          when: >
+            upgrade_mode == 'intelligent' and 
+            log_status.has_errors
+
+        - name: Notify of mode switch
+          debug:
+            msg: |
+              WARNING: Errors detected in logs. Switching to managed upgrade mode:
+              {{ log_status.errors | join('\n') }}
+          when: >
+            upgrade_mode == 'intelligent' and 
+            log_status.has_errors
+
+        - name: Show current host status
+          debug:
+            msg: |
+              Host {{ inventory_hostname }} upgrade status:
+              - Version: {{ new_version.stdout }}
+              - Status: {{ local_host_info.state }}
+              {% if selected_service == 'elasticsearch' %}
+              - Cluster Health: {{ cluster_health.json.status | default('unknown') }}
+              {% endif %}
+
+# Prompt for continuation in managed mode
+        - name: Prompt for next node (managed mode)
+          pause:
+            prompt: |
+              Node {{ inventory_hostname }} has been upgraded to version {{ new_version.stdout }}
+              Current Status: {{ local_host_info.state }}
+              {% if log_status.has_errors %}
+              WARNING: Errors detected in logs:
+              {{ log_status.errors | join('\n  ') }}
+              {% endif %}
+              {% if selected_service == 'elasticsearch' %}
+              Cluster Health: {{ cluster_health.json.status | default('unknown') }}
+              {% endif %}
+              
+              Please verify service health and press ENTER to continue with next node,
+              or type 'abort' to stop the rolling upgrade:
+          register: continue_prompt
+          when: >
+            (upgrade_mode == 'managed' or 
+            (upgrade_mode == 'intelligent' and log_status.has_errors)) and 
+            ansible_play_hosts.index(inventory_hostname) < ansible_play_hosts | length - 1
+          delegate_to: localhost
+
+        - name: Abort if requested
+          fail:
+            msg: "Rolling upgrade aborted by user after {{ inventory_hostname }}"
+          when: >
+            continue_prompt is defined and
+            continue_prompt.user_input | lower == 'abort'
+
+        - name: Automatic mode wait
+          wait_for:
+            timeout: "{{ timeouts.health }}"
+          when: >
+            upgrade_mode == 'automatic' and
+            ansible_play_hosts.index(inventory_hostname) < ansible_play_hosts | length - 1
+
+  rescue:
+    - name: Handle upgrade failure
+      set_fact:
+        host_upgrade_status: "{{ host_upgrade_status | combine({
+          'completed': true,
+          'success': false,
+          'failure_reason': ansible_failed_result.msg | default('Unknown error during upgrade')
+        }) }}"
+        upgrade_failed: true
+        failure_reason: "{{ ansible_failed_result.msg | default('Unknown error during upgrade') }}"
+
+  always:
+    - name: Clean up temporary deb package
+      file:
+        path: "/tmp/{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | basename }}"
+        state: absent
+      when: hostvars['localhost']['selected_play_vars']['installation_method'] == 'local'
+      ignore_errors: yes
+
+    # Update localhost's tracking of host status
+    - name: Update host status on localhost
+      set_fact:
+        upgrade_hosts_status: "{{ upgrade_hosts_status | default({}) | combine({inventory_hostname: host_upgrade_status}) }}"
+      delegate_to: localhost
+      run_once: true
+
+# Final status verification and reporting
+- name: Verify upgrade result
+  block:
+    - name: Check service status
+      include_tasks: get_state.yml
+
+    - name: Set upgrade success status
+      set_fact:
+        upgrade_success: "{{ 
+          local_host_info.state == 'active' and 
+          'running' in local_host_info.substate 
+        }}"
+
+    - name: Get final version
+      shell: "dpkg -l {{ selected_service }} | grep '^ii' | awk '{print $3}'"
+      register: final_version
+      changed_when: false
+      failed_when: false
+      become: yes
+
+    # Store all status info for report
+    - name: Collect final status
+      set_fact:
+        final_status: "{{ final_status | default({}) | combine({
+          inventory_hostname: {
+            'success': upgrade_success | default(false),
+            'versions': {
+              'old': host_upgrade_status.current_version | default('unknown'),
+              'new': host_upgrade_status.new_version | default('unknown')
+            },
+            'state': local_host_info.state | default('unknown'),
+            'substate': local_host_info.substate | default('unknown'),
+            'logs': log_status | default({'has_errors': false, 'errors': []}),
+            'failed': upgrade_failed | default(false),
+            'failure_reason': failure_reason | default(''),
+            'elasticsearch_status': cluster_health.json.status | default('N/A') if selected_service == 'elasticsearch' else 'N/A',
+            'api_verification': host_upgrade_status.api_verification | default({}) if selected_service == 'elasticsearch' else {}
+          }
+        }) }}"
+      delegate_to: localhost
+
+# Generate comprehensive final report
+- name: Generate final report
+  block:
+    - name: Create upgrade report
+      copy:
+        content: |
+          {{ selected_service | title }} Upgrade Report
+          ================={{ '=' * selected_service | length }}=====
+          
+          Upgrade Summary:
+          ---------------
+          Total Hosts: {{ ansible_play_hosts | length }}
+          Upgrade Mode: {{ upgrade_mode }}
+          {% if upgrade_mode == 'intelligent' %}Initial Mode: intelligent (switches to managed if errors detected){% endif %}
+          
+          Timeout Settings:
+          ----------------
+          Service Stabilization: {{ timeouts.stabilize }} seconds
+          Health Check: {{ timeouts.health }} seconds
+          {% if selected_service == 'elasticsearch' %}
+          Cluster Health: {{ timeouts.cluster }} seconds
+          {% endif %}
+          
+          Detailed Results:
+          ----------------
+          {% for host in ansible_play_hosts | sort %}
+          Host: {{ host }}
+          {% set host_status = hostvars[host].final_status[host] %}
+          - Version Change: {{ host_status.versions.old }} → {{ host_status.versions.new }}
+          - Status: {% if host_status.success %}✓ SUCCESS{% else %}✗ FAILED{% endif %}
+          - Service State: {{ host_status.state }}
+          - Details: {{ host_status.substate }}
+          {% if selected_service == 'elasticsearch' and host_status.api_verification is defined %}
+          
+          API Verification:
+          - Version Match: {% if host_status.api_verification.version_matches %}✓{% else %}✗{% endif %}
+          - Cluster Name: {{ host_status.api_verification.cluster_name }}
+          - Node Name: {{ host_status.api_verification.node_name }}
+          
+          Node Information:
+          {{ host_status.api_verification.nodes_info | indent(2) }}
+          {% endif %}
+          
+          {% if host_status.logs.has_errors %}
+          Log Warnings:
+          {% for error in host_status.logs.errors %}
+          * {{ error }}
+          {% endfor %}
+          {% endif %}
+          
+          {% if host_status.failed %}
+          Failure Details:
+          {{ host_status.failure_reason | indent(2) }}
+          {% endif %}
+
+          {% endfor %}
+          
+          Overall Status:
+          --------------
+          Successfully Upgraded: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('final_status.' + inventory_hostname + '.success', 'true') | list | length }}
+          Failed Upgrades: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('final_status.' + inventory_hostname + '.success', 'false') | list | length }}
+          Hosts with Log Errors: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('final_status.' + inventory_hostname + '.logs.has_errors', 'true') | list | length }}
+          
+          Next Steps:
+          -----------
+          {% set failed_hosts = ansible_play_hosts | map('extract', hostvars) | selectattr('final_status.' + inventory_hostname + '.success', 'false') | list %}
+          {% if failed_hosts | length > 0 %}
+          - Review failed upgrades and address issues on: {{ failed_hosts | join(', ') }}
+          {% endif %}
+          
+          {% set error_hosts = ansible_play_hosts | map('extract', hostvars) | selectattr('final_status.' + inventory_hostname + '.logs.has_errors', 'true') | list %}
+          {% if error_hosts | length > 0 %}
+          - Investigate log errors on: {{ error_hosts | join(', ') }}
+          {% endif %}
+          
+          {% if failed_hosts | length == 0 and error_hosts | length == 0 %}
+          - All upgrades completed successfully. Monitor service performance.
+          {% endif %}
+        dest: "/tmp/upgrade_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display upgrade report
+      debug:
+        msg: "{{ lookup('file', '/tmp/upgrade_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+  always:
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/upgrade_report.txt"
+        - "/tmp/pre_upgrade_report.txt"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes

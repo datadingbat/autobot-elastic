@@ -1,0 +1,130 @@
+---
+- name: Install and Configure Prerequisites
+  block:
+    - name: Ensure apt-transport-https is installed
+      apt:
+        name: apt-transport-https
+        state: present
+        update_cache: yes
+
+    - name: Install necessary packages
+      apt:
+        name:
+          - gnupg
+          - curl
+          - wget
+        state: present
+
+    # - name: Add deadsnakes PPA repository
+    #   apt_repository:
+    #     repo: ppa:deadsnakes/ppa
+    #     state: present
+    #     update_cache: yes
+
+    # - name: Install Python 3.12 and dependencies
+    #   apt:
+    #     name:
+    #       - python3.12
+    #       - python3.12-venv
+    #       - python3.12-dev
+    #       - python3-pip
+    #     state: present
+    #     update_cache: yes
+    #   environment:
+    #     DEBIAN_FRONTEND: noninteractive
+
+    # - name: Create symlink for python3.12
+    #   file:
+    #     src: /usr/bin/python3.12
+    #     dest: /usr/local/bin/python3.12
+    #     state: link
+
+    # - name: Install pip for Python 3.12
+    #   shell: |
+    #     curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+    #   args:
+    #     creates: /usr/local/bin/pip3.12
+        
+    # - name: Update pip to latest version
+    #   shell: |
+    #     python3.12 -m pip install --upgrade pip
+    #   changed_when: false
+
+    - name: Create keyring directory
+      file:
+        path: /usr/share/keyrings
+        state: directory
+
+    # Try alternate GPG key installation method
+    - name: Download Elasticsearch GPG key
+      get_url:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        dest: /tmp/elasticsearch.asc
+        mode: '0644'
+
+    # - name: Copy Elasticsearch GPG key from Ansible control node
+    #   copy:
+    #     src: /tmp/elasticsearch.asc
+    #     dest: /tmp/elasticsearch.asc
+    #     mode: '0644'
+
+    - name: Import the Elasticsearch GPG key
+      shell: |
+        cat /tmp/elasticsearch.asc | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+    - name: Verify GPG key exists
+      stat:
+        path: /usr/share/keyrings/elasticsearch-keyring.gpg
+      register: gpg_key
+
+    - name: Add Elasticsearch repository file
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        content: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg arch=amd64] https://artifacts.elastic.co/packages/8.x/apt stable main"
+        mode: '0644'
+
+   # - name: Copy Elasticsearch deb package from Ansible control node
+   #   copy:
+   #     src: /path/to/elasticsearch-8.15.4-amd64.deb
+   #     dest: /tmp/elasticsearch-8.15.4-amd64.deb
+   #     mode: '0644'
+
+   # - name: Copy Kibana deb package from Ansible control node
+   #   copy:
+   #     src: /path/to/kibana-8.15.4-amd64.deb
+   #     dest: /tmp/kibana-8.15.4-amd64.deb
+   #     mode: '0644'
+   
+     - name: Force apt update
+          apt:
+            update_cache: yes
+            cache_valid_time: 0
+
+    - name: Check repository file content
+      shell: cat /etc/apt/sources.list.d/elastic-8.x.list
+      register: repo_content
+      changed_when: false
+
+    - name: Check package availability
+      shell: apt-cache policy elasticsearch
+      register: es_policy
+      changed_when: false
+      
+    - name: Create systemd override directory for Elasticsearch
+      file:
+        path: /etc/systemd/system/elasticsearch.service.d
+        state: directory
+
+    - name: Add systemd override for Elasticsearch to allow memory locking
+      copy:
+        dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+        content: |
+          [Service]
+          LimitMEMLOCK=infinity
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+  become: yes

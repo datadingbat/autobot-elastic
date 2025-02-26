@@ -1,0 +1,35 @@
+# roles/common/tasks/confirm_operation.yml
+- name: Display operation details
+  debug:
+    msg: |
+      Operation Details:
+      - Type: {{ operation_type }}
+      - Component: {{ selected_service }}
+      - Target Hosts: {{ ansible_play_hosts | join(', ') }}
+      
+      {% if warning_message is defined %}
+      WARNING: {{ warning_message }}
+      {% endif %}
+
+- name: Show detailed status
+  include_tasks: roles/common/tasks/generate_report.yml
+  vars:
+    operation_title: "Pre-Execution Status Report"
+    report_filename: "pre_execution_report.txt"
+
+- name: Confirm operation
+  pause:
+    prompt: |
+      Review the above status report carefully.
+      {% if destructive %}
+      WARNING: This is a destructive operation that cannot be undone.
+      {% endif %}
+      Do you want to proceed? (yes/no):
+  register: operation_confirmation
+  when: not skip_confirmation | default(false)
+
+- name: Exit if not confirmed
+  meta: end_play
+  when: >
+    not skip_confirmation | default(false) and
+    operation_confirmation.user_input | lower != 'yes'

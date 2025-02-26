@@ -1,0 +1,431 @@
+---
+# remove_minio.yml - Child play for es-toolkit to remove Minio server and client
+
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: {{ item }}"
+      when: vars[item] is not defined
+      with_items:
+        - ansible_limit
+      no_log: true        
+  run_once: true
+  delegate_to: localhost
+
+- name: Set default variables
+  set_fact:
+    service_dirs:
+      minio_server:
+        - /etc/minio
+        - /minio
+        - /usr/local/bin/minio
+        - /etc/systemd/system/minio.service
+      minio_client:
+        - /usr/local/bin/mc
+        - /root/.mc
+
+- name: Pre-flight checks
+  block:
+    - name: Check installation status
+      block:
+        - name: Check if minio server is installed
+          stat:
+            path: /usr/local/bin/minio
+          register: minio_binary_check
+          become: yes
+
+        - name: Check if minio client is installed
+          stat:
+            path: /usr/local/bin/mc
+          register: mc_binary_check
+          become: yes
+
+        - name: Check if minio service exists
+          shell: "systemctl status minio || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check server configuration files
+          stat:
+            path: "{{ item }}"
+          register: server_config_check
+          loop: "{{ service_dirs['minio_server'] }}"
+          become: yes
+          no_log: true
+
+        - name: Check client configuration files
+          stat:
+            path: "{{ item }}"
+          register: client_config_check
+          loop: "{{ service_dirs['minio_client'] }}"
+          become: yes
+          no_log: true
+
+        - name: Store host status
+          set_fact:
+            host_status:
+              server_installed: "{{ minio_binary_check.stat.exists | default(false) or service_check.rc == 0 or (server_config_check.results | selectattr('stat.exists', 'equalto', true) | list | length > 0) }}"
+              client_installed: "{{ mc_binary_check.stat.exists | default(false) or (client_config_check.results | selectattr('stat.exists', 'equalto', true) | list | length > 0) }}"
+              service_state: "{{ service_check.stdout_lines[2] | default('not running') if service_check.rc == 0 else 'not found' }}"
+              server_config_exists: "{{ server_config_check.results | selectattr('stat.exists', 'equalto', true) | list | length > 0 }}"
+              server_config_paths: "{{ server_config_check.results | selectattr('stat.exists', 'equalto', true) | map(attribute='item') | list }}"
+              client_config_exists: "{{ client_config_check.results | selectattr('stat.exists', 'equalto', true) | list | length > 0 }}"
+              client_config_paths: "{{ client_config_check.results | selectattr('stat.exists', 'equalto', true) | map(attribute='item') | list }}"
+
+    # Aggregate status on localhost
+    - name: Initialize status collection
+      set_fact:
+        all_hosts_status: {}
+      run_once: true
+      delegate_to: localhost
+
+    - name: Aggregate host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | default({}) | combine({ inventory_hostname: hostvars[inventory_hostname].host_status }) }}"
+      delegate_to: localhost
+
+    - name: Combine all host statuses
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | default({}) | combine({ item: hostvars[item].host_status }) }}"
+      loop: "{{ ansible_play_hosts | difference([inventory_hostname]) }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Create removal status report
+      copy:
+        content: |
+          MinIO Removal Status Report
+          ==========================
+          Command Details:
+          ---------------
+          Operation: Remove MinIO (Server and Client)
+          Target Selection: {{ ansible_limit }}
+          Target Hosts: {{ ansible_play_hosts | join(', ') }}
+
+          Component Details:
+          {% for host in ansible_play_hosts | sort %}
+          Host: {{ hostvars[host].ansible_host | default(host) }}
+          
+          MinIO Server:
+          {% if hostvars[host].host_status.server_installed %}
+          - Status: Found (will be removed)
+          - Service State: {{ hostvars[host].host_status.service_state }}
+          - Configuration: {{ hostvars[host].host_status.server_config_paths | length }} location(s)
+          {% if hostvars[host].host_status.server_config_paths %}
+          - Config Paths:
+          {% for path in hostvars[host].host_status.server_config_paths %}
+            * {{ path }}
+          {% endfor %}
+          {% endif %}
+          {% else %}
+          - Status: Not installed
+          {% endif %}
+          
+          MinIO Client:
+          {% if hostvars[host].host_status.client_installed %}
+          - Status: Found (will be removed)
+          - Configuration: {{ hostvars[host].host_status.client_config_paths | length }} location(s)
+          {% if hostvars[host].host_status.client_config_paths %}
+          - Config Paths:
+          {% for path in hostvars[host].host_status.client_config_paths %}
+            * {{ path }}
+          {% endfor %}
+          {% endif %}
+          {% else %}
+          - Status: Not installed
+          {% endif %}
+
+          {% endfor %}
+
+          Summary:
+          - Hosts with MinIO Server: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('host_status.server_installed', 'equalto', true) | list | length }}
+          - Hosts with MinIO Client: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('host_status.client_installed', 'equalto', true) | list | length }}
+          - Hosts with neither component: {{ ansible_play_hosts | map('extract', hostvars) | selectattr('host_status.server_installed', 'equalto', false) | selectattr('host_status.client_installed', 'equalto', false) | list | length }}
+        dest: "/tmp/minio_removal_report.txt"
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+
+    - name: Display pre-removal status
+      debug:
+        msg: "{{ lookup('file', '/tmp/minio_removal_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Check for eligible hosts
+      block:
+        - name: Verify removal needed
+          fail:
+            msg: "No hosts have MinIO server or client installed. Nothing to remove."
+          when: >
+            ansible_play_hosts | map('extract', hostvars) | 
+            selectattr('host_status.server_installed', 'equalto', true) | list | length == 0 and
+            ansible_play_hosts | map('extract', hostvars) | 
+            selectattr('host_status.client_installed', 'equalto', true) | list | length == 0
+          delegate_to: localhost
+          run_once: true
+          no_log: true      
+      rescue:
+        - name: Skip removal
+          meta: end_play
+          no_log: true
+
+    - name: Prompt for removal confirmation
+      pause:
+        prompt: |
+          The above report shows the current status of target hosts.
+          WARNING: This will completely remove both MinIO Server and MinIO Client components.
+          Do you want to proceed with the removal? (yes/no):
+      register: remove_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: remove_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+      
+
+- name: Remove MinIO server
+  block:
+    - name: Stop and disable MinIO service
+      systemd:
+        name: "minio"
+        state: stopped
+        enabled: no
+      failed_when: false
+      no_log: true
+      become: yes
+
+    - name: Remove MinIO service file
+      file:
+        path: /etc/systemd/system/minio.service
+        state: absent
+      become: yes
+
+    - name: Remove MinIO binary
+      file:
+        path: /usr/local/bin/minio
+        state: absent
+      become: yes
+
+    - name: Remove MinIO configuration directory
+      file:
+        path: /etc/minio
+        state: absent
+      become: yes
+
+    - name: Prompt about data directory
+      pause:
+        prompt: |
+          Do you want to remove the MinIO data directory (/minio/data)?
+          WARNING: This will delete all data in the S3 storage.
+          Enter 'yes' to delete, anything else to keep:
+      register: delete_data_prompt
+      run_once: true
+      delegate_to: localhost
+
+    - name: Remove MinIO data directory if confirmed
+      file:
+        path: "/minio/data"
+        state: absent
+      become: yes
+      when: delete_data_prompt.user_input | lower == 'yes'
+  when: host_status.server_installed
+
+- name: Remove MinIO client
+  block:
+    - name: Remove MinIO client binary
+      file:
+        path: /usr/local/bin/mc
+        state: absent
+      become: yes
+
+    - name: Remove MinIO client configuration
+      file:
+        path: /root/.mc
+        state: absent
+      become: yes
+      ignore_errors: true
+  when: host_status.client_installed
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+  when: host_status.server_installed
+
+# Cleanup config files on the controller
+- name: Ask about controller config files
+  pause:
+    prompt: |
+      Do you want to cleanup MinIO configuration files on the controller?
+      (This will backup and remove files in ~/.elasticsearch/)
+      Enter 'yes' to clean up:
+  register: cleanup_controller_configs
+  run_once: true
+  delegate_to: localhost
+
+- name: Cleanup controller config files
+  block:
+    - name: Ensure backups directory exists
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/backups"
+        state: directory
+        mode: '0700'
+
+    - name: Backup config files before removal
+      shell: |
+        if [ -f "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml" ]; then
+          cp "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml" "{{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_config.yml.$(date +%Y%m%d%H%M%S)"
+        fi
+        if [ -f "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt" ]; then
+          cp "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt" "{{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_repository_command.txt.$(date +%Y%m%d%H%M%S)"
+        fi
+
+    - name: Remove config files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml"
+        - "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt"
+  when: cleanup_controller_configs.user_input | lower == 'yes'
+  run_once: true
+  delegate_to: localhost
+
+- name: Generate removal report
+  block:
+    - name: Get final status
+      block:
+        - name: Check final server binary status
+          stat:
+            path: /usr/local/bin/minio
+          register: final_server_status
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check final client binary status
+          stat:
+            path: /usr/local/bin/mc
+          register: final_client_status
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Check final service status
+          shell: "systemctl status minio || true"
+          register: final_service_status
+          changed_when: false
+          failed_when: false
+          become: yes
+
+        - name: Store local status
+          set_fact:
+            host_final_status:
+              server_exists: "{{ final_server_status.stat.exists | default(false) }}"
+              client_exists: "{{ final_client_status.stat.exists | default(false) }}"
+              service_exists: "{{ final_service_status.rc == 0 }}"
+              failed: "{{ removal_failed | default(false) }}"
+              failure_reason: "{{ failure_reason | default('') }}"
+
+        - name: Initialize final status collection
+          set_fact:
+            final_status_info: {}
+          run_once: true
+          delegate_to: localhost
+          no_log: true          
+
+        - name: Aggregate host statuses
+          set_fact:
+            final_status_info: "{{ final_status_info | combine({inventory_hostname: host_final_status}) }}"
+          delegate_to: localhost
+
+        - name: Combine all final host statuses
+          set_fact:
+            final_status_info: "{{ final_status_info | combine({item: hostvars[item]['host_final_status']}) }}"
+          loop: "{{ ansible_play_hosts | difference([inventory_hostname]) }}"
+          run_once: true
+          delegate_to: localhost
+          when: ansible_play_hosts | difference([inventory_hostname]) | length > 0
+          no_log: true
+
+        - name: Create removal report
+          copy:
+            content: |
+              Final MinIO Removal Report
+              =========================
+              Command Details:
+              ---------------
+              Operation: Remove MinIO (Server and Client)
+              Target Selection: {{ ansible_limit }}
+              Target Hosts: {{ ansible_play_hosts | join(', ') }}
+
+              Component Details:
+              {% for host in ansible_play_hosts | sort %}
+              Host: {{ hostvars[host].ansible_host | default(host) }}
+              
+              MinIO Server:
+              - Status: {% if not hostvars[host].host_final_status.server_exists %}Successfully removed{% else %}Removal incomplete{% endif %}
+              - Service Status: {% if not hostvars[host].host_final_status.service_exists %}Stopped/Removed{% else %}Still running{% endif %}
+              
+              MinIO Client:
+              - Status: {% if not hostvars[host].host_final_status.client_exists %}Successfully removed{% else %}Removal incomplete{% endif %}
+              
+              {% if hostvars[host].host_final_status.failed %}
+              Errors:
+              {{ hostvars[host].host_final_status.failure_reason }}
+              {% endif %}
+
+              {% endfor %}
+
+              Summary:
+              - Hosts with complete server removal: {{ ansible_play_hosts | map('extract', hostvars) | map(attribute='host_final_status') | selectattr('server_exists', 'equalto', false) | list | length }}
+              - Hosts with complete client removal: {{ ansible_play_hosts | map('extract', hostvars) | map(attribute='host_final_status') | selectattr('client_exists', 'equalto', false) | list | length }}
+              {% set failed_hosts = ansible_play_hosts | map('extract', hostvars) | map(attribute='host_final_status') | selectattr('failed', 'defined') | selectattr('failed') | list %}
+              {% if failed_hosts | length > 0 %}
+              - Hosts with failures: {{ failed_hosts | length }}
+              {% endif %}
+
+              {% if delete_data_prompt.user_input | lower == 'yes' %}
+              Data directory (/minio/data) was removed.
+              {% else %}
+              Data directory (/minio/data) was preserved.
+              {% endif %}
+
+              {% if cleanup_controller_configs.user_input | lower == 'yes' %}
+              Controller configuration files were backed up and removed.
+              {% else %}
+              Controller configuration files were preserved.
+              {% endif %}
+
+              Execution completed at: {{ ansible_date_time.iso8601 }}
+            dest: "/tmp/final_minio_removal_report.txt"
+          run_once: true
+          delegate_to: localhost
+
+    - name: Display removal report
+      debug:
+        msg: "{{ lookup('file', '/tmp/final_minio_removal_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+  always:
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/minio_removal_report.txt"
+        - "/tmp/final_minio_removal_report.txt"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes
+      no_log: true

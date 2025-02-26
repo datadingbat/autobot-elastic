@@ -1,0 +1,11 @@
+# ~/.ssh/config
+# This is a ssh config file that's used to allow Ansible to perform automation tasks to the cluster
+
+Host *.elastic.internal
+    IdentityFile ~/.ssh/jessem-pp.pem
+    User ubuntu
+    StrictHostKeyChecking no
+
+Host *.amazonaws.com *.compute.internal ec2-* 10.* 3.* 18.*
+    IdentityFile ~/.ssh/jessem-pp.pem
+    User ubuntu

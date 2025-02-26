@@ -1,0 +1,555 @@
+---
+# minio_server_setup.yml - Child play for es-toolkit to configure Minio S3 server
+
+# These are individual tasks, not a play (for es-toolkit compatibility)
+
+# Set default variables
+- name: Set default variables
+  set_fact:
+    minio_server_version: "latest"
+    minio_server_url: "https://dl.min.io/server/minio/release/linux-amd64/minio"
+    installation_method: "{{ install_method | default('online') }}"
+    minio_binary_path_default: "/home/ubuntu/minio"
+    server_host_default: "{{ server_host_default | default('helper.elastic') }}"
+    minio_access_key: "minioadmin"
+    minio_secret_key: "minioadmin"
+    minio_data_dir: "/minio/data"
+    minio_port: "9000"
+    minio_console_port: "9001"
+    minio_protocol: "http"
+    non_interactive: "{{ noninteractive | default(false) }}"
+
+# Prompt for installation method
+- name: Create installation method menu
+  copy:
+    content: |
+      ==========================================
+           MINIO SERVER INSTALLATION METHOD
+      ==========================================
+      1. Online installation (download from internet)
+      2. Offline installation (use local files)
+      
+      Select an option:
+    dest: "/tmp/minio_install_method_menu.txt"
+  when: not non_interactive | bool
+
+- name: Display installation method menu
+  debug:
+    msg: "{{ lookup('file', '/tmp/minio_install_method_menu.txt') | split('\n') }}"
+  when: not non_interactive | bool
+
+- name: Prompt for installation method in interactive mode
+  pause:
+    prompt: "Enter the number of your choice:"
+  register: install_method_choice
+  when: not non_interactive | bool
+
+- name: Set installation method for interactive mode
+  set_fact:
+    installation_method: "{{ 'online' if install_method_choice.user_input == '1' or install_method_choice.user_input == '' else 'offline' }}"
+  when: not non_interactive | bool
+
+- name: Debug installation method
+  debug:
+    msg: "Using installation method: {{ installation_method }}"
+
+# Handle offline installation paths
+- name: Handle offline installation paths
+  block:
+    - name: Set default binary path for non-interactive mode
+      set_fact:
+        minio_binary_path_input: "{{ minio_binary_path_default }}"
+      when: non_interactive | bool
+
+    - name: Prompt for Minio server binary path
+      pause:
+        prompt: "Enter the full path to the Minio server binary on the controller host (this machine):"
+      register: minio_binary_path_prompt
+      when: not non_interactive | bool
+      
+    - name: Set binary path input from prompt
+      set_fact:
+        minio_binary_path_input: "{{ minio_binary_path_prompt.user_input }}"
+      when: not non_interactive | bool
+      
+    - name: Debug binary path
+      debug:
+        msg: "Using binary path: {{ minio_binary_path_input }}"
+        
+    - name: Check if binary exists on controller
+      stat:
+        path: "{{ minio_binary_path_input }}"
+      register: binary_check_controller
+      delegate_to: localhost
+      
+    - name: Debug binary check on controller
+      debug:
+        msg: 
+          - "Path on controller: {{ minio_binary_path_input }}"
+          - "Exists on controller: {{ binary_check_controller.stat.exists | default('not defined') }}"
+      
+    - name: Fail if binary not found on controller
+      fail:
+        msg: "Binary not found at {{ minio_binary_path_input }} on the controller. Please provide a valid path to the Minio server binary."
+      when: not binary_check_controller.stat.exists
+      
+    - name: Set binary path
+      set_fact:
+        minio_binary_path: "{{ minio_binary_path_input }}"
+        minio_binary_path_on_controller: true  # Flag to indicate binary is on controller
+
+  when: installation_method == 'offline'
+
+# Prompt for server host
+- name: Skip server host prompt if default already set
+  set_fact:
+    server_host_value: "{{ server_host_default }}"
+    server_host: "{{ server_host_default }}"
+  when: server_host_default is defined and server_host_default != ""
+
+- name: Server host prompt block
+  block:
+    - name: Set default server host for non-interactive mode
+      set_fact:
+        server_host_value: "{{ server_host_default }}"
+      when: non_interactive | bool
+
+    - name: Prompt for server host in interactive mode
+      pause:
+        prompt: |
+          Enter the hostname where Minio server should be installed:
+          (This must be a single host in your inventory)
+      register: server_host_input
+      when: not non_interactive | bool
+
+    - name: Set server host value from prompt
+      set_fact:
+        server_host_value: "{{ server_host_input.user_input }}"
+      when: not non_interactive | bool
+
+    - name: Debug server host
+      debug:
+        msg: "Using server host: {{ server_host_value }}"
+
+    - name: Validate server host
+      fail:
+        msg: "Host '{{ server_host_value }}' not found in inventory"
+      when: server_host_value not in groups['all']
+
+    - name: Set server host
+      set_fact:
+        server_host: "{{ server_host_value }}"
+  when: server_host_default is not defined or server_host_default == ""
+
+- name: Debug server host setting
+  debug:
+    msg: "Server host set to: {{ server_host }}"
+
+# Prompt for Minio server configuration
+- name: Prompt for data directory in interactive mode
+  pause:
+    prompt: "Enter the data directory for Minio (default: /minio/data):"
+  register: data_dir_input
+  when: not non_interactive | bool
+
+- name: Set data directory
+  set_fact:
+    minio_data_dir: "{{ data_dir_input.user_input | default('/minio/data') if not non_interactive | bool else '/minio/data' }}"
+
+- name: Debug data directory
+  debug:
+    msg: "Using data directory: {{ minio_data_dir }}"
+
+# Prompt for Minio credentials
+- name: Prompt for access key in interactive mode
+  pause:
+    prompt: "Enter the Minio access key (min 3 characters, default: minioadmin):"
+    echo: yes
+  register: access_key_input
+  when: not non_interactive | bool
+
+- name: Prompt for secret key in interactive mode
+  pause:
+    prompt: "Enter the Minio secret key (min 8 characters, default: minioadmin):"
+    echo: yes
+  register: secret_key_input
+  when: not non_interactive | bool
+
+- name: Set Minio credentials
+  set_fact:
+    minio_access_key: >-
+      {% if non_interactive | bool %}
+      minioadmin
+      {% else %}
+      {{ access_key_input.user_input if access_key_input.user_input != '' and access_key_input.user_input | length >= 3 else 'minioadmin' }}
+      {% endif %}
+    minio_secret_key: >-
+      {% if non_interactive | bool %}
+      minioadmin
+      {% else %}
+      {{ secret_key_input.user_input if secret_key_input.user_input != '' and secret_key_input.user_input | length >= 8 else 'minioadmin' }}
+      {% endif %}
+
+- name: Debug credentials
+  debug:
+    msg: 
+      - "Using access key: {{ minio_access_key }}"
+      - "Using secret key: {{ minio_secret_key | regex_replace('.', '*') }}"
+
+# Create pre-installation report
+- name: Create installation plan report directly
+  set_fact:
+    installation_plan: |
+      Minio Server Installation Plan
+      ==============================
+      Installation Method: {{ installation_method | title }}
+      
+      Server Details:
+      --------------
+      Host: {{ server_host }}
+      Data Directory: {{ minio_data_dir }}
+      API Port: {{ minio_port }}
+      Console Port: {{ minio_console_port }}
+      
+      Credentials:
+      -----------
+      Access Key: {{ minio_access_key }}
+      Secret Key: {{ minio_secret_key }}
+      
+      Are you ready to proceed with the installation? (yes/no):
+
+- name: Display installation plan
+  debug:
+    msg: "{{ installation_plan.split('\n') }}"
+
+- name: Set confirmation for non-interactive mode
+  set_fact:
+    confirmation: "yes"
+  when: non_interactive | bool
+
+- name: Prompt for confirmation in interactive mode
+  pause:
+    prompt: "Do you want to proceed with the installation? (yes/no):"
+  register: confirm
+  when: not non_interactive | bool
+
+- name: Set confirmation from prompt
+  set_fact:
+    confirmation: "{{ confirm.user_input | default('no') }}"
+  when: not non_interactive | bool
+
+- name: Debug confirmation
+  debug:
+    msg: "Confirmation: {{ confirmation }}"
+
+- name: Debug confirmation type
+  debug:
+    msg: "Confirmation type: {{ confirmation | type_debug }}"
+
+- name: Set proceed variable
+  set_fact:
+    proceed_with_install: >-
+      {% if confirmation is boolean %}
+        {{ confirmation }}
+      {% else %}
+        {{ confirmation | lower == 'yes' or confirmation | lower == 'y' or confirmation | lower == 'true' or confirmation | lower == '' }}
+      {% endif %}
+
+- name: Debug proceed decision
+  debug:
+    msg: "Will proceed with installation: {{ proceed_with_install }}"
+
+- name: Exit if not confirmed
+  meta: end_play
+  when: not proceed_with_install
+
+# Install Minio Server
+- name: Debug data directory
+  debug:
+    msg: "Data directory: '{{ minio_data_dir }}'"
+
+- name: Set valid data directory
+  set_fact:
+    valid_data_dir: "{{ minio_data_dir | default('/minio/data') | trim }}"
+
+- name: Debug valid data directory
+  debug:
+    msg: "Valid data directory: '{{ valid_data_dir }}'"
+
+- name: Create directories for Minio server
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  with_items:
+    - /usr/local/bin
+    - "{{ valid_data_dir }}"
+    - /etc/minio
+  delegate_to: "{{ server_host }}"
+  become: yes
+
+- name: Install Minio server - online
+  get_url:
+    url: "{{ minio_server_url }}"
+    dest: /usr/local/bin/minio
+    mode: '0755'
+  delegate_to: "{{ server_host }}"
+  when: installation_method == 'online'
+  become: yes
+
+- name: Install Minio server - offline
+  block:
+    - name: Debug installation variables
+      debug:
+        msg: 
+          - "Target server: {{ server_host }}"
+          - "Binary path: {{ minio_binary_path }}"
+          - "Binary on controller: {{ minio_binary_path_on_controller | default(true) }}"
+          
+    # Case 1: Binary is on controller, needs to be uploaded 
+    - name: Upload and install binary from controller
+      copy:
+        src: "{{ minio_binary_path }}"
+        dest: /usr/local/bin/minio
+        mode: '0755'
+        remote_src: false
+      delegate_to: "{{ server_host }}"
+      become: yes
+      register: binary_upload_result
+      when: minio_binary_path_on_controller | default(true)
+      
+    - name: Debug binary upload
+      debug:
+        msg: "Binary upload result: {{ binary_upload_result | default('Not run') }}"
+      when: minio_binary_path_on_controller | default(true)
+
+    # Case 2: Binary is already on remote host
+    - name: Check if binary exists on remote host
+      stat:
+        path: "{{ minio_binary_path }}"
+      register: remote_binary_check
+      delegate_to: "{{ server_host }}"
+      when: not (minio_binary_path_on_controller | default(true))
+
+    - name: Copy binary on remote host
+      copy:
+        src: "{{ minio_binary_path }}"
+        dest: /usr/local/bin/minio
+        mode: '0755'
+        remote_src: true
+      delegate_to: "{{ server_host }}"
+      register: binary_copy_result
+      when: 
+        - not (minio_binary_path_on_controller | default(true))
+        - remote_binary_check is defined
+        - remote_binary_check.stat.exists
+      become: yes
+      
+    - name: Debug binary copy
+      debug:
+        msg: "Binary copy result: {{ binary_copy_result | default('Not run') }}"
+      when: not (minio_binary_path_on_controller | default(true))
+
+    - name: Fail if binary not found anywhere
+      fail:
+        msg: "Binary not found at {{ minio_binary_path }} on the remote host. Please provide a valid path or use a binary on the controller."
+      when: 
+        - not (minio_binary_path_on_controller | default(true))
+        - remote_binary_check is defined
+        - not remote_binary_check.stat.exists
+        
+    - name: Verify binary installation
+      stat:
+        path: /usr/local/bin/minio
+      register: final_binary_check
+      delegate_to: "{{ server_host }}"
+      
+    - name: Debug final binary check
+      debug:
+        msg: 
+          - "Binary installed at: /usr/local/bin/minio"
+          - "Exists: {{ final_binary_check.stat.exists | default('unknown') }}"
+          - "Mode: {{ final_binary_check.stat.mode | default('unknown') }}"
+          - "Size: {{ final_binary_check.stat.size | default('unknown') }}"
+  when: installation_method == 'offline'
+
+- name: Create Minio environment file
+  copy:
+    content: |
+      # Minio configuration
+      MINIO_ROOT_USER={{ minio_access_key }}
+      MINIO_ROOT_PASSWORD={{ minio_secret_key }}
+      MINIO_VOLUMES={{ valid_data_dir }}
+    dest: /etc/minio/minio.env
+    mode: '0600'
+  delegate_to: "{{ server_host }}"
+  become: yes
+
+- name: Create Minio systemd service
+  copy:
+    content: |
+      [Unit]
+      Description=MinIO
+      Documentation=https://docs.min.io
+      Wants=network-online.target
+      After=network-online.target
+      AssertFileIsExecutable=/usr/local/bin/minio
+
+      [Service]
+      WorkingDirectory=/usr/local/
+      EnvironmentFile=/etc/minio/minio.env
+      User=root
+      Group=root
+      ExecStartPre=/bin/bash -c "if [ -z \"${MINIO_VOLUMES}\" ]; then echo \"Variable MINIO_VOLUMES not set in /etc/minio/minio.env\"; exit 1; fi"
+      ExecStart=/usr/local/bin/minio server --console-address :{{ minio_console_port }} --address :{{ minio_port }} $MINIO_OPTS
+      Restart=always
+      LimitNOFILE=65536
+      TasksMax=infinity
+      TimeoutStopSec=infinity
+      SendSIGKILL=no
+
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/minio.service
+    mode: '0644'
+  delegate_to: "{{ server_host }}"
+  become: yes
+
+- name: Start and enable Minio service
+  systemd:
+    name: minio
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  delegate_to: "{{ server_host }}"
+  become: yes
+  register: minio_service_result
+  
+- name: Debug minio service start
+  debug:
+    msg: 
+      - "Minio service start result: {{ minio_service_result }}"
+      - "Changed: {{ minio_service_result.changed }}"
+  
+- name: Check minio service status
+  shell: systemctl status minio
+  delegate_to: "{{ server_host }}"
+  become: yes
+  register: minio_status
+  changed_when: false
+  ignore_errors: yes
+  
+- name: Debug service output
+  debug:
+    msg: "{{ minio_status.stdout_lines | default(['No output']) }}"
+  when: minio_status is defined
+  
+- name: Wait for Minio server to start
+  wait_for:
+    host: "127.0.0.1"
+    port: "{{ minio_port }}"
+    timeout: 60
+  delegate_to: "{{ server_host }}"
+  register: wait_result
+  
+- name: Debug wait result
+  debug:
+    msg: "Wait result: {{ wait_result }}"
+
+# Get server IP/hostname for client configuration
+- name: Get server hostname and IP
+  block:
+    - name: Get server IP address
+      shell: "hostname -I | awk '{print $1}'"
+      register: server_ip_result
+      delegate_to: "{{ server_host }}"
+      changed_when: false
+      
+    - name: Set server IP
+      set_fact:
+        server_ip: "{{ server_ip_result.stdout.strip() }}"
+  
+- name: Save MinIO server configuration
+  block:
+    - name: Ensure elasticsearch directory exists
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+        state: directory
+        mode: '0700'
+      
+    - name: Ensure backups directory exists
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/backups"
+        state: directory
+        mode: '0700'
+      
+    # Check and backup minio server config file if it exists
+    - name: Check if minio server config file exists
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_server_config.yml"
+      register: minio_server_config_file
+      
+    - name: Backup minio server config file if it exists
+      shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/minio_server_config.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_server_config.yml.$(date +%Y%m%d%H%M%S)"
+      when: minio_server_config_file.stat.exists
+      
+    - name: Create minio server configuration file
+      copy:
+        content: |
+          ---
+          # Minio Server Configuration
+          # Created by es-toolkit on {{ ansible_date_time.iso8601 }}
+          
+          minio_server:
+            host: "{{ server_host }}"
+            ip: "{{ server_ip }}"
+            port: {{ minio_port }}
+            console_port: {{ minio_console_port }}
+            protocol: "{{ minio_protocol }}"
+            data_dir: "{{ minio_data_dir }}"
+            credentials:
+              access_key: "{{ minio_access_key }}"
+              secret_key: "{{ minio_secret_key }}"
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_server_config.yml"
+        mode: '0600'
+
+# Generate final report
+- name: Generate installation report
+  debug:
+    msg: |
+      Minio Server Installation Report
+      ===============================
+      
+      Server Details:
+      --------------
+      Host: {{ server_host }}
+      IP Address: {{ server_ip }}
+      Status: Running
+      
+      Endpoints:
+      ---------
+      API: {{ minio_protocol }}://{{ server_host }}:{{ minio_port }}
+      Console: {{ minio_protocol }}://{{ server_host }}:{{ minio_console_port }}
+      
+      Credentials:
+      -----------
+      Access Key: {{ minio_access_key }}
+      Secret Key: {{ minio_secret_key }}
+      
+      Configuration saved to:
+      - {{ lookup('env', 'HOME') }}/.elasticsearch/minio_server_config.yml
+      
+      Next Steps:
+      ----------
+      1. Use the MinIO Console at {{ minio_protocol }}://{{ server_host }}:{{ minio_console_port }}
+      2. Install MinIO Client (mc) using option 11 in the toolkit menu
+      3. Create buckets as needed for your Elasticsearch snapshots
+
+- name: Cleanup temporary files
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items:
+    - "/tmp/minio_install_method_menu.txt"
+    - "/tmp/minio_server_install_plan.txt"
+  ignore_errors: yes
