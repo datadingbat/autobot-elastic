@@ -1,0 +1,1864 @@
+---
+- name: Load deployment variables
+  include_vars:
+    file: "{{ lookup('env', 'HOME') }}/.elasticsearch/deployment_vars.yml"
+  delegate_to: localhost
+  run_once: true
+
+- name: Check for custom configurations file
+  stat:
+    path: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+  register: custom_config_file
+  delegate_to: localhost
+  run_once: true
+
+- name: Load custom configurations if available
+  include_vars:
+    file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+    name: custom_configs
+  when: custom_config_file.stat.exists
+  delegate_to: localhost
+  run_once: true
+
+- name: Set default variables
+  set_fact:
+    installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] | default('apt') }}"
+    start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] | default(true) }}"
+    first_master: "{{ groups['master_nodes'][0] }}"
+    cert_files:
+      - elastic-http.p12
+      - elastic-certificates.p12
+      - elastic-http-ca.pem
+      - elastic-http-ca.crt
+      - elastic-http.key
+      - elastic-http.pem
+    deb_package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
+    # Use paths from custom_configs if available, otherwise fall back to deployment_vars
+    final_paths:
+      data: "{{ custom_configs.paths.initial.data | default(es_data_path) }}"
+      logs: "{{ custom_configs.paths.initial.logs | default(es_log_path) }}"
+    existing_paths:
+      data: ""
+      logs: ""
+    # Use security settings from custom_configs if available   
+    es_cert_pass: "{{ custom_configs.security.es_cert_pass | default(es_cert_pass) }}" 
+    # Use cluster name from custom_configs if available
+    cluster_name: "{{ custom_configs.cluster.name | default(cluster_name) }}" 
+    # Use system tuning settings from custom_configs if available
+    apply_system_tuning: "{{ custom_configs.system_tuning.enabled | default(apply_system_tuning | default(true)) }}"
+    heap_sizes: "{{ custom_configs.system_tuning.heap_sizes | default(heap_sizes | default({})) }}"
+  delegate_to: localhost
+  run_once: true
+  
+- name: Show use of custom configurations
+  debug:
+    msg: "Using {{ 'custom configurations from previous deployment' if custom_config_file.stat.exists else 'default deployment variables' }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Validate local installation requirements
+  assert:
+    that:
+      - deb_package_path != ''
+    fail_msg: "deb_package_path must be set for local installation method"
+  when: installation_method == 'local'
+  run_once: true
+  delegate_to: localhost
+
+- name: Handle deployment configuration
+  block:
+    - name: Prompt for certificate password
+      pause:
+        prompt: |
+          {% if es_cert_pass is defined %}
+          Original cluster deployment used certificate password from deployment_vars.yml
+          Press enter to use the same password ({{ es_cert_pass }})  or otherwise enter a new one:
+          {% else %}
+          Enter certificate password:
+          {% endif %}
+        echo: no
+      register: cert_pass_input
+      no_log: true
+
+    - name: Set certificate password
+      set_fact:
+        es_cert_pass: >-
+          {% if cert_pass_input.user_input %}
+            {{ cert_pass_input.user_input }}
+          {% elif es_cert_pass is defined %}
+            {{ es_cert_pass }}
+          {% else %}
+            "{{ omit }}"
+          {% endif %}
+      no_log: true
+
+    - name: Prompt for cluster name
+      pause:
+        prompt: |
+          {% if cluster_name is defined %}
+          Original cluster deployment used cluster name: {{ cluster_name }}
+          Press enter to use the same name, or enter a new one:
+          {% else %}
+          Enter cluster name:
+          {% endif %}
+      register: cluster_name_input
+
+    - name: Set cluster name
+      set_fact:
+        cluster_name: >-
+          {% if cluster_name_input.user_input %}
+            {{ cluster_name_input.user_input }}
+          {% elif cluster_name is defined %}
+            {{ cluster_name }}
+          {% else %}
+            "{{ omit }}"
+          {% endif %}
+  delegate_to: localhost
+  run_once: true
+
+- name: Validate certificate password
+  assert:
+    that:
+      - es_cert_pass is defined and es_cert_pass != ''
+    fail_msg: "Certificate password must be provided."
+  delegate_to: localhost
+  run_once: true
+
+- name: Validate cluster name
+  assert:
+    that:
+      - cluster_name is defined and cluster_name != ''
+    fail_msg: "Cluster name must be provided."
+  delegate_to: localhost
+  run_once: true
+
+# Determine target node role
+- name: Determine target node role and get existing paths
+  block:
+    - name: Initialize target role
+      set_fact:
+        target_role: >-
+          {%- if inventory_hostname in groups['master_nodes'] -%}
+          master
+          {%- elif inventory_hostname in groups['hot_nodes'] -%}
+          hot
+          {%- elif inventory_hostname in groups['frozen_nodes'] -%}
+          frozen
+          {%- else -%}
+          unknown
+          {%- endif -%}
+
+    - name: Find existing nodes of same role
+      set_fact:
+        existing_nodes: >-
+          {%- if target_role == 'master' -%}
+          {{ groups['master_nodes'] }}
+          {%- elif target_role == 'hot' -%}
+          {{ groups['hot_nodes'] }}
+          {%- elif target_role == 'frozen' -%}
+          {{ groups['frozen_nodes'] }}
+          {%- else -%}
+          []
+          {%- endif -%}
+
+    # Try to get config from existing nodes but don't require it
+- name: Handle reference node selection
+  block:
+    - name: Create hot nodes report
+      copy:
+        content: |
+          Available hot nodes:
+          {% for host in groups['hot_nodes'] %}
+          - {{ host }}
+          {% endfor %}
+        dest: "/tmp/es_hot_nodes_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display hot nodes report
+      debug:
+        msg: "{{ lookup('file', '/tmp/es_hot_nodes_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Prompt for reference node
+      pause:
+        prompt: |
+          Enter the hostname of a working Elasticsearch node to use as reference.
+          This node should have a working Elasticsearch installation.
+          The configuration from this node will be used as a template.
+          
+          Enter hostname (or press enter to skip):
+      register: reference_node_input
+      run_once: true
+      delegate_to: localhost
+
+    - name: Skip reference node if no input
+      set_fact:
+        skip_reference: "{{ reference_node_input.user_input | default('') == '' }}"
+      run_once: true
+
+    - name: Validate reference node if provided
+      fail:
+        msg: "The specified reference node '{{ reference_node_input.user_input }}' was not found in the hot_nodes group"
+      when: 
+        - not skip_reference
+        - reference_node_input.user_input not in groups['hot_nodes']
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set reference node fact if provided
+      set_fact:
+        reference_node: "{{ reference_node_input.user_input }}"
+      when: not skip_reference
+      run_once: true
+
+- name: Attempt to read existing configuration
+  block:
+    - name: Check directory access on reference node
+      stat:
+        path: /etc/elasticsearch
+      register: es_dir
+      delegate_to: "{{ reference_node }}"
+      become: yes
+      ignore_errors: yes
+      when: not skip_reference
+
+    - name: Read elasticsearch.yml from reference node
+      slurp:
+        src: /etc/elasticsearch/elasticsearch.yml
+      register: es_config_file
+      delegate_to: "{{ reference_node }}"
+      become: yes
+      when: 
+        - not skip_reference
+        - es_dir.stat is defined 
+        - es_dir.stat.exists
+      ignore_errors: yes
+
+    - name: Debug configuration read status
+      debug:
+        msg:
+          - "Reference node: {{ reference_node }}"
+          - "Directory exists: {{ es_dir.stat.exists | default(false) }}"
+          - "Config file read: {{ es_config_file is defined and es_config_file.content is defined }}"
+      when: 
+        - not skip_reference
+        - es_dir.stat is defined
+      run_once: true
+      delegate_to: localhost
+
+    - name: Extract paths if config found
+      set_fact:
+        existing_paths:
+          data: "{{ (es_config_file.content | b64decode | regex_findall('path.data: (.+)') | first) if es_config_file is defined and es_config_file.content is defined else '' }}"
+          logs: "{{ (es_config_file.content | b64decode | regex_findall('path.logs: (.+)') | first) if es_config_file is defined and es_config_file.content is defined else '' }}"
+      when: 
+        - not skip_reference
+        - es_config_file is defined 
+        - es_config_file.content is defined
+
+    # Always handle path configuration
+    - name: Handle path configuration
+      block:
+        # First check if we have custom node configurations
+        - name: Check for custom configurations file
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+          register: custom_path_config_check
+          delegate_to: localhost
+          
+        - name: Load custom node paths if available
+          include_vars:
+            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+            name: node_path_configs
+          when: custom_path_config_check.stat.exists
+          delegate_to: localhost
+          
+        # Extract relevant paths for the target role
+        - name: Extract paths from custom configurations
+          set_fact:
+            custom_role_paths: >-
+              {% if custom_path_config_check.stat.exists and target_role == 'master' and node_path_configs.paths.master_nodes %}
+              {{ node_path_configs.paths.master_nodes }}
+              {% elif custom_path_config_check.stat.exists and target_role == 'hot' and node_path_configs.paths.hot_nodes %}
+              {{ node_path_configs.paths.hot_nodes }}
+              {% elif custom_path_config_check.stat.exists and target_role == 'frozen' and node_path_configs.paths.frozen_nodes %}
+              {{ node_path_configs.paths.frozen_nodes }}
+              {% elif custom_path_config_check.stat.exists and target_role == 'ml' and node_path_configs.paths.ml_nodes %}
+              {{ node_path_configs.paths.ml_nodes }}
+              {% else %}
+              {}
+              {% endif %}
+          delegate_to: localhost
+        
+        - name: Prompt for data path
+          pause:
+            prompt: |
+              Path Configuration for {{ target_role }} node:
+              
+              Available path configurations:
+              
+              1. Original deployment configuration:
+                 Data Path: {{ es_data_path }}
+                 
+              {% if existing_paths is defined and existing_paths.data != '' %}
+              2. Reference node ({{ reference_node | default('none') }}) configuration:
+                 Data Path: {{ existing_paths.data }}
+              {% endif %}
+              
+              {% if custom_path_config_check.stat.exists and custom_role_paths | length > 0 %}
+              3. Existing {{ target_role }} nodes in cluster:
+                {% for hostname, paths in custom_role_paths.items() %}
+                 - {{ hostname }}: {{ paths.data }}
+                {% endfor %}
+              {% endif %}
+              
+              Enter path to use for this node's data directory:
+              (Press enter to use original deployment path: {{ final_paths.data }})
+          register: data_path_input
+
+        - name: Prompt for log path
+          pause:
+            prompt: |
+              Log Path Configuration for {{ target_role }} node:
+              
+              Available log path configurations:
+              
+              1. Original deployment configuration:
+                 Log Path: {{ es_log_path }}
+                 
+              {% if existing_paths is defined and existing_paths.logs != '' %}
+              2. Reference node ({{ reference_node | default('none') }}) configuration:
+                 Log Path: {{ existing_paths.logs }}
+              {% endif %}
+              
+              {% if custom_path_config_check.stat.exists and custom_role_paths | length > 0 %}
+              3. Existing {{ target_role }} nodes in cluster:
+                {% for hostname, paths in custom_role_paths.items() %}
+                 - {{ hostname }}: {{ paths.logs }}
+                {% endfor %}
+              {% endif %}
+              
+              Enter path to use for this node's log directory:
+              (Press enter to use original deployment path: {{ final_paths.logs }})
+          register: log_path_input
+
+        - name: Set final paths
+          set_fact:
+            final_paths:
+              data: "{% if data_path_input.user_input | default('') | length > 0 %}{{ data_path_input.user_input }}{% else %}{{ final_paths.data }}{% endif %}"
+              logs: "{% if log_path_input.user_input | default('') | length > 0 %}{{ log_path_input.user_input }}{% else %}{{ final_paths.logs }}{% endif %}"
+            updated_paths: true  
+
+        - name: Display selected paths
+          debug:
+            msg: |
+              Selected paths for {{ target_role }} node:
+              Data Path: {{ final_paths.data }}
+              Log Path: {{ final_paths.logs }}
+
+  delegate_to: localhost
+  run_once: true
+  
+# Calculate system resources and memory for JVM tuning
+- name: Calculate available system resources
+  block:
+    - name: Get total memory
+      shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+      register: total_ram_gb
+      changed_when: false
+
+    - name: Output detected memory
+      debug:
+        msg: "Detected RAM on target node: {{ total_ram_gb.stdout }}GB"
+
+    - name: Calculate recommended heap size
+      set_fact:
+        recommended_heap_size: "{{ [(total_ram_gb.stdout|int / 2)|round|int, 128|int]|min }}"
+
+    - name: Set initial heap size based on node role from vars file
+      set_fact:
+        initial_heap_size: >-
+          {%- if target_role == 'master' and heap_sizes.master is defined -%}
+          {{ heap_sizes.master }}
+          {%- elif target_role == 'hot' and heap_sizes.hot is defined -%}
+          {{ heap_sizes.hot }}
+          {%- elif target_role == 'frozen' and heap_sizes.frozen is defined -%}
+          {{ heap_sizes.frozen }}
+          {%- elif target_role == 'ml' and heap_sizes.ml is defined -%}
+          {{ heap_sizes.ml }}
+          {%- else -%}
+          {{ recommended_heap_size }}
+          {%- endif -%}
+  become: yes
+
+# Prompt for system tuning options
+- name: Configure system tuning options
+  block:
+    - name: Prompt for system tuning
+      pause:
+        prompt: |
+          System Tuning Parameters:
+          
+          JVM Heap Sizes (calculated based on available RAM):
+          - Recommended for {{ target_role | title }} Node: {{ recommended_heap_size }}GB (based on {{ total_ram_gb.stdout }}GB RAM)
+          - Current setting from deployment_vars.yml: {{ initial_heap_size }}GB
+          
+          Do you want to:
+          1. Apply default heap size from deployment_vars.yml ({{ initial_heap_size }}GB)
+          2. Apply recommended setting based on system RAM ({{ recommended_heap_size }}GB)
+          3. Specify custom heap size
+          4. Skip system tuning entirely
+          
+          Enter choice (1-4):
+      register: tuning_choice
+      run_once: true
+      delegate_to: localhost
+
+    - name: Handle custom heap size
+      block:
+        - name: Prompt for custom heap size
+          pause:
+            prompt: "Enter heap size for {{ target_role }} node in GB:"
+          register: custom_heap_size
+          
+        - name: Set custom heap size
+          set_fact:
+            final_heap_size: "{{ custom_heap_size.user_input }}"
+            apply_system_tuning: true
+      when: tuning_choice.user_input == '3'
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set deployment vars heap size
+      set_fact:
+        final_heap_size: "{{ initial_heap_size }}"
+        apply_system_tuning: true
+      when: tuning_choice.user_input == '1'
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set recommended heap size
+      set_fact:
+        final_heap_size: "{{ recommended_heap_size }}"
+        apply_system_tuning: true
+      when: tuning_choice.user_input == '2'
+      run_once: true
+      delegate_to: localhost
+
+    - name: Skip system tuning
+      set_fact:
+        apply_system_tuning: false
+      when: tuning_choice.user_input == '4'
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set heap size for all hosts
+      set_fact:
+        final_heap_size: "{{ hostvars['localhost']['final_heap_size'] | default(initial_heap_size) }}"
+        apply_system_tuning: "{{ hostvars['localhost']['apply_system_tuning'] | default(true) }}"
+      when: hostvars['localhost']['final_heap_size'] is defined
+  
+    - name: Show chosen tuning configuration
+      debug:
+        msg: |
+          System Tuning Configuration:
+          - Apply System Tuning: {{ apply_system_tuning }}
+          - JVM Heap Size: {{ final_heap_size }}GB
+      run_once: true
+
+- name: Validate master nodes exist
+  fail:
+    msg: "No master nodes found in inventory. At least one master node is required."
+  when: groups['master_nodes'] is not defined or groups['master_nodes'] | length == 0
+  run_once: true
+
+# Pre-flight certificate checks
+- name: Check certificates
+  block:
+    - name: Check controller certificates
+      stat:
+        path: "/tmp/es_certs/{{ item }}"
+      register: controller_cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+      #no_log: true
+
+    - name: Setup certificates if needed
+      block:
+        - name: Create temp cert directory
+          file:
+            path: /tmp/es_certs
+            state: directory
+            mode: '0755'
+            owner: "{{ ansible_user }}"
+          delegate_to: localhost
+          run_once: true
+          become: yes
+          #no_log: true
+
+        - name: Fetch certificates from master
+          fetch:
+            src: "/etc/elasticsearch/certs/{{ item }}"
+            dest: "/tmp/es_certs/{{ item }}"
+            flat: yes
+            mode: '0644'
+          with_items: "{{ cert_files }}"
+          delegate_to: "{{ first_master }}"
+          run_once: true
+          become: yes
+          #no_log: true
+      when: controller_cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+
+    - name: Verify fetched certificates
+      stat:
+        path: "/tmp/es_certs/{{ item }}"
+      register: cert_check
+      with_items: "{{ cert_files }}"
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+- name: Validate certificates exist
+  fail:
+    msg: "Required certificates not found. Please ensure certificates are generated first."
+  when: cert_check.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
+  run_once: true
+  delegate_to: localhost
+
+# Pre-flight status check
+- name: Pre-flight checks
+  block:
+    - name: Check installation status
+      block:
+        - name: Check if package is installed
+          shell: "dpkg -l elasticsearch | grep -q '^ii'"
+          register: pkg_check
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check if service is active
+          shell: "systemctl is-active elasticsearch || true"
+          register: service_check
+          changed_when: false
+          failed_when: false
+          become: yes
+          no_log: true
+
+        - name: Check if config directory exists
+          stat:
+            path: /etc/elasticsearch
+          register: config_check
+          become: yes
+          no_log: true
+
+        - name: Set installation status
+          set_fact:
+            es_installed: "{{ pkg_check.rc == 0 or service_check.stdout == 'active' or config_check.stat.exists }}"
+            host_status:
+              installed: "{{ pkg_check.rc == 0 or service_check.stdout == 'active' or config_check.stat.exists }}"
+              pkg_status: "{{ pkg_check.rc == 0 }}"
+              service_status: "{{ service_check.stdout }}"
+              config_exists: "{{ config_check.stat.exists }}"
+          no_log: true
+
+    - name: Create installation status report
+      copy:
+        content: |
+          Pre-Installation Status Report
+          =============================
+          Installation Details:
+          -------------------
+          Component: Elasticsearch
+          Node Role: {{ target_role }}
+          Installation Method: {{ hostvars['localhost']['selected_play_vars']['installation_method'] }}
+          {% if hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt' %}
+          Version: {% if hostvars['localhost']['selected_play_vars']['component_version'] is defined %}{% if hostvars['localhost']['selected_play_vars']['component_version'] == 'latest' %}Latest available{% else %}{{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% endif %}{% else %}Not specified{% endif %}
+          {% else %}
+          Package Path: {{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}
+          {% endif %}
+
+          Path Configuration:
+          -----------------
+          Original Deployment Paths:
+          Data Path: {{ es_data_path }}
+          Log Path: {{ es_log_path }}
+
+          Selected Paths:
+          Data Path: {{ final_paths.data }}
+          Log Path: {{ final_paths.logs }}
+
+          {% if existing_paths.data != '' %}
+          Existing {{ target_role }} Node Paths:
+          Data Path: {{ existing_paths.data }}
+          Log Path: {{ existing_paths.logs }}
+          {% endif %}
+
+          System Tuning:
+          -------------
+          Apply System Tuning: {{ apply_system_tuning }}
+          JVM Heap Size: {{ final_heap_size }}GB
+
+          Cluster Configuration:
+          --------------------
+          Cluster Name: {{ cluster_name }}
+          Node Role: {{ target_role }}
+
+          Target Hosts:
+          -------------
+          Total Target Hosts: {{ ansible_play_hosts | length }}
+
+          Hosts with Existing Installation (Will Skip):
+          {% for host in ansible_play_hosts %}
+          {% if hostvars[host].host_status.installed %}
+          - {{ host }}
+            Package: {% if hostvars[host].host_status.pkg_status %}Installed{% else %}Not installed{% endif %}
+            Service: {{ hostvars[host].host_status.service_status }}
+            Config Directory: {% if hostvars[host].host_status.config_exists %}Exists{% else %}Not found{% endif %}
+
+          {% endif %}
+          {% endfor %}
+
+          Hosts Ready for Installation:
+          {% for host in ansible_play_hosts %}
+          {% if not hostvars[host].host_status.installed %}
+          - {{ host }}
+          {% endif %}
+          {% endfor %}
+        dest: "/tmp/es_preinstall_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display pre-installation status
+      debug:
+        msg: "{{ lookup('file', '/tmp/es_preinstall_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Pause for user to review host report
+      pause:
+        prompt: |
+          Please review the host report above.
+          Press Enter to continue...
+      run_once: true
+      delegate_to: localhost
+
+    - name: Prompt for installation confirmation
+      pause:
+        prompt: |
+          Do you want to proceed with installation on eligible hosts? (yes/no):
+      register: install_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: install_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
+# APT Repository Setup
+- name: Install APT prerequisites
+  when: not es_installed and hostvars['localhost']['selected_play_vars']['installation_method'] == 'apt'
+  block:
+    - name: Ensure apt-transport-https is installed
+      apt:
+        name: apt-transport-https
+        state: present
+        update_cache: yes
+      no_log: true
+
+    - name: Install necessary packages
+      apt:
+        name:
+          - gnupg
+          - curl
+          - wget
+          - python3
+        state: present
+      no_log: true
+
+    - name: Create keyring directory
+      file:
+        path: /usr/share/keyrings
+        state: directory
+      no_log: true
+
+    - name: Download Elasticsearch GPG key
+      get_url:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        dest: "{{ ansible_env.HOME }}/elasticsearch.asc"
+        mode: '0644'
+      no_log: true
+
+    - name: Import the Elasticsearch GPG key
+      shell: |
+        cat "{{ ansible_env.HOME }}/elasticsearch.asc | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg"
+      args:
+        creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+      no_log: true
+
+    - name: Add Elasticsearch repository
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        content: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg arch=amd64] https://artifacts.elastic.co/packages/8.x/apt stable main"
+        mode: '0644'
+      no_log: true
+
+    - name: Force apt update
+      apt:
+        update_cache: yes
+        cache_valid_time: 0
+      no_log: true
+  become: yes
+
+# Installation
+- name: Install Elasticsearch
+  when: not es_installed
+  block:
+    - name: Handle local package installation
+      block:
+        - name: Check package exists on controller
+          stat:
+            path: "{{ deb_package_path }}"
+          register: controller_package_check
+          delegate_to: localhost
+
+        - name: Fail if package not found on controller
+          fail:
+            msg: "Package file not found at {{ deb_package_path }} on Ansible controller. Please ensure the .deb package exists and the path is correct."
+          when: not controller_package_check.stat.exists
+          delegate_to: localhost
+
+        - name: Copy package to target
+          copy:
+            src: "{{ deb_package_path }}"
+            dest: "/tmp/{{ deb_package_path | basename }}"
+            mode: '0644'
+
+        - name: Install from local package
+          apt:
+            deb: "/tmp/{{ deb_package_path | basename }}"
+            state: present
+            allow_unauthenticated: no
+      when: installation_method == 'local'
+      no_log: true
+
+    - name: Install via APT
+      apt:
+        name: "elasticsearch{% if hostvars['localhost']['selected_play_vars']['component_version'] != 'latest' %}={{ hostvars['localhost']['selected_play_vars']['component_version'] }}{% endif %}"
+        state: "{{ 'latest' if hostvars['localhost']['selected_play_vars']['component_version'] == 'latest' else 'present' }}"
+        allow_unauthenticated: no
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: installation_method == 'apt'
+      no_log: true
+  become: yes
+
+
+- name: Short pause after perms
+  wait_for:
+    timeout: 10
+  delegate_to: localhost
+  run_once: true
+
+# System Configuration
+- name: Configure system settings
+  when: not es_installed
+  block:
+    - name: Create systemd override directory
+      file:
+        path: /etc/systemd/system/elasticsearch.service.d
+        state: directory
+      no_log: true
+
+    - name: Configure systemd override
+      copy:
+        dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+        content: |
+          [Service]
+          LimitMEMLOCK=infinity
+      no_log: true
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      become: yes
+      no_log: true
+
+    - name: Setup certificates
+      block:
+        - name: Create certs directory
+          file:
+            path: /etc/elasticsearch/certs
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+          no_log: true
+
+        - name: Copy certificates
+          copy:
+            src: "/tmp/es_certs/{{ item }}"
+            dest: "/etc/elasticsearch/certs/{{ item }}"
+            mode: '0660'
+            owner: root
+            group: elasticsearch
+          with_items: "{{ cert_files }}"
+          no_log: true
+
+        - name: Set certificate permissions
+          file:
+            path: "/etc/elasticsearch/certs/{{ item }}"
+            owner: root
+            group: elasticsearch
+            mode: '0660'
+          with_items: "{{ cert_files }}"
+          no_log: true
+      no_log: true
+
+    - name: Update SSL passwords in keystore
+      shell: 'echo -n {{ es_cert_pass | trim | quote }} | /usr/share/elasticsearch/bin/elasticsearch-keystore add -f {{ item }}'
+      loop:
+        - xpack.security.transport.ssl.keystore.secure_password
+        - xpack.security.transport.ssl.truststore.secure_password
+        - xpack.security.http.ssl.keystore.secure_password
+        - xpack.security.http.ssl.truststore.secure_password
+      #no_log: true
+      become: yes
+
+    - name: Configure elasticsearch.yml
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        content: |
+          # Elasticsearch configuration
+          path.data: {{ final_paths.data }}
+          path.logs: {{ final_paths.logs }}
+
+          bootstrap.memory_lock: true
+
+          cluster.name: {{ cluster_name }}
+
+          node.name: {{ hostvars[inventory_hostname].ansible_host }}
+          network.host: {{ hostvars[inventory_hostname].ansible_host }}
+
+          {% if inventory_hostname in groups['master_nodes'] %}
+          node.roles: [master]
+          {% elif inventory_hostname in groups['hot_nodes'] %}
+          node.roles: [data_hot, ingest, remote_cluster_client, ml, data_content, transform]
+          {% elif inventory_hostname in groups['frozen_nodes'] %}
+          node.roles: [data_frozen, remote_cluster_client]
+          {% endif %}
+
+          discovery.seed_hosts:
+          {% for host in groups['master_nodes'] %}
+            - "{{ hostvars[host].ansible_host }}:9300"
+          {% endfor %}
+          {% if inventory_hostname in groups['master_nodes'] %}
+          cluster.initial_master_nodes:
+          {% for host in groups['master_nodes'] %}
+            - "{{ hostvars[host].ansible_host }}"
+          {% endfor %}
+          {% endif %}
+
+          xpack.security.enabled: true
+          xpack.security.enrollment.enabled: true
+
+          xpack.security.http.ssl:
+            enabled: true
+            keystore.path: /etc/elasticsearch/certs/elastic-http.p12
+            truststore.path: /etc/elasticsearch/certs/elastic-http.p12
+            verification_mode: certificate 
+            client_authentication: optional
+
+          xpack.security.transport.ssl:
+            enabled: true
+            verification_mode: certificate
+            keystore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+            truststore.path: /etc/elasticsearch/certs/elastic-certificates.p12
+            client_authentication: optional
+            
+          transport.host: 0.0.0.0
+          transport.port: 9300
+          http.port: 9200
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0660'
+      no_log: true
+
+    - name: Create and set permissions for Elasticsearch directories
+      block:
+        - name: Create custom data directory if not exists
+          file:
+            path: "{{ final_paths.data }}"
+            state: directory
+            mode: '0750'
+          when: final_paths.data != '/var/lib/elasticsearch'
+    
+        - name: Create custom log directory if not exists
+          file:
+            path: "{{ final_paths.logs }}"
+            state: directory
+            mode: '0750'
+          when: final_paths.logs != '/var/log/elasticsearch'
+    
+        - name: Set Elasticsearch directory permissions
+          file:
+            path: "{{ item }}"
+            owner: elasticsearch
+            group: elasticsearch
+            mode: '0750'
+            state: directory
+            recurse: yes    
+          loop:
+            - "/etc/elasticsearch"
+            - "{{ final_paths.data }}"
+            - "{{ final_paths.logs }}"
+          register: dir_perms
+          failed_when: false  # Don't fail if elasticsearch user doesn't exist yet
+      become: yes
+
+    # Apply system tuning
+    - name: Apply system tuning
+      block:
+        # Disable swap completely
+        - name: Disable swap
+          command: swapoff -a
+          changed_when: false
+
+        - name: Disable swap in fstab
+          replace:
+            path: /etc/fstab
+            regexp: '^([^#].*?\sswap\s+sw\s+.*)'
+            replace: '# \1'
+
+        # System limits configuration for Elasticsearch
+        - name: Configure memlock limits for elasticsearch
+          copy:
+            dest: /etc/security/limits.d/elasticsearch.conf
+            content: |
+              elasticsearch soft memlock unlimited
+              elasticsearch hard memlock unlimited
+              elasticsearch soft nproc 4096
+              elasticsearch hard nproc 4096
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Set system limits for Elasticsearch
+          lineinfile:
+            path: /etc/security/limits.conf
+            line: "{{ item }}"
+            create: yes
+          loop:
+            - "elasticsearch  -  nofile  65535"
+
+        # VM settings configuration
+        - name: Set vm.max_map_count
+          sysctl:
+            name: vm.max_map_count
+            value: '262144'
+            state: present
+            sysctl_file: /etc/sysctl.d/elasticsearch.conf
+
+        - name: Set vm.swappiness
+          sysctl:
+            name: vm.swappiness
+            value: '1'
+            state: present
+            sysctl_file: /etc/sysctl.d/elasticsearch.conf
+
+        # Configure transparent hugepages
+        - name: Disable transparent hugepages
+          copy:
+            dest: /etc/systemd/system/disable-transparent-huge-pages.service
+            content: |
+              [Unit]
+              Description=Disable Transparent Huge Pages
+              DefaultDependencies=no
+              After=sysinit.target local-fs.target
+              Before=elasticsearch.service
+
+              [Service]
+              Type=oneshot
+              ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+              ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+              RemainAfterExit=yes
+
+              [Install]
+              WantedBy=sysinit.target
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Enable transparent hugepages service
+          systemd:
+            name: disable-transparent-huge-pages
+            enabled: yes
+            state: started
+            daemon_reload: yes
+
+        # Configure JVM options
+        - name: Create jvm.options.d directory
+          file:
+            path: /etc/elasticsearch/jvm.options.d
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Configure JVM heap size
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/heap.options
+            content: |
+              -Xms{{ final_heap_size }}g
+              -Xmx{{ final_heap_size }}g
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+
+        - name: Configure additional JVM options
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/custom.options
+            content: |
+              # GC configuration
+              -XX:+UseG1GC
+              -XX:G1ReservePercent=25
+              -XX:InitiatingHeapOccupancyPercent=30
+              
+              # JVM temporary directory
+              -Djava.io.tmpdir=${ES_TMPDIR}
+              
+              # DNS cache TTL
+              -Dnetworkaddress.cache.ttl=60
+              
+              # Heap dumps
+              -XX:+HeapDumpOnOutOfMemoryError
+              -XX:HeapDumpPath=/var/lib/elasticsearch
+              
+              # JVM fatal error logs
+              -XX:ErrorFile=/var/log/elasticsearch/hs_err_pid%p.log
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+
+        # Configure systemd service limits
+        - name: Set additional systemd service parameters
+          blockinfile:
+            path: /usr/lib/systemd/system/elasticsearch.service
+            insertafter: '^\[Service\]'
+            block: |
+              LimitMEMLOCK=infinity
+              LimitNOFILE=65535
+              LimitNPROC=4096
+            backup: yes
+
+        # Reload systemd for changes to take effect
+        - name: Reload systemd
+          systemd:
+            daemon_reload: yes
+
+      rescue:
+        - name: Log tuning failure
+          debug:
+            msg: "Failed to apply system tuning tasks"
+          failed_when: true
+      when: apply_system_tuning | bool
+      become: yes
+
+    # Verify certificate permissions before starting
+    - name: Verify certificate permissions
+      stat:
+        path: "/etc/elasticsearch/certs/{{ item }}"
+      register: cert_stat
+      with_items: "{{ cert_files }}"
+      no_log: true
+
+    - name: Start Elasticsearch
+      systemd:
+        name: elasticsearch
+        state: started
+        enabled: yes
+      when: start_service | bool
+      no_log: true
+
+    # Add a short wait to let the service stabilize
+    - name: Wait for service to stabilize
+      pause:
+        seconds: 10
+      when: start_service | bool
+      no_log: true
+
+    # Check the service status
+    - name: Check Elasticsearch service status
+      command: systemctl status elasticsearch
+      register: es_status
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Display service status if there are issues
+      debug:
+        msg: "{{ es_status.stdout_lines }}"
+      when: "'active (running)' not in es_status.stdout"
+  become: yes
+
+  
+# Final Report Generation
+- name: Generate installation report
+  block:
+    - name: Get final service status
+      shell: "systemctl status elasticsearch || true"
+      register: final_status
+      changed_when: false
+      failed_when: false
+      become: yes
+      when: not es_installed
+      no_log: true
+
+    - name: Collect final status
+      set_fact:
+        final_status_info: "{{ final_status_info | default({}) | combine({inventory_hostname: {
+          'skipped': es_installed,
+          'status': final_status if not es_installed else omit
+        }}) }}"
+      delegate_to: localhost
+      no_log: true
+
+    - name: Create installation report
+      copy:
+        content: |
+          Elasticsearch Installation Report
+          ===============================
+          Installation Summary:
+          -------------------
+          Total Hosts: {{ ansible_play_hosts | length }}
+          Skipped (Existing): {{ final_status_info.values() | selectattr('skipped', 'true') | list | length }}
+          Attempted Install: {{ final_status_info.values() | selectattr('skipped', 'false') | list | length }}
+
+          Configuration Details:
+          -------------------
+          Node Role: {{ target_role }}
+          Cluster Name: {{ cluster_name }}
+          Data Path: {{ final_paths.data }}
+          Log Path: {{ final_paths.logs }}
+
+          System Tuning:
+          -------------
+          Applied System Tuning: {{ apply_system_tuning }}
+          JVM Heap Size: {{ final_heap_size }}GB
+          VM Parameters Set:
+          - vm.max_map_count = 262144
+          - vm.swappiness = 1
+          - Transparent Huge Pages = disabled
+
+          Skipped Hosts (Existing Installation):
+          {% for host, info in final_status_info.items() if info.skipped %}
+          - {{ host }}
+          {% endfor %}
+
+          Installation Results:
+          {% for host, info in final_status_info.items() if not info.skipped %}
+          Host: {{ host }}
+          Status: {% if 'Active: active (running)' in info.status.stdout %}Successfully installed and running
+          {% elif 'Active:' in info.status.stdout %}Installed but not running
+          {% else %}Installation failed or incomplete{% endif %}
+          
+          Details:
+          {{ info.status.stdout }}
+          
+          {% endfor %}
+
+          Next Steps:
+          -----------
+          1. Verify cluster health: curl -k https://[host]:9200/_cluster/health
+          2. Set up additional security features if needed
+          3. Configure monitoring if required
+          4. Review logs at {{ final_paths.logs }}/elastic-cluster.log
+        dest: "/tmp/es_install_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display installation report
+      debug:
+        msg: "{{ lookup('file', '/tmp/es_install_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Pause for user to review installation report
+      pause:
+        prompt: |
+          Please review the installation report above.
+          Press Enter to continue...
+      run_once: true
+      delegate_to: localhost
+    
+    # Update ~/.elasticsearch/ with new node information
+    - name: Update node inventory tracking
+      block:
+        # Create ~/.elasticsearch directory if it doesn't exist
+        - name: Ensure ~/.elasticsearch directory exists
+          file:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+            state: directory
+            mode: '0700'
+          delegate_to: localhost
+          run_once: true
+
+        # Check for and initialize tracking files
+        - name: Check for existing tracking files
+          stat:
+            path: "{{ item }}"
+          register: tracking_files
+          loop:
+            - "{{ lookup('env', 'HOME') }}/.elasticsearch/added_nodes.yml"
+            - "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+          delegate_to: localhost
+          run_once: true
+
+        - name: Initialize added_nodes file if it doesn't exist
+          copy:
+            content: |
+              ---
+              # Elasticsearch nodes added via es-toolkit
+              # Last updated: {{ ansible_date_time.iso8601 }}
+              
+              added_nodes:
+                master_nodes: []
+                hot_nodes: []
+                frozen_nodes: []
+                ml_nodes: []
+              
+              # Node details dictionary will be populated as nodes are added
+              node_details: {}
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/added_nodes.yml"
+            mode: '0600'
+          when: tracking_files.results[0].stat.exists == false
+          delegate_to: localhost
+          run_once: true
+
+        - name: Backup added_nodes file if it exists
+          shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/added_nodes.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/added_nodes.yml.$(date +%Y%m%d%H%M%S)"
+          when: tracking_files.results[0].stat.exists == true
+          delegate_to: localhost
+          run_once: true
+
+        - name: Initialize operations_log file if it doesn't exist
+          copy:
+            content: |
+              ---
+              # Elasticsearch operations log
+              # Created: {{ ansible_date_time.iso8601 }}
+              
+              operations: []
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+            mode: '0600'
+          when: tracking_files.results[1].stat.exists == false
+          delegate_to: localhost
+          run_once: true
+
+        - name: Backup operations_log file if it exists
+          shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/operations_log.yml.$(date +%Y%m%d%H%M%S)"
+          when: tracking_files.results[1].stat.exists == true
+          delegate_to: localhost
+          run_once: true
+          
+        # Skip loading existing tracking data since we're creating new files
+          
+        # Process installation results - create list of nodes where ES was actually installed
+        - name: Get installation status for each host
+          set_fact:
+            node_added: "{{ not es_installed | default(false) }}"
+            
+        - name: Create status file for each host
+          copy:
+            dest: "/tmp/es_install_status_{{ inventory_hostname }}.txt"
+            content: "{{ 'added' if not es_installed | default(false) else 'skipped' }}"
+          delegate_to: localhost
+            
+        - name: Find all status files for added nodes
+          find:
+            paths: /tmp
+            patterns: "es_install_status_*.txt"
+            contains: "added"
+          register: added_status_files
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Debug found status files
+          debug:
+            msg: "Found {{ added_status_files.files | length }} status files for newly added nodes"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Extract hostnames from added status files
+          set_fact:
+            successful_hosts: "{{ added_status_files.files | map(attribute='path') | 
+                               map('regex_replace', '^/tmp/es_install_status_(.+)\\.txt$', '\\1') | list }}"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Cleanup status files
+          file:
+            path: "/tmp/es_install_status_{{ item }}.txt"
+            state: absent
+          loop: "{{ ansible_play_hosts }}"
+          delegate_to: localhost
+          run_once: true
+
+        - name: Debug successful hosts
+          debug:
+            msg: 
+              - "Successfully installed nodes: {{ successful_hosts | join(', ') }}"
+              - "Master nodes added: {{ successful_hosts | select('in', groups['master_nodes']) | list | join(', ') }}"
+              - "Hot nodes added: {{ successful_hosts | select('in', groups['hot_nodes']) | list | join(', ') }}"
+              - "Frozen nodes added: {{ successful_hosts | select('in', groups['frozen_nodes']) | list | join(', ') }}"
+              - "ML nodes added: {{ successful_hosts | select('in', groups['ml_nodes']) | list | join(', ') }}"
+          delegate_to: localhost
+          run_once: true
+
+        # Update added_nodes tracking file
+        - name: Create simple node tracking file
+          copy:
+            content: |
+              ---
+              # Elasticsearch nodes added via es-toolkit
+              # Last updated: {{ ansible_date_time.iso8601 }}
+              
+              added_nodes:
+                master_nodes: {{ successful_hosts | select('in', groups['master_nodes']) | list }}
+                hot_nodes: {{ successful_hosts | select('in', groups['hot_nodes']) | list }}
+                frozen_nodes: {{ successful_hosts | select('in', groups['frozen_nodes']) | list }}
+                ml_nodes: {{ successful_hosts | select('in', groups['ml_nodes']) | list }}
+              
+              # Node details
+              node_details:
+              {% for host in successful_hosts %}
+                {{ host }}:
+                  role: {% if host in groups['master_nodes'] %}master{% elif host in groups['hot_nodes'] %}hot{% elif host in groups['frozen_nodes'] %}frozen{% elif host in groups['ml_nodes'] %}ml{% else %}unknown{% endif %}
+                  ansible_host: {{ hostvars[host].ansible_host | default(host) }}
+                  heap_size: {{ final_heap_size }}
+                  data_path: {{ final_paths.data }}
+                  log_path: {{ final_paths.logs }}
+                  added_date: {{ ansible_date_time.iso8601 }}
+                  system_tuning: {{ apply_system_tuning }}
+                  installation_method: {{ installation_method }}
+                {% if installation_method == 'apt' %}
+                  component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}"
+                {% elif installation_method == 'local' %}
+                  package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
+                {% endif %}
+              {% endfor %}
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/added_nodes.yml"
+            mode: '0600'
+          delegate_to: localhost
+          run_once: true
+          
+        # Create simple operation record
+        - name: Generate timestamp
+          command: date +%Y%m%d%H%M%S
+          register: timestamp_raw
+          delegate_to: localhost
+          run_once: true
+          changed_when: false
+          
+        # Check and backup operations_log if it exists
+        - name: Check if operations_log file exists
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+          register: operations_log_file
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Backup operations_log file if it exists
+          shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/operations_log.yml.$(date +%Y%m%d%H%M%S)"
+          when: operations_log_file.stat.exists
+          delegate_to: localhost
+          run_once: true
+        
+        # Create individual operation log file
+        - name: Create operation log file
+          copy:
+            content: |
+              ---
+              # Elasticsearch Operation Record
+              # Created: {{ ansible_date_time.iso8601 }}
+              
+              Operation: add_elasticsearch
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Hosts: {{ successful_hosts | join(', ') }}
+              {% if successful_hosts | length == 0 %}
+              Status: No new hosts were added (all hosts had existing installations)
+              {% else %}
+              Status: Successfully installed {{ successful_hosts | length }} new host(s)
+              {% endif %}
+              
+              Configuration:
+                Installation Method: {{ installation_method }}
+                {% if installation_method == 'apt' %}
+                Component Version: {{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}
+                {% elif installation_method == 'local' %}
+                Package Path: {{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}
+                {% endif %}
+                Data Path: {{ final_paths.data }}
+                Log Path: {{ final_paths.logs }}
+                Heap Size: {{ final_heap_size }}GB
+                System Tuning: {{ apply_system_tuning }}
+                Cluster Name: {{ cluster_name }}
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operation_{{ timestamp_raw.stdout }}.log"
+            mode: '0600'
+          delegate_to: localhost
+          run_once: true
+          
+        # Update custom configurations file with new node information
+        - name: Check for custom configurations file
+          stat:
+            path: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+          register: custom_config_check
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Load existing custom configurations
+          include_vars:
+            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+            name: existing_custom_configs
+          when: custom_config_check.stat.exists
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Create empty custom configs if file doesn't exist
+          set_fact:
+            existing_custom_configs:
+              installation:
+                method: "{{ installation_method }}"
+              security:
+                es_cert_pass: "{{ es_cert_pass }}"
+              cluster:
+                name: "{{ cluster_name }}"
+              paths:
+                initial:
+                  data: "{{ final_paths.data }}"
+                  logs: "{{ final_paths.logs }}"
+                master_nodes: {}
+                hot_nodes: {}
+                frozen_nodes: {}
+                ml_nodes: {}
+              system_tuning:
+                enabled: "{{ apply_system_tuning }}"
+                heap_sizes: "{{ heap_sizes }}"
+              node_configurations: {}
+              minio:
+                configured: false
+          when: not custom_config_check.stat.exists
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Backup custom configurations file if it exists
+          shell: |
+            mkdir -p {{ lookup('env', 'HOME') }}/.elasticsearch/backups
+            cp {{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/custom_configurations.yml.$(date +%Y%m%d%H%M%S)
+          when: custom_config_check.stat.exists
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+            
+        - name: Extract successful master nodes
+          set_fact:
+            new_master_nodes: "{{ successful_hosts | select('in', groups['master_nodes']) | list }}"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Extract successful hot nodes
+          set_fact:
+            new_hot_nodes: "{{ successful_hosts | select('in', groups['hot_nodes']) | list }}"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Extract successful frozen nodes
+          set_fact:
+            new_frozen_nodes: "{{ successful_hosts | select('in', groups['frozen_nodes']) | list }}"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Extract successful ml nodes
+          set_fact:
+            new_ml_nodes: "{{ successful_hosts | select('in', groups['ml_nodes']) | list }}"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Update custom configurations with successful installation details
+          copy:
+            content: |
+              ---
+              # Elasticsearch Custom Configurations
+              # Last updated: {{ ansible_date_time.iso8601 }}
+              # This file contains all custom configurations from initial deployment and subsequent operations
+              
+              # Installation and version information
+              installation:
+                method: "{{ existing_custom_configs.installation.method }}"
+                {% if existing_custom_configs.installation.component_version is defined %}
+                component_version: "{{ existing_custom_configs.installation.component_version }}"
+                {% endif %}
+                {% if existing_custom_configs.installation.es_deb_package_path is defined %}
+                es_deb_package_path: "{{ existing_custom_configs.installation.es_deb_package_path }}"
+                {% endif %}
+                {% if existing_custom_configs.installation.kibana_deb_package_path is defined %}
+                kibana_deb_package_path: "{{ existing_custom_configs.installation.kibana_deb_package_path }}"
+                {% endif %}
+                {% if existing_custom_configs.installation.initial_deployment_date is defined %}
+                initial_deployment_date: "{{ existing_custom_configs.installation.initial_deployment_date }}"
+                {% endif %}
+                latest_node_addition: "{{ ansible_date_time.iso8601 }}"
+              
+              # Security settings
+              security:
+                es_cert_pass: "{{ existing_custom_configs.security.es_cert_pass }}"
+                {% if existing_custom_configs.security.passwords_generated is defined %}
+                passwords_generated: {{ existing_custom_configs.security.passwords_generated }}
+                {% endif %}
+              
+              # Cluster settings
+              cluster:
+                name: "{{ existing_custom_configs.cluster.name }}"
+                {% if existing_custom_configs.cluster.initial_masters is defined %}
+                initial_masters: {{ existing_custom_configs.cluster.initial_masters }}
+                {% endif %}
+                {% if existing_custom_configs.cluster.initial_hot_nodes is defined %}
+                initial_hot_nodes: {{ existing_custom_configs.cluster.initial_hot_nodes }}
+                {% endif %}
+                {% if existing_custom_configs.cluster.initial_frozen_nodes is defined %}
+                initial_frozen_nodes: {{ existing_custom_configs.cluster.initial_frozen_nodes }}
+                {% endif %}
+                {% if existing_custom_configs.cluster.initial_ml_nodes is defined %}
+                initial_ml_nodes: {{ existing_custom_configs.cluster.initial_ml_nodes }}
+                {% endif %}
+                {% if existing_custom_configs.cluster.initial_kibana_nodes is defined %}
+                initial_kibana_nodes: {{ existing_custom_configs.cluster.initial_kibana_nodes }}
+                {% endif %}
+                current_node_count:
+                  master: {{ groups['master_nodes'] | length }}
+                  hot: {{ groups['hot_nodes'] | length }}
+                  frozen: {{ groups['frozen_nodes'] | default([]) | length }}
+                  ml: {{ groups['ml_nodes'] | default([]) | length }}
+                  total: {{ groups['master_nodes'] | length + groups['hot_nodes'] | length + groups['frozen_nodes'] | default([]) | length + groups['ml_nodes'] | default([]) | length }}
+              
+              # Filesystem paths
+              paths:
+                # Initial paths from deployment
+                initial:
+                  data: "{{ existing_custom_configs.paths.initial.data }}"
+                  logs: "{{ existing_custom_configs.paths.initial.logs }}"
+                # Node-specific paths (updated with latest additions)
+                master_nodes:
+                  {% for hostname in new_master_nodes %}
+                  {{ hostname }}:
+                    data: "{{ final_paths.data }}"
+                    logs: "{{ final_paths.logs }}"
+                  {% endfor %}
+                  {% for hostname, paths in existing_custom_configs.paths.master_nodes.items() %}
+                  {{ hostname }}: {{ paths }}
+                  {% endfor %}
+                hot_nodes:
+                  {% for hostname in new_hot_nodes %}
+                  {{ hostname }}:
+                    data: "{{ final_paths.data }}"
+                    logs: "{{ final_paths.logs }}"
+                  {% endfor %}
+                  {% for hostname, paths in existing_custom_configs.paths.hot_nodes.items() %}
+                  {{ hostname }}: {{ paths }}
+                  {% endfor %}
+                frozen_nodes:
+                  {% for hostname in new_frozen_nodes %}
+                  {{ hostname }}:
+                    data: "{{ final_paths.data }}"
+                    logs: "{{ final_paths.logs }}"
+                  {% endfor %}
+                  {% for hostname, paths in existing_custom_configs.paths.frozen_nodes.items() %}
+                  {{ hostname }}: {{ paths }}
+                  {% endfor %}
+                ml_nodes:
+                  {% for hostname in new_ml_nodes %}
+                  {{ hostname }}:
+                    data: "{{ final_paths.data }}"
+                    logs: "{{ final_paths.logs }}"
+                  {% endfor %}
+                  {% for hostname, paths in existing_custom_configs.paths.ml_nodes.items() %}
+                  {{ hostname }}: {{ paths }}
+                  {% endfor %}
+              
+              # System tuning
+              system_tuning:
+                enabled: {{ existing_custom_configs.system_tuning.enabled }}
+                heap_sizes:
+                  master: {{ existing_custom_configs.system_tuning.heap_sizes.master }}
+                  hot: {{ existing_custom_configs.system_tuning.heap_sizes.hot }}
+                  frozen: {{ existing_custom_configs.system_tuning.heap_sizes.frozen }}
+                  ml: {{ existing_custom_configs.system_tuning.heap_sizes.ml }}
+                vm_settings:
+                  max_map_count: {{ existing_custom_configs.system_tuning.vm_settings.max_map_count | default(262144) }}
+                  swappiness: {{ existing_custom_configs.system_tuning.vm_settings.swappiness | default(1) }}
+                  disable_thp: {{ existing_custom_configs.system_tuning.vm_settings.disable_thp | default(true) }}
+              
+              # Node-specific configurations
+              node_configurations:
+                {% for hostname in successful_hosts %}
+                {{ hostname }}:
+                  role: {% if hostname in groups['master_nodes'] %}master{% elif hostname in groups['hot_nodes'] %}hot{% elif hostname in groups['frozen_nodes'] %}frozen{% elif hostname in groups['ml_nodes'] %}ml{% else %}unknown{% endif %}
+                  ansible_host: {{ hostvars[hostname].ansible_host | default(hostname) }}
+                  heap_size: {{ final_heap_size }}
+                  data_path: {{ final_paths.data }}
+                  log_path: {{ final_paths.logs }}
+                  added_date: {{ ansible_date_time.iso8601 }}
+                  system_tuning: {{ apply_system_tuning }}
+                  installation_method: {{ installation_method }}
+                {% if installation_method == 'apt' %}
+                  component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}"
+                {% elif installation_method == 'local' %}
+                  package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
+                {% endif %}
+                {% endfor %}
+                {% for hostname, config in existing_custom_configs.node_configurations.items() %}
+                {% if hostname not in successful_hosts %}
+                {{ hostname }}: {{ config }}
+                {% endif %}
+                {% endfor %}
+              
+              # MinIO configurations (preserved from previous configuration)
+              minio: {{ existing_custom_configs.minio }}
+              
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+            mode: '0600'
+          delegate_to: localhost
+          run_once: true
+          
+        # Update main operations log file
+        - name: Load existing operations log
+          include_vars:
+            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+            name: current_operations
+          delegate_to: localhost
+          run_once: true
+          when: operations_log_file.stat.exists
+
+        - name: Create empty operations list if file doesn't exist
+          set_fact:
+            current_operations:
+              operations: []
+          delegate_to: localhost
+          run_once: true
+          when: not operations_log_file.stat.exists
+            
+        - name: Append new operation to log
+          copy:
+            content: |
+              ---
+              # Elasticsearch operations log
+              # Updated: {{ ansible_date_time.iso8601 }}
+              
+              operations:
+              {% for op in current_operations.operations %}
+                - {{ op | to_json }}
+              {% endfor %}
+                - 
+                  operation: add_elasticsearch
+                  timestamp: "{{ ansible_date_time.iso8601 }}"
+                  hosts: "{{ successful_hosts | join(', ') }}"
+                  status: "{% if successful_hosts | length == 0 %}No new hosts added{% else %}Added {{ successful_hosts | length }} host(s){% endif %}"
+                  configuration:
+                    installation_method: "{{ installation_method }}"
+                  {% if installation_method == 'apt' %}
+                    component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}"
+                  {% elif installation_method == 'local' %}
+                    package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
+                  {% endif %}
+                    data_path: "{{ final_paths.data }}"
+                    log_path: "{{ final_paths.logs }}"
+                    heap_size: "{{ final_heap_size }}"
+                    system_tuning: "{{ apply_system_tuning }}"
+                    cluster_name: "{{ cluster_name }}"
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+            mode: '0600'
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Create cluster topology snapshot
+          block:
+            - name: Ensure backups directory exists
+              file:
+                path: "{{ lookup('env', 'HOME') }}/.elasticsearch/backups"
+                state: directory
+                mode: '0700'
+              
+            - name: Check if topology file exists
+              stat:
+                path: "{{ lookup('env', 'HOME') }}/.elasticsearch/cluster_topology.yml"
+              register: topology_file
+              
+            - name: Backup existing topology file if it exists
+              shell: "cp {{ lookup('env', 'HOME') }}/.elasticsearch/cluster_topology.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/cluster_topology.yml.$(date +%Y%m%d%H%M%S)"
+              when: topology_file.stat.exists
+              
+            - name: Initialize topology tracking
+              copy:
+                content: |
+                  ---
+                  # Elasticsearch cluster topology snapshot
+                  # Last updated: {{ ansible_date_time.iso8601 }}
+                  # This file combines information from original deployment and nodes added via toolkit
+                  
+                  cluster_name: {{ cluster_name }}
+                  
+                  node_counts:
+                    master: {{ groups['master_nodes'] | length }}
+                    hot: {{ groups['hot_nodes'] | length }}
+                    frozen: {{ groups['frozen_nodes'] | default([]) | length }}
+                    ml: {{ groups['ml_nodes'] | default([]) | length }}
+                    total: {{ groups['master_nodes'] | length + groups['hot_nodes'] | length + 
+                           groups['frozen_nodes'] | default([]) | length + groups['ml_nodes'] | default([]) | length }}
+                  
+                  nodes:
+                    master_nodes:
+                  {% for host in groups['master_nodes'] %}
+                    - host: {{ host }}
+                      ip: {{ hostvars[host].ansible_host | default(host) }}
+                  {% endfor %}
+                    
+                    hot_nodes:
+                  {% for host in groups['hot_nodes'] %}
+                    - host: {{ host }}
+                      ip: {{ hostvars[host].ansible_host | default(host) }}
+                  {% endfor %}
+                    
+                  {% if groups['frozen_nodes'] | default([]) | length > 0 %}
+                    frozen_nodes:
+                  {% for host in groups['frozen_nodes'] %}
+                    - host: {{ host }}
+                      ip: {{ hostvars[host].ansible_host | default(host) }}
+                  {% endfor %}
+                  {% endif %}
+                    
+                  {% if groups['ml_nodes'] | default([]) | length > 0 %}
+                    ml_nodes:
+                  {% for host in groups['ml_nodes'] %}
+                    - host: {{ host }}
+                      ip: {{ hostvars[host].ansible_host | default(host) }}
+                  {% endfor %}
+                  {% endif %}
+                dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/cluster_topology.yml"
+                mode: '0600'
+              when: not topology_file.stat.exists
+              
+            - name: Update existing topology file
+              block:
+                - name: Load current topology data
+                  include_vars:
+                    file: "{{ lookup('env', 'HOME') }}/.elasticsearch/cluster_topology.yml"
+                    name: current_topology
+                  
+                - name: Update topology file
+                  copy:
+                    content: |
+                      ---
+                      # Elasticsearch cluster topology snapshot
+                      # Last updated: {{ ansible_date_time.iso8601 }}
+                      # This file combines information from original deployment and nodes added via toolkit
+                      
+                      cluster_name: {{ cluster_name }}
+                      
+                      node_counts:
+                        master: {{ groups['master_nodes'] | length }}
+                        hot: {{ groups['hot_nodes'] | length }}
+                        frozen: {{ groups['frozen_nodes'] | default([]) | length }}
+                        ml: {{ groups['ml_nodes'] | default([]) | length }}
+                        total: {{ groups['master_nodes'] | length + groups['hot_nodes'] | length + 
+                               groups['frozen_nodes'] | default([]) | length + groups['ml_nodes'] | default([]) | length }}
+                      
+                      nodes:
+                        master_nodes:
+                      {% for host in groups['master_nodes'] %}
+                        - host: {{ host }}
+                          ip: {{ hostvars[host].ansible_host | default(host) }}
+                      {% endfor %}
+                        
+                        hot_nodes:
+                      {% for host in groups['hot_nodes'] %}
+                        - host: {{ host }}
+                          ip: {{ hostvars[host].ansible_host | default(host) }}
+                      {% endfor %}
+                        
+                      {% if groups['frozen_nodes'] | default([]) | length > 0 %}
+                        frozen_nodes:
+                      {% for host in groups['frozen_nodes'] %}
+                        - host: {{ host }}
+                          ip: {{ hostvars[host].ansible_host | default(host) }}
+                      {% endfor %}
+                      {% endif %}
+                        
+                      {% if groups['ml_nodes'] | default([]) | length > 0 %}
+                        ml_nodes:
+                      {% for host in groups['ml_nodes'] %}
+                        - host: {{ host }}
+                          ip: {{ hostvars[host].ansible_host | default(host) }}
+                      {% endfor %}
+                      {% endif %}
+                    dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/cluster_topology.yml"
+                    mode: '0600'
+              when: topology_file.stat.exists
+          delegate_to: localhost
+          run_once: true
+
+  always:
+    - name: Set cleanup files list
+      set_fact:
+        cleanup_files:
+          - "/tmp/es_preinstall_report.txt"
+          - "/tmp/es_install_report.txt"
+          - "/tmp/es_hot_nodes_report.txt"
+          - "{{ ansible_env.HOME }}/elasticsearch.asc"  
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+
+    - name: Add deb package to cleanup list if local installation
+      set_fact:
+        cleanup_files: "{{ cleanup_files + ['/tmp/' + hostvars['localhost']['selected_play_vars']['deb_package_path'] | basename] }}"
+      when: 
+        - hostvars['localhost']['selected_play_vars']['installation_method'] is defined
+        - hostvars['localhost']['selected_play_vars']['installation_method'] == 'local'
+        - hostvars['localhost']['selected_play_vars']['deb_package_path'] is defined
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+      
+    # Add any remaining status files to cleanup list
+    - name: Find any remaining status files
+      find:
+        paths: /tmp
+        patterns: "es_install_status_*.txt"
+      register: remaining_status_files
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+      
+    - name: Add status files to cleanup list
+      set_fact:
+        cleanup_files: "{{ cleanup_files + [item.path] }}"
+      with_items: "{{ remaining_status_files.files }}"
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items: "{{ cleanup_files }}"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes
+      no_log: true
