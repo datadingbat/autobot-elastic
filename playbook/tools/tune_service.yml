@@ -1,0 +1,332 @@
+---
+# tune_service.yml - Combined service tuning utility for Elasticsearch and Kibana
+# This file consolidates functionality from tuning_es.yml and tuning_kibana.yml
+
+# Input validation tasks
+- name: Validate input variables
+  block:
+    - name: Check required variables
+      fail:
+        msg: "Missing required variable: selected_service. Please specify the service to tune (elasticsearch or kibana)."
+      when: selected_service is not defined or selected_service not in ['elasticsearch', 'kibana']
+
+    # Get total system memory if not provided
+    - name: Get total memory if not provided
+      shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+      register: mem_info
+      changed_when: false
+      when: total_ram_gb is not defined
+  
+    - name: Set total RAM variable
+      set_fact:
+        total_ram_gb: "{{ total_ram_gb | default(mem_info.stdout | int) }}"
+
+    - name: Validate RAM value
+      fail:
+        msg: "Invalid RAM value ({{ total_ram_gb }}). Must be a positive integer greater than 4GB."
+      when: not total_ram_gb | int or total_ram_gb | int < 4
+  run_once: true
+  delegate_to: localhost
+
+- name: Calculate system resources
+  block:
+    - name: Calculate heap size
+      set_fact:
+        heap_size: "{{ [(total_ram_gb|int / 2)|round|int, 128|int]|min }}"
+
+    - name: Display calculated values
+      debug:
+        msg: 
+          - "Total RAM: {{ total_ram_gb }}GB"
+          - "Calculated heap size: {{ heap_size }}GB"
+          - "Service being tuned: {{ selected_service }}"
+
+# Main tuning tasks based on service type
+- name: Main utility tasks
+  block:
+    # Memory and swap configuration
+    - name: Configure memory settings
+      block:
+        - name: Disable swap
+          command: swapoff -a
+          changed_when: false
+
+        - name: Disable swap in fstab
+          replace:
+            path: /etc/fstab
+            regexp: '^([^#].*?\sswap\s+sw\s+.*)'
+            replace: '# \1'
+          ignore_errors: yes
+
+        - name: Configure memlock limits for service user
+          copy:
+            dest: "/etc/security/limits.d/{{ selected_service }}.conf"
+            content: |
+              {{ selected_service }} soft memlock unlimited
+              {{ selected_service }} hard memlock unlimited
+              {{ selected_service }} soft nofile 65535
+              {{ selected_service }} hard nofile 65535
+              {{ selected_service }} soft nproc 4096
+              {{ selected_service }} hard nproc 4096
+            mode: '0644'
+            owner: root
+            group: root
+
+        - name: Set vm.max_map_count
+          sysctl:
+            name: vm.max_map_count
+            value: '262144'
+            sysctl_set: yes
+            state: present
+            reload: yes
+            
+        - name: Set vm.swappiness to 1
+          sysctl:
+            name: vm.swappiness
+            value: '1'
+            sysctl_set: yes
+            state: present
+            reload: yes
+      rescue:
+        - name: Handle memory configuration failure
+          fail:
+            msg: "Failed to configure memory settings. Check system permissions and requirements."
+      become: yes
+
+    # JVM configuration for Elasticsearch
+    - name: Configure Elasticsearch JVM
+      block:
+        - name: Create Elasticsearch JVM options directory
+          file:
+            path: /etc/elasticsearch/jvm.options.d
+            state: directory
+            owner: root
+            group: elasticsearch
+            mode: '0750'
+
+        - name: Configure Elasticsearch JVM heap size
+          copy:
+            dest: /etc/elasticsearch/jvm.options.d/heap.options
+            content: |
+              -Xms{{ heap_size }}g
+              -Xmx{{ heap_size }}g
+              # Additional JVM options
+              -XX:+UseG1GC
+              -XX:G1ReservePercent=25
+              -XX:InitiatingHeapOccupancyPercent=30
+            mode: '0644'
+            owner: root
+            group: elasticsearch
+      rescue:
+        - name: Handle JVM configuration failure
+          fail:
+            msg: "Failed to configure JVM settings. Check directory permissions and elasticsearch user existence."
+      become: yes
+      when: selected_service == 'elasticsearch'
+
+    # JVM configuration for Kibana
+    - name: Configure Kibana JVM (if applicable)
+      block:
+        - name: Create Kibana Node options directory if it doesn't exist
+          file:
+            path: /etc/kibana/node.options.d
+            state: directory
+            owner: root
+            group: kibana
+            mode: '0750'
+          ignore_errors: yes
+
+        - name: Configure Kibana node memory options
+          copy:
+            dest: /etc/kibana/node.options.d/memory.options
+            content: |
+              --max-old-space-size={{ heap_size * 1024 }}
+            mode: '0644'
+            owner: root
+            group: kibana
+          ignore_errors: yes
+      rescue:
+        - name: Handle Kibana configuration failure
+          debug:
+            msg: "Could not configure Kibana node options. You may need to set them manually in kibana.yml."
+      become: yes
+      when: selected_service == 'kibana'
+
+    # System limits configuration
+    - name: Configure system limits
+      block:
+        - name: Set ulimit in systemd service
+          blockinfile:
+            path: "/usr/lib/systemd/system/{{ selected_service }}.service"
+            insertafter: '^\[Service\]'
+            block: |
+              LimitMEMLOCK=infinity
+              LimitNOFILE=65535
+              LimitNPROC=4096
+            backup: yes
+
+        - name: Set system limits
+          lineinfile:
+            path: /etc/security/limits.conf
+            line: "{{ item }}"
+            create: yes
+          loop:
+            - "{{ selected_service }}  -  nofile  65535"
+            - "{{ selected_service }}  -  nproc   4096"
+
+        - name: Reload systemd
+          systemd:
+            daemon_reload: yes
+      rescue:
+        - name: Handle system limits configuration failure
+          fail:
+            msg: "Failed to configure system limits. Check systemd service file and limits.conf permissions."
+      become: yes
+
+    # Elasticsearch specific configuration
+    - name: Configure Elasticsearch specific settings
+      block:
+        - name: Check if Elasticsearch config exists
+          stat:
+            path: /etc/elasticsearch/elasticsearch.yml
+          register: es_config_stat
+
+        - name: Enable Elasticsearch bootstrap.memory_lock
+          lineinfile:
+            path: /etc/elasticsearch/elasticsearch.yml
+            line: "bootstrap.memory_lock: true"
+            regexp: "^bootstrap.memory_lock:"
+          when: es_config_stat.stat.exists
+      become: yes
+      when: selected_service == 'elasticsearch'
+
+    # Kibana specific configuration
+    - name: Configure Kibana specific settings
+      block:
+        - name: Check if Kibana config exists
+          stat:
+            path: /etc/kibana/kibana.yml
+          register: kibana_config_stat
+
+        - name: Increase Kibana max worker count
+          lineinfile:
+            path: /etc/kibana/kibana.yml
+            line: "worker.maxWorkerCount: {{ [ansible_processor_vcpus|int, 4]|max }}"
+            regexp: "^worker.maxWorkerCount:"
+          when: kibana_config_stat.stat.exists
+      become: yes
+      when: selected_service == 'kibana'
+
+    # Verification tasks
+    - name: Verify configuration
+      block:
+        - name: Check memory lock limits
+          command: ulimit -l
+          register: memlock_result
+          changed_when: false
+
+        - name: Check file descriptor limits
+          shell: ulimit -n
+          register: ulimit_result
+          changed_when: false
+
+        - name: Display verification results
+          debug:
+            msg:
+              - "Memory lock limit: {{ memlock_result.stdout }}"
+              - "File descriptor limit: {{ ulimit_result.stdout }}"
+              - "Heap size configuration: {{ heap_size }}GB"
+        - name: Verify max_map_count
+          command: sysctl -n vm.max_map_count
+          register: max_map_count_result
+          changed_when: false
+      become: yes
+      become_user: "{{ selected_service }}"
+      ignore_errors: yes
+
+  rescue:
+    - name: Handle overall tuning failure
+      fail:
+        msg: "Service tuning failed. Check error messages above."
+
+- name: Generate tuning report
+  block:
+    - name: Create report directory
+      file:
+        path: "/tmp/service_tuning_reports"
+        state: directory
+      delegate_to: localhost
+
+    - name: Create tuning report
+      copy:
+        content: |
+          {{ selected_service | title }} Tuning Report
+          {{ '=' * (selected_service | length + 14) }}
+          Host: {{ inventory_hostname }}
+          Timestamp: {{ ansible_date_time.iso8601 }}
+
+          Memory Configuration:
+          - Total System RAM: {{ total_ram_gb }}GB
+          - Allocated Memory: {{ heap_size }}GB
+          - Swap: Disabled
+          - Memory Lock: Unlimited
+
+          System Limits:
+          - Max File Descriptors: 65535
+          - Max Processes: 4096
+          - Virtual Memory Max Map Count: {{ max_map_count_result.stdout | default('262144') }}
+          - VM Swappiness: 1
+
+          {% if selected_service == 'elasticsearch' %}
+          JVM Configuration:
+          - Min Heap: {{ heap_size }}GB
+          - Max Heap: {{ heap_size }}GB
+          - Garbage Collector: G1GC
+          - G1GC Reserve: 25%
+          - Heap Occupancy Threshold: 30%
+          {% elif selected_service == 'kibana' %}
+          Node.js Configuration:
+          - Max Old Space Size: {{ heap_size * 1024 }}MB
+          - Max Worker Count: {{ [ansible_processor_vcpus|int, 4]|max }}
+          {% endif %}
+
+          Verification Results:
+          - Memory Lock Limit: {{ memlock_result.stdout | default('Unknown') }}
+          - File Descriptor Limit: {{ ulimit_result.stdout | default('Unknown') }}
+        dest: "/tmp/service_tuning_reports/tuning_{{ selected_service }}_{{ inventory_hostname | replace('.', '_') }}.txt"
+      delegate_to: localhost
+
+    - name: Display tuning report
+      debug:
+        msg: "{{ lookup('file', '/tmp/service_tuning_reports/tuning_' + selected_service + '_' + inventory_hostname | replace('.', '_') + '.txt') | split('\n') }}"
+  always:
+    - name: Cleanup report files
+      file:
+        path: "/tmp/service_tuning_reports"
+        state: absent
+      delegate_to: localhost
+      ignore_errors: yes
+      
+# Final restart of service after tuning
+- name: Restart service
+  block:
+    - name: Prompt for service restart
+      pause:
+        prompt: |
+          Tuning has been applied for {{ selected_service }}.
+          Do you want to restart the service now? (yes/no)
+      register: restart_service_prompt
+      delegate_to: localhost
+      run_once: true
+
+    - name: Restart service if requested
+      systemd:
+        name: "{{ selected_service }}"
+        state: restarted
+        daemon_reload: yes
+      become: yes
+      when: restart_service_prompt.user_input | lower == 'yes'
+  rescue:
+    - name: Handle service restart failure
+      debug:
+        msg: "Failed to restart service. You may need to restart it manually: 'sudo systemctl restart {{ selected_service }}'"

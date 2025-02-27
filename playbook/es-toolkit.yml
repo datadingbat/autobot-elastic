@@ -884,16 +884,17 @@
           1. Start service
           2. Stop service
           3. Restart service
+          4. Change node role (Elasticsearch only)
           Enter the number of your choice:
       register: state_choice
       when: selected_utility == '2'
 
     - name: Validate state selection
       fail:
-        msg: "Invalid state selection. Please enter a number between 1 and 3."
+        msg: "Invalid state selection. Please enter a number between 1 and 4."
       when: >
         selected_utility == '2' and 
-        state_choice.user_input not in ['1','2','3']
+        state_choice.user_input not in ['1','2','3','4']
 
     - name: Set target state
       set_fact:
@@ -903,7 +904,52 @@
           '1': 'started'
           '2': 'stopped'
           '3': 'restarted'
+          '4': 'change_role'
       when: selected_utility == '2'
+      
+    # Handle node role selection if change_role was selected
+    - name: Validate service for node role change
+      fail:
+        msg: "Node role changes are only supported for Elasticsearch service"
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input == '4' and 
+        selected_service != 'elasticsearch'
+        
+    - name: Prompt for node role selection
+      pause:
+        prompt: |
+          Select the node role type:
+          1. Master node (node.roles: [ master ])
+          2. Hot node (node.roles: [ data_hot, data_content, ingest, ml, transform, remote_cluster_client ])
+          3. Frozen node (node.roles: [ data_frozen, remote_cluster_client ])
+          4. ML node (node.roles: [ ml, remote_cluster_client ])
+          Enter the number of your choice:
+      register: role_choice
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input == '4'
+        
+    - name: Validate role selection
+      fail:
+        msg: "Invalid node role selection. Please enter a number between 1 and 4."
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input == '4' and
+        role_choice.user_input not in ['1','2','3','4']
+        
+    - name: Set node role type
+      set_fact:
+        node_role_type: "{{ role_map[role_choice.user_input] }}"
+      vars:
+        role_map:
+          '1': 'master'
+          '2': 'hot'
+          '3': 'frozen'
+          '4': 'ml'
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input == '4'
 
 # Target selection prompt
     - name: Select target hosts
@@ -1330,6 +1376,7 @@
           limit: "{{ limit }}"
           selected_service: "{{ selected_service | default(omit) }}"
           target_state: "{{ target_state | default(omit) }}"
+          node_role_type: "{{ node_role_type | default(omit) }}"  # Added for node role change
           installation_method: "{{ installation_method | default(omit) }}"
           es_version: "{{ es_version | default(omit) }}"
           component_version: "{{ component_version | default(omit) }}"  # Added for upgrades
@@ -1382,6 +1429,7 @@
   vars:
     selected_service: "{{ hostvars['localhost']['selected_play_vars']['selected_service'] }}"
     target_state: "{{ hostvars['localhost']['selected_play_vars']['target_state'] }}"
+    node_role_type: "{{ hostvars['localhost']['selected_play_vars']['node_role_type'] }}"
     installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] }}"
     es_version: "{{ hostvars['localhost']['selected_play_vars']['es_version'] }}"
     component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] }}"

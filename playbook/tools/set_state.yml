@@ -13,13 +13,120 @@
     
     - name: Validate target state
       fail:
-        msg: "Invalid target state. Must be 'started', 'stopped', or 'restarted'"
-      when: target_state not in ['started', 'stopped', 'restarted']
+        msg: "Invalid target state. Must be 'started', 'stopped', 'restarted', or 'change_role'"
+      when: target_state not in ['started', 'stopped', 'restarted', 'change_role']
+    
+    # Validate node role if changing roles
+    - name: Validate node role selection
+      fail:
+        msg: "Missing required variable: node_role_type"
+      when: target_state == 'change_role' and (node_role_type is not defined)
+    
+    - name: Validate node role type
+      fail:
+        msg: "Invalid node role type. Must be one of: master, hot, frozen, ml"
+      when: >
+        target_state == 'change_role' and 
+        node_role_type not in ['master', 'hot', 'frozen', 'ml']
   run_once: true
   delegate_to: localhost
 
 - name: Main utility tasks
   block:
+    # Node role management
+    - name: Change node role
+      block:
+        - name: Read current elasticsearch.yml
+          shell: "cat /etc/elasticsearch/elasticsearch.yml"
+          register: current_es_yaml
+          changed_when: false
+          failed_when: false
+          become: yes
+          when: target_state == 'change_role'
+          
+        - name: Extract current node.roles
+          set_fact:
+            current_node_roles: "{{ (current_es_yaml.stdout | regex_findall('node\\.roles\\s*:\\s*\\[([^\\]]+)\\]') | first) | default('') }}"
+          when: target_state == 'change_role' and current_es_yaml.rc == 0
+          
+        - name: Set initial node role info
+          set_fact:
+            local_host_info:
+              initial_state: >-
+                {%- if current_es_yaml.rc != 0 -%}
+                not installed
+                {%- elif current_node_roles is defined -%}
+                {{ current_node_roles }}
+                {%- else -%}
+                unknown
+                {%- endif -%}
+          when: target_state == 'change_role'
+          
+        - name: Set new node roles based on selected type
+          set_fact:
+            new_node_roles: "{{ node_roles_map[node_role_type] }}"
+          vars:
+            node_roles_map:
+              master: "[ master ]"
+              hot: "[ data_hot, data_content, ingest, ml, transform, remote_cluster_client ]"
+              frozen: "[ data_frozen, remote_cluster_client ]"
+              ml: "[ ml, remote_cluster_client ]"
+          when: target_state == 'change_role'
+          
+        - name: Update elasticsearch.yml with new node roles
+          replace:
+            path: /etc/elasticsearch/elasticsearch.yml
+            regexp: 'node\.roles\s*:\s*\[[^\]]+\]'
+            replace: 'node.roles: {{ new_node_roles }}'
+          become: yes
+          register: role_change_result
+          when: target_state == 'change_role' and local_host_info.initial_state != 'not installed'
+          
+        - name: Set role change info
+          set_fact:
+            local_host_info: "{{ local_host_info | combine({
+              'action_taken': 'change_role to ' + node_role_type,
+              'new_roles': new_node_roles,
+              'success': role_change_result is changed,
+              'restart_required': true
+            }) }}"
+          when: target_state == 'change_role' and local_host_info.initial_state != 'not installed'
+          
+        - name: Prompt to restart elasticsearch after role change
+          pause:
+            prompt: |
+              Node role has been changed to {{ node_role_type }} ({{ new_node_roles }}).
+              Elasticsearch must be restarted for changes to take effect.
+              
+              Do you want to restart Elasticsearch now? (yes/no):
+          register: restart_prompt
+          delegate_to: localhost
+          run_once: true
+          when: target_state == 'change_role' and role_change_result is changed
+          
+        - name: Restart elasticsearch if confirmed
+          systemd:
+            name: elasticsearch
+            state: restarted
+          become: yes
+          register: restart_result
+          when: >
+            target_state == 'change_role' and 
+            role_change_result is changed and 
+            restart_prompt.user_input | lower == 'yes'
+          
+        - name: Update host info with restart status
+          set_fact:
+            local_host_info: "{{ local_host_info | combine({
+              'restart_performed': restart_prompt.user_input | lower == 'yes',
+              'restart_success': restart_result is success
+            }) }}"
+          when: >
+            target_state == 'change_role' and 
+            role_change_result is changed and 
+            restart_prompt.user_input | lower == 'yes'
+      when: target_state == 'change_role'
+
     # Service state management
     - name: Service state operations
       block:
@@ -45,6 +152,7 @@
                 {%- else -%}
                 failed
                 {%- endif -%}
+          when: target_state != 'change_role'
 
         - name: Manage service state
           systemd:
@@ -53,13 +161,13 @@
           failed_when: false
           become: yes
           register: state_change_result
-          when: local_host_info.initial_state != 'not installed'
+          when: local_host_info.initial_state != 'not installed' and target_state != 'change_role'
 
         - name: Wait for service state change
           wait_for:
             timeout: 10
           when: 
-            - target_state != 'stopped'
+            - target_state not in ['stopped', 'change_role']
             - local_host_info.initial_state != 'not installed'
 
         - name: Get final service status
@@ -68,11 +176,12 @@
           changed_when: false
           failed_when: false
           become: yes
+          when: target_state != 'change_role'
 
         - name: Get journalctl logs if failed
           shell: "journalctl -u {{ selected_service }}.service -n 50 --no-pager | tail -n 5"
           register: journal_logs_result
-          when: "'failed' in final_status.stdout or final_status.rc != 0"
+          when: target_state != 'change_role' and "'failed' in final_status.stdout or final_status.rc != 0"
           changed_when: false
           become: yes
           ignore_errors: yes
@@ -110,6 +219,8 @@
               {%- else -%}
               false
               {%- endif -%}
+          when: target_state != 'change_role'
+      when: target_state != 'change_role'
 
     # Report generation
     - name: Generate reports
@@ -126,7 +237,7 @@
             shared_host_info: "{{ shared_host_info | default({}) | combine({inventory_hostname: local_host_info}) }}"
           delegate_to: localhost
 
-        - name: Create status report
+        - name: Create status report for service state change
           copy:
             content: |
               Service State Change Report for {{ selected_service }}
@@ -135,7 +246,7 @@
               ----------------------------------------------
               Requested Change: {{ local_host_info.action_taken }}
               Initial State: {{ local_host_info.initial_state }}
-              Final State: {{ local_host_info.final_state }}
+              Final State: {{ local_host_info.final_state | default('N/A') }}
               Success: {{ local_host_info.success }}
               {% if local_host_info.initial_state == 'not installed' %}
               Details: Service is not installed on this host (Unit {{ selected_service }}.service not found)
@@ -143,13 +254,37 @@
               {% if state_change_result is defined and state_change_result.msg is defined %}
               Operation Message: {{ state_change_result.msg }}
               {% endif %}
-              {% if local_host_info.journal_logs != '' %}
+              {% if local_host_info.journal_logs is defined and local_host_info.journal_logs != '' %}
               
               Recent Logs:
               {{ local_host_info.journal_logs }}
               {% endif %}
             dest: "/tmp/service_reports/status_{{ inventory_hostname }}.txt"
           delegate_to: localhost
+          when: target_state != 'change_role'
+          
+        - name: Create status report for node role change
+          copy:
+            content: |
+              Node Role Change Report for {{ selected_service }}
+              ==============================================
+              Host: {{ inventory_hostname }}
+              ----------------------------------------------
+              Requested Change: Change node role to {{ node_role_type }}
+              Previous Roles: {{ local_host_info.initial_state }}
+              New Roles: {{ local_host_info.new_roles | default('N/A') }}
+              Change Successful: {{ local_host_info.success }}
+              Restart Required: {{ local_host_info.restart_required | default(false) }}
+              {% if local_host_info.restart_performed is defined %}
+              Restart Performed: {{ local_host_info.restart_performed }}
+              Restart Successful: {{ local_host_info.restart_success | default(false) }}
+              {% endif %}
+              {% if local_host_info.initial_state == 'not installed' %}
+              Details: Elasticsearch is not installed on this host
+              {% endif %}
+            dest: "/tmp/service_reports/status_{{ inventory_hostname }}.txt"
+          delegate_to: localhost
+          when: target_state == 'change_role'
 
         - name: Collect all reports
           shell: "cat /tmp/service_reports/status_*.txt"

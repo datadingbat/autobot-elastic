@@ -9,6 +9,10 @@ Thumbs.db
 # Claude helper files
 **/CLAUDE.md
 
+# Backup directories
+**/backup/
+**/backups/
+
 # Python
 __pycache__/
 *.py[cod]
