@@ -40,22 +40,58 @@
         - /var/log/metricbeat
         - /usr/share/metricbeat
         - /etc/systemd/system/metricbeat.service.d
+      minio:
+        - /etc/minio
+        - /minio
+        - /usr/local/bin/minio
+        - /etc/systemd/system/minio.service
+        - /usr/local/bin/mc
+        - /root/.mc
 
 - name: Pre-flight checks
   block:
     - name: Check installation status
       block:
-        - name: Check if package is installed
+        - name: Check if package is installed (apt packages)
           shell: "dpkg -l {{ selected_service }} | grep '^ii'"
           register: pkg_check
           changed_when: false
           failed_when: false
           no_log: true
           become: yes
+          when: selected_service != 'minio'
+
+        - name: Check if MinIO binaries exist
+          block:
+            - name: Check if MinIO server is installed
+              stat:
+                path: /usr/local/bin/minio
+              register: minio_binary_check
+              become: yes
+
+            - name: Check if MinIO client is installed
+              stat:
+                path: /usr/local/bin/mc
+              register: mc_binary_check
+              become: yes
+
+            - name: Check if MinIO service exists
+              shell: "systemctl status minio || true"
+              register: minio_service_check
+              changed_when: false
+              failed_when: false
+              become: yes
+              no_log: true
+          when: selected_service == 'minio'
 
         - name: Get package version
           set_fact:
-            pkg_version: "{{ pkg_check.stdout.split()[2] | default('not installed') if pkg_check.rc == 0 else 'not installed' }}"
+            pkg_version: >-
+              {% if selected_service != 'minio' %}
+                {{ pkg_check.stdout.split()[2] | default('not installed') if pkg_check.rc == 0 else 'not installed' }}
+              {% else %}
+                {{ 'Installed' if minio_binary_check.stat.exists | default(false) or mc_binary_check.stat.exists | default(false) else 'Not installed' }}
+              {% endif %}
 
         - name: Check if service exists
           shell: "systemctl status {{ selected_service }} || true"
@@ -218,40 +254,137 @@
 
 - name: Remove service
   block:
-    - name: Stop and disable service
-      systemd:
-        name: "{{ selected_service }}"
-        state: stopped
-        enabled: no
-      failed_when: false
-      no_log: true
-      become: yes
+    # Special handling for MinIO
+    - name: Remove MinIO
+      block:
+        - name: Stop and disable MinIO service
+          systemd:
+            name: "minio"
+            state: stopped
+            enabled: no
+          failed_when: false
+          no_log: true
+          become: yes
 
-    - name: Remove package
-      apt:
-        name: "{{ selected_service }}"
-        state: absent
-        purge: yes
-        autoremove: yes
-      become: yes
+        - name: Prompt about data directory
+          pause:
+            prompt: |
+              Do you want to remove the MinIO data directory (/minio/data)?
+              WARNING: This will delete all data in the S3 storage.
+              Enter 'yes' to delete, anything else to keep:
+          register: delete_data_prompt
+          run_once: true
+          delegate_to: localhost
 
-    - name: Remove all service directories
-      file:
-        path: "{{ item }}"
-        state: absent
-      loop: "{{ service_dirs[selected_service] }}"
-      become: yes
+        - name: Set data directory variable
+          set_fact:
+            remove_data_dir: "{{ delete_data_prompt.user_input | lower == 'yes' }}"
+          delegate_to: localhost
+          run_once: true
 
+        - name: Remove MinIO files but preserve data directory if requested
+          file:
+            path: "{{ item }}"
+            state: absent
+          with_items:
+            - /etc/minio
+            - /etc/systemd/system/minio.service
+            - /usr/local/bin/minio
+            - /usr/local/bin/mc
+            - /root/.mc
+          become: yes
+
+        - name: Remove data directory if confirmed
+          file:
+            path: "/minio/data"
+            state: absent
+          become: yes
+          when: remove_data_dir | bool
+          
+        - name: Remove minio directory if empty
+          shell: "rmdir /minio 2>/dev/null || true"
+          become: yes
+          changed_when: false
+
+        # Cleanup controller config files
+        - name: Ask about controller config files
+          pause:
+            prompt: |
+              Do you want to cleanup MinIO configuration files on the controller?
+              (This will backup and remove files in ~/.elasticsearch/)
+              Enter 'yes' to clean up:
+          register: cleanup_controller_configs
+          run_once: true
+          delegate_to: localhost
+
+        - name: Cleanup controller config files
+          block:
+            - name: Ensure backups directory exists
+              file:
+                path: "{{ lookup('env', 'HOME') }}/.elasticsearch/backups"
+                state: directory
+                mode: '0700'
+
+            - name: Backup config files before removal
+              shell: |
+                if [ -f "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml" ]; then
+                  cp "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml" "{{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_config.yml.$(date +%Y%m%d%H%M%S)"
+                fi
+                if [ -f "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt" ]; then
+                  cp "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt" "{{ lookup('env', 'HOME') }}/.elasticsearch/backups/minio_repository_command.txt.$(date +%Y%m%d%H%M%S)"
+                fi
+
+            - name: Remove config files
+              file:
+                path: "{{ item }}"
+                state: absent
+              with_items:
+                - "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml"
+                - "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_repository_command.txt"
+          when: cleanup_controller_configs.user_input | lower == 'yes'
+          run_once: true
+          delegate_to: localhost
+      when: selected_service == 'minio'
+      
+    # Standard handling for Elastic components
+    - name: Remove apt-based service
+      block:
+        - name: Stop and disable service
+          systemd:
+            name: "{{ selected_service }}"
+            state: stopped
+            enabled: no
+          failed_when: false
+          no_log: true
+          become: yes
+
+        - name: Remove package
+          apt:
+            name: "{{ selected_service }}"
+            state: absent
+            purge: yes
+            autoremove: yes
+          become: yes
+
+        - name: Remove all service directories
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop: "{{ service_dirs[selected_service] }}"
+          become: yes
+
+        - name: Clean package cache
+          apt:
+            clean: yes
+          become: yes
+          no_log: true
+      when: selected_service != 'minio'
+
+    # Common for all services
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
       become: yes
-
-    - name: Clean package cache
-      apt:
-        clean: yes
-      become: yes
-      no_log: true
   rescue:
     - name: Log removal failure
       set_fact:
@@ -262,21 +395,60 @@
   block:
     - name: Get final status
       block:
-        - name: Check final package status
+        - name: Check final package status (apt packages)
           shell: "dpkg -l {{ selected_service }} || true"
           register: final_pkg_status
           changed_when: false
           failed_when: false
           become: yes
           no_log: true
+          when: selected_service != 'minio'
 
-        - name: Check final service status
+        - name: Check final service status (apt services)
           shell: "systemctl status {{ selected_service }} || true"
           register: final_service_status
           changed_when: false
           failed_when: false
           become: yes
           no_log: true
+          when: selected_service != 'minio'
+          
+        # Special handling for MinIO status check
+        - name: Check final MinIO status
+          block:
+            - name: Check final MinIO server status
+              stat:
+                path: /usr/local/bin/minio
+              register: final_minio_binary
+              become: yes
+
+            - name: Check final MinIO client status
+              stat:
+                path: /usr/local/bin/mc
+              register: final_mc_binary
+              become: yes
+
+            - name: Check final MinIO service status
+              shell: "systemctl status minio || true"
+              register: final_minio_service
+              changed_when: false
+              failed_when: false
+              become: yes
+
+            - name: Check final MinIO data directory
+              stat:
+                path: /minio/data
+              register: final_minio_data
+              become: yes
+              
+            - name: Set MinIO status variables for standard processing
+              set_fact:
+                final_pkg_status:
+                  stdout: "{{ 'MinIO binaries ' + ('not found' if not final_minio_binary.stat.exists and not final_mc_binary.stat.exists else 'remaining') }}"
+                final_service_status:
+                  stdout: "{{ final_minio_service.stdout | default('MinIO service not found') }}"
+                  rc: "{{ final_minio_service.rc | default(1) }}"
+          when: selected_service == 'minio'
 
         - name: Check remaining files
           find:
@@ -342,6 +514,13 @@
                 Failure Reason: {{ hostvars[host].host_final_status.failure_reason }}
                 {% endif %}
 
+              {% if selected_service == 'minio' %}
+              Specific Status:
+                MinIO Server: {{ "Removed" if not hostvars[host].final_minio_binary.stat.exists | default(false) else "Still present" }}
+                MinIO Client: {{ "Removed" if not hostvars[host].final_mc_binary.stat.exists | default(false) else "Still present" }}
+                Data Directory: {{ "Preserved" if hostvars[host].final_minio_data.stat.exists | default(false) else "Removed" }}
+              {% endif %}
+
               {% if (hostvars[host].host_final_status.remaining_files | int) > 0 %}
               Remaining Files ({{ hostvars[host].host_final_status.remaining_files }} found):
               {% for file in hostvars[host].host_final_status.remaining_file_list %}
@@ -359,6 +538,15 @@
               {% set failed_hosts = ansible_play_hosts | map('extract', hostvars) | map(attribute='host_final_status') | selectattr('failed', 'defined') | selectattr('failed') | list %}
               {% if failed_hosts | length > 0 %}
               - Hosts with failures: {{ failed_hosts | length }}
+              {% endif %}
+
+              {% if selected_service == 'minio' %}
+              {% if delete_data_prompt is defined %}
+              Data directory (/minio/data) was {{ "preserved" if not remove_data_dir else "removed" }}.
+              {% endif %}
+              {% if cleanup_controller_configs is defined %}
+              Controller configuration files were {{ "preserved" if cleanup_controller_configs.user_input | lower != 'yes' else "backed up and removed" }}.
+              {% endif %}
               {% endif %}
 
               Execution completed at: {{ ansible_date_time.iso8601 }}

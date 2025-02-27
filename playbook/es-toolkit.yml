@@ -840,10 +840,9 @@
         msg: "Selected utility: {{ utility_file }}"
       when: selected_utility == '1' and service_choice.user_input == '1'
       
-    - name: Set selected service and utility file for MinIO
+    - name: Set selected service for MinIO
       set_fact:
         selected_service: "minio"
-        utility_file: "remove_minio"
       when: >
         (selected_utility == '5' and service_choice.user_input == '5') or
         (selected_utility == '1' and service_choice.user_input == '6')

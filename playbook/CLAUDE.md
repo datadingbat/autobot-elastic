@@ -5,6 +5,7 @@
 - Management interface: `ansible-playbook -i inventory.ini es-toolkit.yml`
 - Add node: `ansible-playbook -i inventory.ini tools/add_es.yml`
 - Generate cluster summary: `ansible-playbook -i inventory.ini tools/cluster_summary_new.yml`
+- Change node role: Select option 2 (Change Service State) > 4 (Change node role) in es-toolkit.yml
 - Check inventory: `cat inventory.ini`
 - Validate playbook: `ansible-playbook --syntax-check playbook.yml`
 
