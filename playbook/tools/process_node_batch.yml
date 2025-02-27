@@ -1,0 +1,102 @@
+---
+# process_node_batch.yml - Included task file to process batches of nodes
+# Variables expected:
+# - current_batch: List of hostnames in the current batch
+# - node_type: Type of nodes being processed (master, data, ml, unknown)
+# - batch_number: Current batch number
+# - total_batches: Total number of batches
+
+- name: Display batch processing start
+  debug:
+    msg: "Processing {{ node_type }} node batch {{ batch_number }}/{{ total_batches }} ({{ current_batch | length }} nodes)"
+  delegate_to: localhost
+  run_once: true
+
+- name: Process each node in the batch
+  block:
+    - name: Update service state on nodes in batch
+      systemd:
+        name: "{{ selected_service }}"
+        state: "{{ target_state }}"
+      become: yes
+      delegate_to: "{{ item }}"
+      loop: "{{ current_batch }}" 
+      register: batch_results
+
+    - name: Wait for service startup on each node (if starting)
+      wait_for:
+        timeout: 15
+      loop: "{{ current_batch }}"
+      delegate_to: "{{ item }}"
+      when: target_state not in ['stopped']
+  delegate_to: localhost
+  run_once: true
+
+- name: Check cluster health after batch
+  uri:
+    url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+    method: GET
+    user: elastic
+    password: "{{ elastic_password }}"
+    force_basic_auth: yes
+    validate_certs: no
+    return_content: yes
+  register: post_batch_health
+  run_once: true
+  delegate_to: localhost
+  when: is_elasticsearch_operation and has_hot_nodes and elastic_password is defined
+  ignore_errors: yes
+  no_log: true
+  
+- name: Display post-batch cluster health
+  debug:
+    msg: |
+      Batch {{ batch_number }}/{{ total_batches }} complete
+      
+      Current cluster health:
+      - Status: {{ post_batch_health.json.status | default('unknown') }}
+      - Nodes: {{ post_batch_health.json.number_of_nodes | default('unknown') }}
+      - Active shards: {{ post_batch_health.json.active_shards | default('unknown') }}
+      - Relocating shards: {{ post_batch_health.json.relocating_shards | default('unknown') }}
+      - Initializing shards: {{ post_batch_health.json.initializing_shards | default('unknown') }}
+      - Unassigned shards: {{ post_batch_health.json.unassigned_shards | default('unknown') }}
+      
+      Waiting {{ final_wait_seconds }} seconds before proceeding to next batch...
+  run_once: true
+  delegate_to: localhost
+  when: is_elasticsearch_operation and post_batch_health is defined and post_batch_health.status == 200
+  
+- name: Wait for cluster to stabilize between batches
+  pause:
+    seconds: "{{ final_wait_seconds }}"
+  run_once: true
+  delegate_to: localhost
+  when: batch_number < total_batches
+  
+- name: Check for serious cluster issues
+  block:
+    - name: Validate cluster is operational
+      fail:
+        msg: "CRITICAL: Cluster health is RED. Rolling restart has been halted to prevent data loss. Please check the cluster status manually before resuming."
+      when: post_batch_health.json.status == 'red'
+      
+    - name: Prompt for confirmation to continue if in yellow state
+      pause:
+        prompt: |
+          WARNING: Cluster health is YELLOW after processing batch {{ batch_number }}.
+          
+          This typically indicates replica shards are not fully allocated.
+          - Unassigned shards: {{ post_batch_health.json.unassigned_shards }}
+          - Initializing shards: {{ post_batch_health.json.initializing_shards }}
+          - Relocating shards: {{ post_batch_health.json.relocating_shards }}
+          
+          Do you want to continue with the next batch? (yes/no)
+      register: continue_yellow
+      when: post_batch_health.json.status == 'yellow'
+      
+    - name: Exit if not confirmed
+      meta: end_play
+      when: post_batch_health.json.status == 'yellow' and continue_yellow.user_input | lower != 'yes'
+  run_once: true
+  delegate_to: localhost
+  when: is_elasticsearch_operation and post_batch_health is defined and post_batch_health.status == 200

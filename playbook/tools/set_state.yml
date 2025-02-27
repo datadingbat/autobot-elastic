@@ -15,6 +15,16 @@
       fail:
         msg: "Invalid target state. Must be 'started', 'stopped', 'restarted', or 'change_role'"
       when: target_state not in ['started', 'stopped', 'restarted', 'change_role']
+      
+    # Set default variables for batching and safety features
+    - name: Set default batch variables
+      set_fact:
+        batch_size: 5  # Default to 5 nodes per batch
+        wait_seconds: 60  # Default to wait 60 seconds between batches
+        safety_checks: true  # Default to running safety checks
+        skip_health_checks: false  # Default to running health checks
+      run_once: true
+      delegate_to: localhost
     
     # Validate node role if changing roles
     - name: Validate node role selection
@@ -30,6 +40,161 @@
         node_role_type not in ['master', 'hot', 'frozen', 'ml']
   run_once: true
   delegate_to: localhost
+
+- name: Configure batch parameters for large clusters
+  block:
+    - name: Count target hosts
+      set_fact:
+        target_host_count: "{{ ansible_play_hosts | length }}"
+      run_once: true
+      delegate_to: localhost
+    
+    - name: Prompt for batch settings if large target group detected
+      pause:
+        prompt: |
+          You are about to make changes to {{ target_host_count }} hosts.
+          For large clusters, a rolling update is recommended.
+          
+          How many nodes would you like to update per batch? [default: 5]
+          (Enter a number between 1 and {{ target_host_count }}, or 'all' to update all at once)
+      register: batch_size_input
+      run_once: true
+      delegate_to: localhost
+      when: target_host_count > 10 and (target_state == 'restarted' or target_state == 'stopped')
+      
+    - name: Prompt for wait time between batches
+      pause:
+        prompt: |
+          How many seconds would you like to wait between batches? [default: 60]
+          (This allows time for the cluster to stabilize between batches)
+      register: wait_time_input
+      run_once: true
+      delegate_to: localhost
+      when: target_host_count > 10 and (target_state == 'restarted' or target_state == 'stopped') and (batch_size_input.user_input | default('') != 'all')
+      
+    - name: Set final batch settings
+      set_fact:
+        final_batch_size: >-
+          {% if batch_size_input is not defined or batch_size_input.user_input | default('') == '' %}
+            5
+          {% elif batch_size_input.user_input | lower == 'all' %}
+            {{ target_host_count }}
+          {% else %}
+            {{ batch_size_input.user_input | int }}
+          {% endif %}
+        final_wait_seconds: >-
+          {% if wait_time_input is not defined or wait_time_input.user_input | default('') == '' %}
+            60
+          {% else %}
+            {{ wait_time_input.user_input | int }}
+          {% endif %}
+        use_batching: >-
+          {% if batch_size_input is not defined %}
+            {{ target_host_count > 10 }}
+          {% elif batch_size_input.user_input | default('') == 'all' %}
+            false
+          {% else %}
+            true
+          {% endif %}
+      run_once: true
+      delegate_to: localhost
+      when: target_host_count > 1
+      
+    - name: Display batch configuration
+      debug:
+        msg: |
+          Batch configuration:
+          - Total hosts: {{ target_host_count }}
+          - Hosts per batch: {{ final_batch_size if use_batching else 'All at once' }}
+          - Wait between batches: {{ final_wait_seconds if use_batching else 'N/A' }} seconds
+      run_once: true
+      delegate_to: localhost
+      when: target_host_count > 1
+
+- name: Perform Elasticsearch health checks
+  block:
+    - name: Check if this is an Elasticsearch operation
+      set_fact:
+        is_elasticsearch_operation: "{{ selected_service == 'elasticsearch' }}"
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Get elastic password for API calls
+      shell: "cat {{ lookup('env', 'HOME') }}/.elasticsearch/elastic_password.txt 2>/dev/null || echo ''"
+      register: elastic_password_lookup
+      run_once: true
+      delegate_to: localhost
+      when: is_elasticsearch_operation
+      no_log: true
+      
+    - name: Set elastic password
+      set_fact:
+        elastic_password: "{{ elastic_password_lookup.stdout | trim }}"
+      run_once: true
+      delegate_to: localhost
+      when: is_elasticsearch_operation and elastic_password_lookup.stdout | trim != ''
+      no_log: true
+      
+    - name: Check for hot nodes
+      set_fact:
+        has_hot_nodes: "{{ groups['hot_nodes'] is defined and groups['hot_nodes'] | length > 0 }}"
+      run_once: true
+      delegate_to: localhost
+      when: is_elasticsearch_operation
+      
+    - name: Check cluster health before changes
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: initial_health
+      run_once: true
+      delegate_to: localhost
+      when: is_elasticsearch_operation and has_hot_nodes and elastic_password is defined
+      ignore_errors: yes
+      no_log: true
+      
+    - name: Display initial cluster health
+      debug:
+        msg: |
+          Initial Elasticsearch cluster health:
+          - Status: {{ initial_health.json.status | default('unknown') }}
+          - Nodes: {{ initial_health.json.number_of_nodes | default('unknown') }}
+          - Data nodes: {{ initial_health.json.number_of_data_nodes | default('unknown') }}
+          - Active shards: {{ initial_health.json.active_shards | default('unknown') }}
+          - Relocating shards: {{ initial_health.json.relocating_shards | default('unknown') }}
+          - Initializing shards: {{ initial_health.json.initializing_shards | default('unknown') }}
+          - Unassigned shards: {{ initial_health.json.unassigned_shards | default('unknown') }}
+      run_once: true
+      delegate_to: localhost
+      when: is_elasticsearch_operation and has_hot_nodes and initial_health is defined and initial_health.status == 200
+      
+    - name: Confirm if changes should proceed on the cluster
+      pause:
+        prompt: |
+          About to perform {{ target_state }} operation on {{ target_host_count }} Elasticsearch node(s).
+          
+          {% if initial_health is defined and initial_health.status == 200 %}
+          Current cluster health is {{ initial_health.json.status }}.
+          {% else %}
+          Unable to determine current cluster health.
+          {% endif %}
+          
+          Do you want to proceed? (yes/no)
+      register: es_proceed_confirm
+      run_once: true
+      delegate_to: localhost
+      when: is_elasticsearch_operation and target_host_count > 0
+      
+    - name: Exit if not confirmed
+      meta: end_play
+      when: is_elasticsearch_operation and es_proceed_confirm is defined and es_proceed_confirm.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
 
 - name: Main utility tasks
   block:
@@ -152,23 +317,156 @@
                 {%- else -%}
                 failed
                 {%- endif -%}
+              original_hostname: "{{ inventory_hostname }}"
+              node_type: >-
+                {%- if selected_service == 'elasticsearch' and inventory_hostname in groups['master_nodes'] | default([]) -%}
+                master
+                {%- elif selected_service == 'elasticsearch' and inventory_hostname in groups['hot_nodes'] | default([]) -%}
+                hot
+                {%- elif selected_service == 'elasticsearch' and inventory_hostname in groups['frozen_nodes'] | default([]) -%}
+                frozen
+                {%- elif selected_service == 'elasticsearch' and inventory_hostname in groups['ml_nodes'] | default([]) -%}
+                ml
+                {%- else -%}
+                unknown
+                {%- endif -%}
           when: target_state != 'change_role'
-
-        - name: Manage service state
-          systemd:
-            name: "{{ selected_service }}"
-            state: "{{ target_state }}"
-          failed_when: false
-          become: yes
-          register: state_change_result
-          when: local_host_info.initial_state != 'not installed' and target_state != 'change_role'
-
-        - name: Wait for service state change
-          wait_for:
-            timeout: 10
-          when: 
-            - target_state not in ['stopped', 'change_role']
-            - local_host_info.initial_state != 'not installed'
+          
+        # Create host groups for batching
+        - name: Share host info for batch grouping
+          set_fact:
+            all_hosts_info: "{{ all_hosts_info | default({}) | combine({inventory_hostname: local_host_info}) }}"
+          run_once: true
+          delegate_to: localhost
+          when: target_state != 'change_role' and target_host_count > 1
+          
+        - name: Group hosts by type for ordered operations
+          set_fact:
+            host_groups:
+              unknown_nodes: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.node_type', 'equalto', 'unknown') | map(attribute='local_host_info.original_hostname') | list }}"
+              data_nodes: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.node_type', 'equalto', 'hot') | map(attribute='local_host_info.original_hostname') | list 
+                          + ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.node_type', 'equalto', 'frozen') | map(attribute='local_host_info.original_hostname') | list }}"
+              ml_nodes: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.node_type', 'equalto', 'ml') | map(attribute='local_host_info.original_hostname') | list }}"
+              master_nodes: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.node_type', 'equalto', 'master') | map(attribute='local_host_info.original_hostname') | list }}"
+          run_once: true
+          delegate_to: localhost
+          when: target_state != 'change_role' and target_host_count > 1 and selected_service == 'elasticsearch'
+          
+        - name: Create batches for each node type
+          set_fact:
+            batched_hosts: "{{ batched_hosts | default({}) | combine({
+              'unknown_nodes': unknown_node_batches,
+              'data_nodes': data_node_batches,
+              'ml_nodes': ml_node_batches,
+              'master_nodes': master_node_batches
+            }) }}"
+          vars:
+            unknown_node_batches: "{{ host_groups.unknown_nodes | batch(final_batch_size | int) | list }}"
+            data_node_batches: "{{ host_groups.data_nodes | batch(final_batch_size | int) | list }}"
+            ml_node_batches: "{{ host_groups.ml_nodes | batch(final_batch_size | int) | list }}"
+            master_node_batches: "{{ host_groups.master_nodes | batch(final_batch_size | int) | list }}"
+          run_once: true
+          delegate_to: localhost
+          when: target_state != 'change_role' and use_batching | bool and target_host_count > 1 and selected_service == 'elasticsearch'
+          
+        - name: Display batch plan
+          debug:
+            msg: |
+              Rolling update plan for Elasticsearch cluster:
+              
+              1. Unknown nodes: {{ host_groups.unknown_nodes | length }} nodes in {{ batched_hosts.unknown_nodes | length }} batches
+              2. Data nodes: {{ host_groups.data_nodes | length }} nodes in {{ batched_hosts.data_nodes | length }} batches
+              3. ML nodes: {{ host_groups.ml_nodes | length }} nodes in {{ batched_hosts.ml_nodes | length }} batches
+              4. Master nodes: {{ host_groups.master_nodes | length }} nodes in {{ batched_hosts.master_nodes | length }} batches
+              
+              Total: {{ target_host_count }} nodes
+              Wait time between batches: {{ final_wait_seconds }} seconds
+          run_once: true
+          delegate_to: localhost
+          when: target_state != 'change_role' and use_batching | bool and target_host_count > 1 and selected_service == 'elasticsearch' and batched_hosts is defined
+      
+        # Execution for non-batched operations (non-Elasticsearch or small clusters)
+        - name: Execute standard service state change (no batching)
+          block:
+            - name: Manage service state (no batching)
+              systemd:
+                name: "{{ selected_service }}"
+                state: "{{ target_state }}"
+              failed_when: false
+              become: yes
+              register: state_change_result
+              when: local_host_info.initial_state != 'not installed'
+              
+            - name: Wait for service startup
+              wait_for:
+                timeout: 10
+              when: 
+                - target_state not in ['stopped', 'change_role']
+                - local_host_info.initial_state != 'not installed'
+          when: >
+            target_state != 'change_role' and 
+            (not use_batching | bool or selected_service != 'elasticsearch')
+            
+        # Execution for batched operations (Elasticsearch with many nodes)
+        - name: Execute batched service state changes
+          block:
+            # Unknown nodes - Process in batches
+            - name: Process unknown node batches
+              include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
+              vars:
+                current_batch: "{{ item }}"
+                node_type: "unknown"
+                batch_number: "{{ loop.index }}"
+                total_batches: "{{ batched_hosts.unknown_nodes | length }}"
+              with_items: "{{ batched_hosts.unknown_nodes }}"
+              run_once: true
+              delegate_to: localhost
+              when: batched_hosts.unknown_nodes | length > 0
+              
+            # Data nodes - Process in batches
+            - name: Process data node batches
+              include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
+              vars:
+                current_batch: "{{ item }}"
+                node_type: "data"
+                batch_number: "{{ loop.index }}"
+                total_batches: "{{ batched_hosts.data_nodes | length }}"
+              with_items: "{{ batched_hosts.data_nodes }}"
+              run_once: true
+              delegate_to: localhost
+              when: batched_hosts.data_nodes | length > 0
+            
+            # ML nodes - Process in batches  
+            - name: Process ML node batches
+              include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
+              vars:
+                current_batch: "{{ item }}"
+                node_type: "ml"
+                batch_number: "{{ loop.index }}"
+                total_batches: "{{ batched_hosts.ml_nodes | length }}"
+              with_items: "{{ batched_hosts.ml_nodes }}"
+              run_once: true
+              delegate_to: localhost
+              when: batched_hosts.ml_nodes | length > 0
+              
+            # Master nodes - Process in batches (last)
+            - name: Process master node batches
+              include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
+              vars:
+                current_batch: "{{ item }}"
+                node_type: "master"
+                batch_number: "{{ loop.index }}"
+                total_batches: "{{ batched_hosts.master_nodes | length }}"
+              with_items: "{{ batched_hosts.master_nodes }}"
+              run_once: true
+              delegate_to: localhost
+              when: batched_hosts.master_nodes | length > 0
+          when: >
+            target_state != 'change_role' and 
+            use_batching | bool and 
+            target_host_count > 1 and 
+            selected_service == 'elasticsearch' and 
+            batched_hosts is defined
 
         - name: Get final service status
           shell: "systemctl status {{ selected_service }}"
@@ -223,6 +521,87 @@
       when: target_state != 'change_role'
 
     # Report generation
+    # Perform final health check for Elasticsearch
+    - name: Final Elasticsearch health verification
+      block:
+        - name: Check final cluster health
+          uri:
+            url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: final_health
+          run_once: true
+          delegate_to: localhost
+          when: is_elasticsearch_operation and has_hot_nodes and elastic_password is defined
+          ignore_errors: yes
+          no_log: true
+          
+        - name: Wait longer for cluster stabilization
+          pause:
+            seconds: 30
+          run_once: true
+          delegate_to: localhost
+          when: is_elasticsearch_operation and final_health is defined and final_health.status == 200 and final_health.json.status != 'green'
+          
+        - name: Check final cluster health again
+          uri:
+            url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: final_health_retry
+          run_once: true
+          delegate_to: localhost
+          when: is_elasticsearch_operation and has_hot_nodes and elastic_password is defined and final_health is defined and final_health.json.status != 'green'
+          ignore_errors: yes
+          no_log: true
+          
+        - name: Display final cluster health
+          debug:
+            msg: |
+              FINAL ELASTICSEARCH CLUSTER HEALTH
+              ================================
+              
+              Status: {{ (final_health_retry.json.status | default(final_health.json.status)) | default('unknown') | upper }}
+              Nodes: {{ (final_health_retry.json.number_of_nodes | default(final_health.json.number_of_nodes)) | default('unknown') }}
+              Data Nodes: {{ (final_health_retry.json.number_of_data_nodes | default(final_health.json.number_of_data_nodes)) | default('unknown') }}
+              Active Shards: {{ (final_health_retry.json.active_shards | default(final_health.json.active_shards)) | default('unknown') }}
+              
+              Shard Status:
+              - Initializing: {{ (final_health_retry.json.initializing_shards | default(final_health.json.initializing_shards)) | default('unknown') }}
+              - Relocating: {{ (final_health_retry.json.relocating_shards | default(final_health.json.relocating_shards)) | default('unknown') }}
+              - Unassigned: {{ (final_health_retry.json.unassigned_shards | default(final_health.json.unassigned_shards)) | default('unknown') }}
+              
+              {% if (final_health_retry.json.status | default(final_health.json.status)) == 'yellow' %}
+              NOTE: Cluster status is YELLOW. This usually indicates that some replica shards
+              are not allocated. The cluster is operational but does not have full redundancy.
+              {% elif (final_health_retry.json.status | default(final_health.json.status)) == 'red' %}
+              WARNING: Cluster status is RED. Some primary shards are not allocated.
+              This indicates data may be unavailable. Immediate investigation is required.
+              {% elif (final_health_retry.json.status | default(final_health.json.status)) == 'green' %}
+              SUCCESS: Cluster status is GREEN. All primary and replica shards are allocated.
+              The cluster is fully operational with complete redundancy.
+              {% endif %}
+              
+              Operation completed at: {{ ansible_date_time.iso8601 }}
+          run_once: true
+          delegate_to: localhost
+          when: is_elasticsearch_operation and final_health is defined and final_health.status == 200
+          
+      when: >
+        target_state != 'change_role' and 
+        selected_service == 'elasticsearch' and 
+        is_elasticsearch_operation and 
+        has_hot_nodes and 
+        elastic_password is defined
+          
     - name: Generate reports
       block:
         - name: Ensure report directory exists on localhost
