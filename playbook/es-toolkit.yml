@@ -906,6 +906,26 @@
           '4': 'change_role'
       when: selected_utility == '2'
       
+    # Prompt for restart wait time if restarting Elasticsearch
+    - name: Prompt for restart wait time
+      pause:
+        prompt: |
+          Enter the wait time in seconds between node restart and health check (default: 30)
+          Press Enter to use the default:
+      register: wait_time_prompt
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input == '3' and
+        selected_service == 'elasticsearch'
+        
+    - name: Set wait time
+      set_fact:
+        restart_wait_seconds: "{{ wait_time_prompt.user_input | default('30') | int }}"
+      when: >
+        selected_utility == '2' and 
+        state_choice.user_input == '3' and
+        selected_service == 'elasticsearch'
+      
     # Handle node role selection if change_role was selected
     - name: Validate service for node role change
       fail:
@@ -918,7 +938,7 @@
     - name: Prompt for node role selection
       pause:
         prompt: |
-          Select the node role type:
+          Select the node role type to CHANGE TO:
           1. Master node (node.roles: [ master ])
           2. Hot node (node.roles: [ data_hot, data_content, ingest, ml, transform, remote_cluster_client ])
           3. Frozen node (node.roles: [ data_frozen, remote_cluster_client ])
@@ -1382,6 +1402,7 @@
           deb_package_path: "{{ deb_package_path | default(omit) }}"
           upgrade_mode: "{{ upgrade_mode | default(omit) }}"  # Added for upgrades
           start_service: "{{ start_service | default(omit)}}"
+          restart_wait_seconds: "{{ restart_wait_seconds | default(30) }}"
           
     # Debug for cluster_summary
     - name: Debug play variables for cluster_summary
@@ -1423,25 +1444,30 @@
       
 # Second play to execute the selected utility
 - name: Execute Selected Utility
+  # Use standard host targeting
   hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
   gather_facts: "{{ hostvars['localhost']['selected_play_vars']['utility_file'] != 'get_state_play' }}"
+  pre_tasks:
+    - name: Setup global variables for all hosts
+      set_fact:
+        selected_service: "{{ hostvars['localhost']['selected_play_vars']['selected_service'] | default(omit) }}"
+        target_state: "{{ hostvars['localhost']['selected_play_vars']['target_state'] | default(omit) }}"
+        node_role_type: "{{ hostvars['localhost']['selected_play_vars']['node_role_type'] | default(omit) }}" 
+        installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] | default(omit) }}"
+        es_version: "{{ hostvars['localhost']['selected_play_vars']['es_version'] | default(omit) }}"
+        component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default(omit) }}"
+        deb_package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default(omit) }}"
+        upgrade_mode: "{{ hostvars['localhost']['selected_play_vars']['upgrade_mode'] | default(omit) }}"
+        start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] | default(omit) }}"
+        restart_wait_seconds: "{{ hostvars['localhost']['selected_play_vars']['restart_wait_seconds'] | default(30) }}"
+        ansible_limit: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
+      run_once: false
   vars:
-    selected_service: "{{ hostvars['localhost']['selected_play_vars']['selected_service'] }}"
-    target_state: "{{ hostvars['localhost']['selected_play_vars']['target_state'] }}"
-    node_role_type: "{{ hostvars['localhost']['selected_play_vars']['node_role_type'] }}"
-    installation_method: "{{ hostvars['localhost']['selected_play_vars']['installation_method'] }}"
-    es_version: "{{ hostvars['localhost']['selected_play_vars']['es_version'] }}"
-    component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] }}"
-    deb_package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] }}"
-    upgrade_mode: "{{ hostvars['localhost']['selected_play_vars']['upgrade_mode'] }}"
-    start_service: "{{ hostvars['localhost']['selected_play_vars']['start_service'] }}"
-    hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
     serial: "{{ '1' if hostvars['localhost']['selected_play_vars']['utility_file'] == 'upgrade_component' else '0' }}"
   tasks:
     - name: Include selected utility
       include_tasks: "tools/{{ hostvars['localhost']['selected_play_vars']['utility_file'] }}.yml"
-      vars:
-        ansible_limit: "{{ hostvars['localhost']['selected_play_vars']['limit'] }}"
+      run_once: false
       when: >
         hostvars['localhost']['selected_play_vars']['utility_file'] != 'deploy_cluster' and 
         (hostvars['localhost']['selected_play_vars']['utility_file'] != 'improved_summary' or 
