@@ -13,10 +13,41 @@
   run_once: true
 
 - name: Load custom configurations if available
-  include_vars:
-    file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
-    name: custom_configs
-  when: custom_config_file.stat.exists
+  block:
+    - name: Attempt to load custom configurations
+      include_vars:
+        file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+        name: custom_configs
+      when: custom_config_file.stat.exists
+  rescue:
+    - name: Handle custom config loading error
+      debug:
+        msg: "Error loading custom_configurations.yml - using empty defaults instead"
+    
+    - name: Set empty custom configs as fallback
+      set_fact:
+        custom_configs:
+          metadata:
+            created_date: "{{ ansible_date_time.iso8601 }}"
+            last_modified_date: "{{ ansible_date_time.iso8601 }}"
+            last_modified_by: "add_es.yml"
+            modification_history:
+              - date: "{{ ansible_date_time.iso8601 }}"
+                tool: "add_es.yml"
+          installation: {}
+          security: {}
+          cluster: {}
+          paths:
+            initial: {}
+            master_nodes: {}
+            hot_nodes: {}
+            frozen_nodes: {}
+            ml_nodes: {}
+          system_tuning:
+            enabled: false
+            heap_sizes: {}
+          node_configurations: {}
+          minio: {'configured': false}
   delegate_to: localhost
   run_once: true
 
@@ -269,27 +300,67 @@
           delegate_to: localhost
           
         - name: Load custom node paths if available
-          include_vars:
-            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
-            name: node_path_configs
+          block:
+            - name: Attempt to load custom node paths
+              include_vars:
+                file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+                name: node_path_configs
+          rescue:
+            - name: Handle custom node paths loading error
+              debug:
+                msg: "Error loading custom_configurations.yml - using empty defaults for node paths"
+            
+            - name: Set empty node path configs as fallback
+              set_fact:
+                node_path_configs:
+                  paths:
+                    master_nodes: {}
+                    hot_nodes: {}
+                    frozen_nodes: {}
+                    ml_nodes: {}
           when: custom_path_config_check.stat.exists
           delegate_to: localhost
           
         # Extract relevant paths for the target role
         - name: Extract paths from custom configurations
           set_fact:
-            custom_role_paths: >-
-              {% if custom_path_config_check.stat.exists and target_role == 'master' and node_path_configs.paths.master_nodes %}
-              {{ node_path_configs.paths.master_nodes }}
-              {% elif custom_path_config_check.stat.exists and target_role == 'hot' and node_path_configs.paths.hot_nodes %}
-              {{ node_path_configs.paths.hot_nodes }}
-              {% elif custom_path_config_check.stat.exists and target_role == 'frozen' and node_path_configs.paths.frozen_nodes %}
-              {{ node_path_configs.paths.frozen_nodes }}
-              {% elif custom_path_config_check.stat.exists and target_role == 'ml' and node_path_configs.paths.ml_nodes %}
-              {{ node_path_configs.paths.ml_nodes }}
-              {% else %}
-              {}
-              {% endif %}
+            custom_role_paths: "{{ {} }}"
+          
+        - name: Set master node paths
+          set_fact:
+            custom_role_paths: "{{ node_path_configs.paths.master_nodes }}"
+          when: 
+            - custom_path_config_check.stat.exists 
+            - target_role == 'master' 
+            - node_path_configs.paths.master_nodes is defined
+            - node_path_configs.paths.master_nodes | type_debug == 'dict'
+            
+        - name: Set hot node paths
+          set_fact:
+            custom_role_paths: "{{ node_path_configs.paths.hot_nodes }}"
+          when: 
+            - custom_path_config_check.stat.exists 
+            - target_role == 'hot' 
+            - node_path_configs.paths.hot_nodes is defined
+            - node_path_configs.paths.hot_nodes | type_debug == 'dict'
+            
+        - name: Set frozen node paths
+          set_fact:
+            custom_role_paths: "{{ node_path_configs.paths.frozen_nodes }}"
+          when: 
+            - custom_path_config_check.stat.exists 
+            - target_role == 'frozen' 
+            - node_path_configs.paths.frozen_nodes is defined
+            - node_path_configs.paths.frozen_nodes | type_debug == 'dict'
+            
+        - name: Set ml node paths
+          set_fact:
+            custom_role_paths: "{{ node_path_configs.paths.ml_nodes }}"
+          when: 
+            - custom_path_config_check.stat.exists 
+            - target_role == 'ml' 
+            - node_path_configs.paths.ml_nodes is defined
+            - node_path_configs.paths.ml_nodes | type_debug == 'dict'
           delegate_to: localhost
         
         - name: Prompt for data path
@@ -373,6 +444,12 @@
       debug:
         msg: "Detected RAM on target node: {{ total_ram_gb.stdout }}GB"
 
+    - name: Debug raw memory calculation
+      debug:
+        msg: 
+          - "Raw RAM detected: {{ total_ram_gb.stdout }} GB"
+          - "Raw calculation: {{ total_ram_gb.stdout|int }} / 2 = {{ (total_ram_gb.stdout|int / 2) }}"
+
     - name: Calculate recommended heap size
       set_fact:
         recommended_heap_size: "{{ [(total_ram_gb.stdout|int / 2)|round|int, 128|int]|min }}"
@@ -450,6 +527,7 @@
     - name: Skip system tuning
       set_fact:
         apply_system_tuning: false
+        final_heap_size: "{{ initial_heap_size }}"
       when: tuning_choice.user_input == '4'
       run_once: true
       delegate_to: localhost
@@ -465,7 +543,7 @@
         msg: |
           System Tuning Configuration:
           - Apply System Tuning: {{ apply_system_tuning }}
-          - JVM Heap Size: {{ final_heap_size }}GB
+          - JVM Heap Size: {{ final_heap_size | default(initial_heap_size) }}GB
       run_once: true
 
 - name: Validate master nodes exist
@@ -625,7 +703,7 @@
 
           Hosts Ready for Installation:
           {% for host in ansible_play_hosts %}
-          {% if not hostvars[host].host_status.installed %}
+          {% if not hostvars[host].host_status.installed and not (hostvars[host].host_status.is_reference_node | default(false)) %}
           - {{ host }}
           {% endif %}
           {% endfor %}
@@ -697,7 +775,7 @@
 
     - name: Import the Elasticsearch GPG key
       shell: |
-        cat "{{ ansible_env.HOME }}/elasticsearch.asc | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg"
+        cat "{{ ansible_env.HOME }}/elasticsearch.asc" | gpg --dearmor > /usr/share/keyrings/elasticsearch-keyring.gpg
       args:
         creates: /usr/share/keyrings/elasticsearch-keyring.gpg
       no_log: true
@@ -1423,9 +1501,62 @@
           run_once: true
           
         - name: Load existing custom configurations
-          include_vars:
-            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
-            name: existing_custom_configs
+          block:
+            - name: Attempt to load existing custom configurations
+              include_vars:
+                file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+                name: existing_custom_configs
+          rescue:
+            - name: Handle custom config loading error
+              debug:
+                msg: "Error loading custom_configurations.yml - using empty defaults for custom configurations"
+              
+            - name: Create default empty custom configs structure
+              set_fact:
+                existing_custom_configs:
+                  metadata:
+                    created_date: "{{ ansible_date_time.iso8601 }}"
+                    last_modified_date: "{{ ansible_date_time.iso8601 }}"
+                    last_modified_by: "add_es.yml"
+                    modification_history:
+                      - date: "{{ ansible_date_time.iso8601 }}"
+                        tool: "add_es.yml"
+                  installation:
+                    method: "{{ installation_method }}"
+                    component_version: "latest"
+                  security:
+                    es_cert_pass: "{{ es_cert_pass }}"
+                    passwords_generated: false
+                  cluster:
+                    name: "{{ cluster_name }}"
+                    current_node_count:
+                      master: "{{ groups['master_nodes'] | length }}"
+                      hot: "{{ groups['hot_nodes'] | length }}"
+                      frozen: "{{ groups['frozen_nodes'] | default([]) | length }}"
+                      ml: "{{ groups['ml_nodes'] | default([]) | length }}"
+                      total: "{{ groups['master_nodes'] | length + groups['hot_nodes'] | length + groups['frozen_nodes'] | default([]) | length + groups['ml_nodes'] | default([]) | length }}"
+                  paths:
+                    initial:
+                      data: "{{ final_paths.data }}"
+                      logs: "{{ final_paths.logs }}"
+                    master_nodes: {}
+                    hot_nodes: {}
+                    frozen_nodes: {}
+                    ml_nodes: {}
+                  system_tuning:
+                    enabled: "{{ apply_system_tuning }}"
+                    heap_sizes:
+                      master: "{{ final_heap_size if target_role == 'master' else 0 }}"
+                      hot: "{{ final_heap_size if target_role == 'hot' else 0 }}"
+                      frozen: "{{ final_heap_size if target_role == 'frozen' else 0 }}"
+                      ml: "{{ final_heap_size if target_role == 'ml' else 0 }}"
+                    vm_settings:
+                      max_map_count: 262144
+                      swappiness: 1
+                      disable_thp: true
+                  node_configurations: {}
+                  minio:
+                    configured: false
           when: custom_config_check.stat.exists
           delegate_to: localhost
           run_once: true
@@ -1496,7 +1627,23 @@
               ---
               # Elasticsearch Custom Configurations
               # Last updated: {{ ansible_date_time.iso8601 }}
+              # Last modified by: add_es.yml
               # This file contains all custom configurations from initial deployment and subsequent operations
+              
+              # File metadata
+              metadata:
+                created_date: "{{ existing_custom_configs.metadata.created_date | default(ansible_date_time.iso8601) }}"
+                last_modified_date: "{{ ansible_date_time.iso8601 }}"
+                last_modified_by: "add_es.yml"
+                modification_history:
+                {% if existing_custom_configs.metadata is defined and existing_custom_configs.metadata.modification_history is defined %}
+                {% for entry in existing_custom_configs.metadata.modification_history %}
+                  - date: "{{ entry.date }}"
+                    tool: "{{ entry.tool }}"
+                {% endfor %}
+                {% endif %}
+                  - date: "{{ ansible_date_time.iso8601 }}"
+                    tool: "add_es.yml"
               
               # Installation and version information
               installation:
@@ -1555,41 +1702,57 @@
                   logs: "{{ existing_custom_configs.paths.initial.logs }}"
                 # Node-specific paths (updated with latest additions)
                 master_nodes:
-                  {% for hostname in new_master_nodes %}
-                  {{ hostname }}:
+                {% if new_master_nodes | length > 0 or (existing_custom_configs.paths.master_nodes.items() | length > 0) %}
+                {% for hostname in new_master_nodes %}
+                  "{{ hostname }}":
                     data: "{{ final_paths.data }}"
                     logs: "{{ final_paths.logs }}"
-                  {% endfor %}
-                  {% for hostname, paths in existing_custom_configs.paths.master_nodes.items() %}
-                  {{ hostname }}: {{ paths }}
-                  {% endfor %}
+                {% endfor %}
+                {% for hostname, paths in existing_custom_configs.paths.master_nodes.items() %}
+                  "{{ hostname }}": {{ paths }}
+                {% endfor %}
+                {% else %}
+                  {}
+                {% endif %}
                 hot_nodes:
-                  {% for hostname in new_hot_nodes %}
-                  {{ hostname }}:
+                {% if new_hot_nodes | length > 0 or (existing_custom_configs.paths.hot_nodes.items() | length > 0) %}
+                {% for hostname in new_hot_nodes %}
+                  "{{ hostname }}":
                     data: "{{ final_paths.data }}"
                     logs: "{{ final_paths.logs }}"
-                  {% endfor %}
-                  {% for hostname, paths in existing_custom_configs.paths.hot_nodes.items() %}
-                  {{ hostname }}: {{ paths }}
-                  {% endfor %}
+                {% endfor %}
+                {% for hostname, paths in existing_custom_configs.paths.hot_nodes.items() %}
+                  "{{ hostname }}": {{ paths }}
+                {% endfor %}
+                {% else %}
+                  {}
+                {% endif %}
                 frozen_nodes:
-                  {% for hostname in new_frozen_nodes %}
-                  {{ hostname }}:
+                {% if new_frozen_nodes | length > 0 or (existing_custom_configs.paths.frozen_nodes.items() | length > 0) %}
+                {% for hostname in new_frozen_nodes %}
+                  "{{ hostname }}":
                     data: "{{ final_paths.data }}"
                     logs: "{{ final_paths.logs }}"
-                  {% endfor %}
-                  {% for hostname, paths in existing_custom_configs.paths.frozen_nodes.items() %}
-                  {{ hostname }}: {{ paths }}
-                  {% endfor %}
+                {% endfor %}
+                {% for hostname, paths in existing_custom_configs.paths.frozen_nodes.items() %}
+                  "{{ hostname }}": {{ paths }}
+                {% endfor %}
+                {% else %}
+                  {}
+                {% endif %}
                 ml_nodes:
-                  {% for hostname in new_ml_nodes %}
-                  {{ hostname }}:
+                {% if new_ml_nodes | length > 0 or (existing_custom_configs.paths.ml_nodes.items() | length > 0) %}
+                {% for hostname in new_ml_nodes %}
+                  "{{ hostname }}":
                     data: "{{ final_paths.data }}"
                     logs: "{{ final_paths.logs }}"
-                  {% endfor %}
-                  {% for hostname, paths in existing_custom_configs.paths.ml_nodes.items() %}
-                  {{ hostname }}: {{ paths }}
-                  {% endfor %}
+                {% endfor %}
+                {% for hostname, paths in existing_custom_configs.paths.ml_nodes.items() %}
+                  "{{ hostname }}": {{ paths }}
+                {% endfor %}
+                {% else %}
+                  {}
+                {% endif %}
               
               # System tuning
               system_tuning:
@@ -1606,8 +1769,9 @@
               
               # Node-specific configurations
               node_configurations:
+                {% if successful_hosts | length > 0 or (existing_custom_configs.node_configurations.items() | length > 0) %}
                 {% for hostname in successful_hosts %}
-                {{ hostname }}:
+                "{{ hostname }}":
                   role: {% if hostname in groups['master_nodes'] %}master{% elif hostname in groups['hot_nodes'] %}hot{% elif hostname in groups['frozen_nodes'] %}frozen{% elif hostname in groups['ml_nodes'] %}ml{% else %}unknown{% endif %}
                   ansible_host: {{ hostvars[hostname].ansible_host | default(hostname) }}
                   heap_size: {{ final_heap_size }}
@@ -1616,17 +1780,20 @@
                   added_date: {{ ansible_date_time.iso8601 }}
                   system_tuning: {{ apply_system_tuning }}
                   installation_method: {{ installation_method }}
-                {% if installation_method == 'apt' %}
+                  {% if installation_method == 'apt' %}
                   component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}"
-                {% elif installation_method == 'local' %}
+                  {% elif installation_method == 'local' %}
                   package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
-                {% endif %}
+                  {% endif %}
                 {% endfor %}
                 {% for hostname, config in existing_custom_configs.node_configurations.items() %}
                 {% if hostname not in successful_hosts %}
-                {{ hostname }}: {{ config }}
+                "{{ hostname }}": {{ config }}
                 {% endif %}
                 {% endfor %}
+                {% else %}
+                {}
+                {% endif %}
               
               # MinIO configurations (preserved from previous configuration)
               minio: {{ existing_custom_configs.minio }}
@@ -1638,12 +1805,23 @@
           
         # Update main operations log file
         - name: Load existing operations log
-          include_vars:
-            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
-            name: current_operations
+          block:
+            - name: Attempt to load existing operations log
+              include_vars:
+                file: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+                name: current_operations
+              when: operations_log_file.stat.exists
+          rescue:
+            - name: Handle operations log loading error
+              debug:
+                msg: "Error loading operations_log.yml - using empty operations list instead"
+              
+            - name: Set empty operations as fallback
+              set_fact:
+                current_operations:
+                  operations: []
           delegate_to: localhost
           run_once: true
-          when: operations_log_file.stat.exists
 
         - name: Create empty operations list if file doesn't exist
           set_fact:
@@ -1671,11 +1849,11 @@
                   status: "{% if successful_hosts | length == 0 %}No new hosts added{% else %}Added {{ successful_hosts | length }} host(s){% endif %}"
                   configuration:
                     installation_method: "{{ installation_method }}"
-                  {% if installation_method == 'apt' %}
+                    {% if installation_method == 'apt' %}
                     component_version: "{{ hostvars['localhost']['selected_play_vars']['component_version'] | default('latest') }}"
-                  {% elif installation_method == 'local' %}
+                    {% elif installation_method == 'local' %}
                     package_path: "{{ hostvars['localhost']['selected_play_vars']['deb_package_path'] | default('') }}"
-                  {% endif %}
+                    {% endif %}
                     data_path: "{{ final_paths.data }}"
                     log_path: "{{ final_paths.logs }}"
                     heap_size: "{{ final_heap_size }}"

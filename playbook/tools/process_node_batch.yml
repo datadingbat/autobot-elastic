@@ -6,31 +6,68 @@
 # - batch_number: Current batch number
 # - total_batches: Total number of batches
 
-- name: Display batch processing start
+- name: Display batch processing start (SINGLE NODE)
   debug:
-    msg: "Processing {{ node_type }} node batch {{ batch_number }}/{{ total_batches }} ({{ current_batch | length }} nodes)"
+    msg: |
+      ===========================================================
+      STARTING {{ node_type }} NODE RESTART: {{ current_batch }}
+      ===========================================================
+      Progress: Node {{ batch_number }} of {{ total_batches }}
+      This is a sequential restart - only ONE node at a time
   delegate_to: localhost
   run_once: true
 
-- name: Process each node in the batch
+- name: Process the current node (one at a time)
   block:
-    - name: Update service state on nodes in batch
+    - name: Ensure log directory exists for restart log
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Ensure log file exists for entry
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt"
+        state: touch
+        mode: "0664"
+      delegate_to: localhost
+      run_once: true
+    
+    - name: Log restart initiation to file BEFORE restarting
+      shell: |
+        echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] RESTART INITIATED: {{ current_batch }} ({{ node_type }})" >> {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
+      delegate_to: localhost
+      run_once: true
+
+    - name: Announce node restart
+      debug:
+        msg: |
+          ==========================================
+          RESTARTING NODE: {{ current_batch }}
+          ==========================================
+          $(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')
+      run_once: true
+      delegate_to: localhost
+      
+    - name: Update service state on the current node
       systemd:
         name: "{{ selected_service }}"
         state: "{{ target_state }}"
       become: yes
-      delegate_to: "{{ item }}"
-      loop: "{{ current_batch }}" 
+      delegate_to: "{{ current_batch }}"
       register: batch_results
+      run_once: true
 
-    - name: Wait for service startup on each node (if starting)
+    - name: Wait for service startup (if starting)
       wait_for:
-        timeout: 15
-      loop: "{{ current_batch }}"
-      delegate_to: "{{ item }}"
+        timeout: "{{ restart_wait_seconds | default(30) | int }}"
+      delegate_to: "{{ current_batch }}"
       when: target_state not in ['stopped']
-  delegate_to: localhost
-  run_once: true
+      run_once: true
+
+# No additional wait needed - we go straight to health checks
 
 - name: Check cluster health after batch
   uri:
@@ -51,7 +88,7 @@
 - name: Display post-batch cluster health
   debug:
     msg: |
-      Batch {{ batch_number }}/{{ total_batches }} complete
+      Node {{ current_batch }} restart complete ({{ batch_number }}/{{ total_batches }})
       
       Current cluster health:
       - Status: {{ post_batch_health.json.status | default('unknown') }}
@@ -61,42 +98,136 @@
       - Initializing shards: {{ post_batch_health.json.initializing_shards | default('unknown') }}
       - Unassigned shards: {{ post_batch_health.json.unassigned_shards | default('unknown') }}
       
-      Waiting {{ final_wait_seconds }} seconds before proceeding to next batch...
+      Checking for GREEN status before proceeding to next node...
   run_once: true
   delegate_to: localhost
   when: is_elasticsearch_operation and post_batch_health is defined and post_batch_health.status == 200
   
-- name: Wait for cluster to stabilize between batches
-  pause:
-    seconds: "{{ final_wait_seconds }}"
+- name: Wait for cluster to return to GREEN status before proceeding to next node
+  block:
+    - name: Initial health check after node restart
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: initial_health_check
+      no_log: true
+    
+    - name: Display initial health status
+      debug:
+        msg: |
+          Checking cluster health after restarting node: {{ current_batch }}
+          Current status: {{ initial_health_check.json.status | upper }}
+          Active shards: {{ initial_health_check.json.active_shards_percent_as_number }}%
+          Unassigned shards: {{ initial_health_check.json.unassigned_shards }}
+          
+          {% if initial_health_check.json.status != 'green' %}
+          ⚠️ Waiting for cluster to return to GREEN status before proceeding...
+          Polling every 10 seconds (will wait indefinitely)
+          {% else %}
+          ✅ Cluster is already GREEN - Safe to proceed
+          {% endif %}
+      
+    - name: Poll cluster health until green (no timeout)
+      uri:
+        url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+      register: health_check
+      until: health_check.json.status == 'green'
+      retries: 999999  # Effectively infinite retries - will never timeout
+      delay: 10        # Check every 10 seconds
+      no_log: true
+      when: initial_health_check.json.status != 'green'
+      
+    - name: Set health_check for green clusters that don't need polling
+      set_fact:
+        health_check: "{{ initial_health_check }}"
+      when: initial_health_check.json.status == 'green'
+      
+    - name: Display GREEN confirmation
+      debug:
+        msg: |
+          **********************************************************************
+          ✅✅✅ CLUSTER HEALTH: GREEN AFTER NODE {{ current_batch }} RESTART ✅✅✅
+          **********************************************************************
+          All primary and replica shards allocated.
+          Safe to proceed to next node.
+          
+          Node progress: {{ batch_number }}/{{ total_batches }}
+        verbosity: 0  # Force display at all verbosity levels
+      
+    - name: Create log file if it doesn't exist
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt"
+        state: touch
+        mode: "0664"
+      delegate_to: localhost
+      run_once: true
+    
+    - name: Append node restart details to log
+      shell: |
+        echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] GREEN HEALTH CONFIRMED: {{ current_batch }} ({{ node_type }}) - Status: {{ health_check.json.status | upper }}, Nodes: {{ health_check.json.number_of_nodes }}, Shards: {{ health_check.json.active_shards_percent_as_number }}%" >> {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Display cluster health after node restart
+      debug:
+        msg: |
+          ==========================================
+          NODE RESTART COMPLETE: {{ current_batch }}
+          ==========================================
+          
+          Cluster health after restart:
+          - Current status: {{ health_check.json.status | default('unknown') | upper }}
+          - All nodes: {{ health_check.json.number_of_nodes }}
+          - Data nodes: {{ health_check.json.number_of_data_nodes }}
+          - Active shards: {{ health_check.json.active_shards_percent_as_number }}%
+          
+          Shard Status:
+          - Active: {{ health_check.json.active_shards }}
+          - Initializing: {{ health_check.json.initializing_shards }}
+          - Relocating: {{ health_check.json.relocating_shards }}
+          - Unassigned: {{ health_check.json.unassigned_shards }}
+          
+          {% if health_check.json.status == 'green' %}
+          ✅ CLUSTER IS GREEN - Safe to proceed to next node
+          {% else %}
+          ⚠️ CLUSTER IS NOT GREEN - Will continue to wait for GREEN status
+          {% endif %}
+          
+          Node progress: {{ batch_number }}/{{ total_batches }} complete
+          Polling interval: 10 seconds between health checks
+          
+    # No additional wait time needed - we've already waited for GREEN status
+    - name: Confirm moving to next node
+      debug: 
+        msg: |
+          --------------------------------------------------------------
+          ✓ NODE {{ current_batch }} RESTART COMPLETE - Moving to next node
+          --------------------------------------------------------------
+      delegate_to: localhost
+      run_once: true
+      
   run_once: true
   delegate_to: localhost
-  when: batch_number < total_batches
+  when: is_elasticsearch_operation and has_hot_nodes and elastic_password is defined
   
-- name: Check for serious cluster issues
+# Check for serious cluster issues is now handled in the polling block above
+- name: Legacy check for serious cluster issues
   block:
     - name: Validate cluster is operational
       fail:
         msg: "CRITICAL: Cluster health is RED. Rolling restart has been halted to prevent data loss. Please check the cluster status manually before resuming."
-      when: post_batch_health.json.status == 'red'
-      
-    - name: Prompt for confirmation to continue if in yellow state
-      pause:
-        prompt: |
-          WARNING: Cluster health is YELLOW after processing batch {{ batch_number }}.
-          
-          This typically indicates replica shards are not fully allocated.
-          - Unassigned shards: {{ post_batch_health.json.unassigned_shards }}
-          - Initializing shards: {{ post_batch_health.json.initializing_shards }}
-          - Relocating shards: {{ post_batch_health.json.relocating_shards }}
-          
-          Do you want to continue with the next batch? (yes/no)
-      register: continue_yellow
-      when: post_batch_health.json.status == 'yellow'
-      
-    - name: Exit if not confirmed
-      meta: end_play
-      when: post_batch_health.json.status == 'yellow' and continue_yellow.user_input | lower != 'yes'
+      when: post_batch_health.json.status == 'red' and health_check is not defined
   run_once: true
   delegate_to: localhost
-  when: is_elasticsearch_operation and post_batch_health is defined and post_batch_health.status == 200
+  when: is_elasticsearch_operation and post_batch_health is defined and post_batch_health.status == 200 and not (batch_number < total_batches and is_elasticsearch_operation and has_hot_nodes and elastic_password is defined)

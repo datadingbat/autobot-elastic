@@ -1,0 +1,71 @@
+---
+# Wrapper for add_es.yml that properly handles reference node selection
+# This allows us to use a reference node for configuration details
+# while still installing on all other nodes in the specified groups
+
+- name: Set target execution groups
+  hosts: localhost
+  gather_facts: no
+  vars_prompt:
+    - name: target_group
+      prompt: |
+        Enter target host group to install Elasticsearch on (e.g. hot_nodes):
+      private: no
+
+    - name: reference_host
+      prompt: |
+        Enter reference host to copy configuration from (or press Enter to skip):
+      private: no
+
+  tasks:
+    - name: Validate target group
+      fail:
+        msg: "Invalid target group: '{{ target_group }}'. This group does not exist in inventory."
+      when: target_group not in groups
+
+    - name: Count hosts in target group
+      set_fact:
+        target_hosts_count: "{{ groups[target_group] | length }}"
+
+    - name: Validate reference host
+      fail:
+        msg: "Reference host '{{ reference_host }}' not found in inventory."
+      when: reference_host != '' and reference_host not in groups['all']
+
+    - name: Create target hosts list
+      set_fact:
+        target_hosts: >-
+          {%- if reference_host != '' -%}
+          {{ groups[target_group] | difference([reference_host]) }}
+          {%- else -%}
+          {{ groups[target_group] }}
+          {%- endif -%}
+
+    - name: Create dynamic inventory
+      add_host:
+        name: "{{ item }}"
+        groups: ["es_install_targets"]
+      with_items: "{{ target_hosts }}"
+
+    - name: Show installation plan
+      debug:
+        msg:
+          - "Target group: {{ target_group }} ({{ target_hosts_count }} hosts)"
+          - "Reference host: {{ reference_host if reference_host != '' else 'None (using default configuration)' }}"
+          - "Installation targets: {{ target_hosts | join(', ') }}"
+          - "Hosts that will be skipped: {{ [] if reference_host == '' else [reference_host] }}"
+
+    - name: Confirm installation
+      pause:
+        prompt: |
+          This will install Elasticsearch on {{ target_hosts | length }} hosts.
+          Press Enter to continue or Ctrl+C to cancel:
+
+- name: Execute add_es on target hosts
+  hosts: es_install_targets
+  gather_facts: yes
+  tasks:
+    - name: Include add_es tasks
+      include_tasks: add_es.yml
+      vars:
+        reference_node: "{{ hostvars['localhost']['reference_host'] }}"

@@ -448,6 +448,11 @@
           command: "filebeat modules enable system"
           register: module_enable
           changed_when: module_enable.rc == 0
+          
+        - name: Enable elasticsearch module
+          command: "filebeat modules enable elasticsearch"
+          register: es_module_enable
+          changed_when: es_module_enable.rc == 0
 
         - name: Configure system module
           copy:
@@ -457,6 +462,23 @@
                 syslog:
                   enabled: true
                 auth:
+                  enabled: true
+            mode: '0644'
+            
+        - name: Configure elasticsearch module
+          copy:
+            dest: /etc/filebeat/modules.d/elasticsearch.yml
+            content: |
+              - module: elasticsearch
+                server:
+                  enabled: true
+                gc:
+                  enabled: true
+                audit:
+                  enabled: true
+                slowlog:
+                  enabled: true
+                deprecation:
                   enabled: true
             mode: '0644'
       rescue:

@@ -454,14 +454,60 @@
           register: custom_config_check
         
         - name: Load existing custom configurations if available
-          include_vars:
-            file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
-            name: existing_custom_configs
+          block:
+            - name: Attempt to load custom configurations
+              include_vars:
+                file: "{{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml"
+                name: existing_custom_configs
+              when: custom_config_check.stat.exists
+          rescue:
+            - name: Handle custom config loading error
+              debug:
+                msg: "Error loading custom_configurations.yml - using empty defaults instead"
+            
+            - name: Backup corrupted configurations file
+              shell: |
+                mkdir -p {{ lookup('env', 'HOME') }}/.elasticsearch/backups
+                cp {{ lookup('env', 'HOME') }}/.elasticsearch/custom_configurations.yml {{ lookup('env', 'HOME') }}/.elasticsearch/backups/custom_configurations.yml.corrupted.$(date +%Y%m%d%H%M%S)
+              ignore_errors: yes
+              when: custom_config_check.stat.exists
+            
+            - name: Set empty custom configs as fallback
+              set_fact:
+                existing_custom_configs:
+                  metadata:
+                    created_date: "{{ ansible_date_time.iso8601 }}"
+                    last_modified_date: "{{ ansible_date_time.iso8601 }}"
+                    last_modified_by: "minio_setup.yml"
+                    modification_history:
+                      - date: "{{ ansible_date_time.iso8601 }}"
+                        tool: "minio_setup.yml"
+                  installation: {}
+                  security: {}
+                  cluster: {}
+                  paths:
+                    initial: {}
+                    master_nodes: {}
+                    hot_nodes: {}
+                    frozen_nodes: {}
+                    ml_nodes: {}
+                  system_tuning:
+                    enabled: false
+                    heap_sizes: {}
+                  node_configurations: {}
+                  minio: {'configured': false}
           when: custom_config_check.stat.exists
         
         - name: Create empty custom configs if file doesn't exist
           set_fact:
             existing_custom_configs:
+              metadata:
+                created_date: "{{ ansible_date_time.iso8601 }}"
+                last_modified_date: "{{ ansible_date_time.iso8601 }}"
+                last_modified_by: "minio_setup.yml"
+                modification_history:
+                  - date: "{{ ansible_date_time.iso8601 }}"
+                    tool: "minio_setup.yml"
               installation: {}
               security: {}
               cluster: {}
@@ -490,7 +536,23 @@
               ---
               # Elasticsearch Custom Configurations
               # Last updated: {{ ansible_date_time.iso8601 }}
+              # Last modified by: minio_setup.yml
               # This file contains all custom configurations from initial deployment and subsequent operations
+              
+              # File metadata
+              metadata:
+                created_date: "{{ existing_custom_configs.metadata.created_date | default(ansible_date_time.iso8601) }}"
+                last_modified_date: "{{ ansible_date_time.iso8601 }}"
+                last_modified_by: "minio_setup.yml"
+                modification_history:
+                {% if existing_custom_configs.metadata is defined and existing_custom_configs.metadata.modification_history is defined %}
+                {% for entry in existing_custom_configs.metadata.modification_history %}
+                  - date: "{{ entry.date }}"
+                    tool: "{{ entry.tool }}"
+                {% endfor %}
+                {% endif %}
+                  - date: "{{ ansible_date_time.iso8601 }}"
+                    tool: "minio_setup.yml"
               
               # Installation and version information
               installation:

@@ -12,9 +12,19 @@
 
     # Get total system memory if not provided
     - name: Get total memory if not provided
-      shell: grep MemTotal /proc/meminfo | awk '{print int($2/1024/1024)}'
+      shell: |
+        # Get total memory in KB, divide by 1024 to get MB, then by 1024 to get GB with proper rounding
+        awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo
       register: mem_info
       changed_when: false
+      delegate_to: "{{ inventory_hostname }}"
+      when: total_ram_gb is not defined
+      
+    - name: Debug memory value from /proc/meminfo
+      debug:
+        msg: 
+          - "Raw memory value from {{ inventory_hostname }}: {{ mem_info.stdout }} GB"
+          - "Command executed directly on target host (not on localhost)"
       when: total_ram_gb is not defined
   
     - name: Set total RAM variable
@@ -32,11 +42,82 @@
   block:
     - name: Calculate heap size
       set_fact:
-        heap_size: "{{ [(total_ram_gb|int / 2)|round|int, 128|int]|min }}"
+        calculated_half_ram: "{{ (total_ram_gb|int / 2)|round|int }}"
+        
+    - name: Apply heap size limits for Elasticsearch
+      set_fact:
+        # For Elasticsearch, use 50% of RAM, with a minimum of 1GB
+        heap_size: "{% if calculated_half_ram|int < 1 %}1{% else %}{{ calculated_half_ram|int }}{% endif %}"
+        
+    - name: Debug heap size calculation
+      debug:
+        msg:
+          - "Total RAM detected: {{ total_ram_gb }}GB"
+          - "50% of RAM calculation: {{ calculated_half_ram }}GB"
+          - "Final heap size (ensuring at least 1GB): {{ heap_size }}GB"
 
+    - name: Create pre-tuning report
+      copy:
+        content: |
+          PRE-TUNING CONFIRMATION REPORT
+          ============================
+          
+          Target Information:
+          -----------------
+          Host: {{ inventory_hostname }}
+          Service: {{ selected_service }}
+          Total RAM: {{ total_ram_gb }}GB
+          
+          JVM Configuration:
+          ----------------
+          Heap Size: {{ heap_size }}GB (50% of available RAM)
+          
+          System Settings to be Applied:
+          ---------------------------
+          - Disable swap completely
+          - Set vm.max_map_count = 262144
+          - Set vm.swappiness = 1
+          - Disable transparent huge pages
+          - Configure memlock limits to unlimited
+          - Set file descriptor limits to 65535
+          - Set max processes to 4096
+          
+          {% if selected_service == 'elasticsearch' %}
+          Elasticsearch-Specific:
+          --------------------
+          - Configure bootstrap.memory_lock = true
+          - Set JVM min/max heap to {{ heap_size }}GB
+          - Configure G1GC garbage collector with 25% reserve and 30% occupancy threshold
+          {% elif selected_service == 'kibana' %}
+          Kibana-Specific:
+          -------------
+          - Configure Node.js max-old-space-size to {{ heap_size * 1024 }}MB
+          - Set worker.maxWorkerCount based on available CPUs
+          {% endif %}
+        dest: "/tmp/pre_tuning_report.txt"
+      delegate_to: localhost
+      
+    - name: Display pre-tuning report
+      debug:
+        msg: "{{ lookup('file', '/tmp/pre_tuning_report.txt') | split('\n') }}"
+        
+    - name: Prompt for confirmation
+      pause:
+        prompt: |
+          Review the tuning parameters above.
+          Do you want to proceed with applying these changes? (yes/no):
+      register: tuning_confirmation
+      delegate_to: localhost
+      
+    - name: Exit if not confirmed
+      meta: end_play
+      when: tuning_confirmation.user_input | lower not in ['yes', 'y']
+      delegate_to: localhost
+      
     - name: Display calculated values
       debug:
         msg: 
+          - "Tuning confirmed. Proceeding with changes..."
           - "Total RAM: {{ total_ram_gb }}GB"
           - "Calculated heap size: {{ heap_size }}GB"
           - "Service being tuned: {{ selected_service }}"
@@ -220,28 +301,56 @@
     # Verification tasks
     - name: Verify configuration
       block:
-        - name: Check memory lock limits
-          command: ulimit -l
-          register: memlock_result
-          changed_when: false
+        - name: Check if service user exists
+          getent:
+            database: passwd
+            key: "{{ selected_service }}"
+          register: service_user_check
+          ignore_errors: yes
+          
+        - name: Check as service user if possible
+          block:
+            - name: Check memory lock limits
+              command: ulimit -l
+              register: memlock_result
+              changed_when: false
 
-        - name: Check file descriptor limits
-          shell: ulimit -n
-          register: ulimit_result
-          changed_when: false
+            - name: Check file descriptor limits
+              shell: ulimit -n
+              register: ulimit_result
+              changed_when: false
+          become: yes
+          become_user: "{{ selected_service }}"
+          when: service_user_check is succeeded
+          ignore_errors: yes
+          
+        - name: Check as root if service user check failed
+          block:
+            - name: Check memory lock limits as root
+              command: ulimit -l
+              register: memlock_result
+              changed_when: false
+
+            - name: Check file descriptor limits as root
+              shell: ulimit -n
+              register: ulimit_result
+              changed_when: false
+          become: yes
+          when: service_user_check is failed
+          ignore_errors: yes
 
         - name: Display verification results
           debug:
             msg:
-              - "Memory lock limit: {{ memlock_result.stdout }}"
-              - "File descriptor limit: {{ ulimit_result.stdout }}"
+              - "Memory lock limit: {{ memlock_result.stdout | default('Unknown - verification failed') }}"
+              - "File descriptor limit: {{ ulimit_result.stdout | default('Unknown - verification failed') }}"
               - "Heap size configuration: {{ heap_size }}GB"
+              
         - name: Verify max_map_count
           command: sysctl -n vm.max_map_count
           register: max_map_count_result
           changed_when: false
-      become: yes
-      become_user: "{{ selected_service }}"
+          become: yes
       ignore_errors: yes
 
   rescue:

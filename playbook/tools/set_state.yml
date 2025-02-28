@@ -1,6 +1,8 @@
 ---
 # Input validation tasks
 - name: Validate input variables
+  run_once: true
+  delegate_to: localhost
   block:
     - name: Check required variables
       fail:
@@ -19,10 +21,14 @@
     # Set default variables for batching and safety features
     - name: Set default batch variables
       set_fact:
-        batch_size: 5  # Default to 5 nodes per batch
-        wait_seconds: 60  # Default to wait 60 seconds between batches
-        safety_checks: true  # Default to running safety checks
-        skip_health_checks: false  # Default to running health checks
+        batch_size: 1  # Force 1 node per batch for sequential restarts
+        final_batch_size: 1  # Ensure this is also set to 1
+        use_batching: true  # Always use batching for sequential node processing
+        wait_seconds: 0  # No static wait - rely exclusively on cluster health check
+        final_wait_seconds: 0  # No static wait - rely exclusively on cluster health check
+        safety_checks: true  # Always run safety checks
+        skip_health_checks: false  # Always run health checks
+        ansible_date_time_start: "{{ ansible_date_time.epoch }}"  # Record start time for duration calculation
       run_once: true
       delegate_to: localhost
     
@@ -41,75 +47,46 @@
   run_once: true
   delegate_to: localhost
 
-- name: Configure batch parameters for large clusters
+- name: Configure sequential node processing
+  run_once: true
+  delegate_to: localhost
   block:
     - name: Count target hosts
       set_fact:
-        target_host_count: "{{ ansible_play_hosts | length }}"
+        target_host_count: "{{ ansible_play_hosts | length | int }}"
       run_once: true
       delegate_to: localhost
     
-    - name: Prompt for batch settings if large target group detected
-      pause:
-        prompt: |
+    - name: Display sequential restart mode for Elasticsearch
+      debug:
+        msg: |
+          ========================================================
+          ELASTICSEARCH SEQUENTIAL RESTART MODE ENABLED
+          ========================================================
           You are about to make changes to {{ target_host_count }} hosts.
-          For large clusters, a rolling update is recommended.
           
-          How many nodes would you like to update per batch? [default: 5]
-          (Enter a number between 1 and {{ target_host_count }}, or 'all' to update all at once)
-      register: batch_size_input
+          For Elasticsearch, nodes will be restarted:
+          - One at a time (batch size: 1)
+          - With cluster health check between each node
+          - Waiting for GREEN status before proceeding to next node
+          - No timeout - will wait as long as needed for cluster health
+          
+          This ensures maximum cluster stability during restarts.
       run_once: true
       delegate_to: localhost
-      when: target_host_count > 10 and (target_state == 'restarted' or target_state == 'stopped')
-      
-    - name: Prompt for wait time between batches
-      pause:
-        prompt: |
-          How many seconds would you like to wait between batches? [default: 60]
-          (This allows time for the cluster to stabilize between batches)
-      register: wait_time_input
-      run_once: true
-      delegate_to: localhost
-      when: target_host_count > 10 and (target_state == 'restarted' or target_state == 'stopped') and (batch_size_input.user_input | default('') != 'all')
-      
-    - name: Set final batch settings
-      set_fact:
-        final_batch_size: >-
-          {% if batch_size_input is not defined or batch_size_input.user_input | default('') == '' %}
-            5
-          {% elif batch_size_input.user_input | lower == 'all' %}
-            {{ target_host_count }}
-          {% else %}
-            {{ batch_size_input.user_input | int }}
-          {% endif %}
-        final_wait_seconds: >-
-          {% if wait_time_input is not defined or wait_time_input.user_input | default('') == '' %}
-            60
-          {% else %}
-            {{ wait_time_input.user_input | int }}
-          {% endif %}
-        use_batching: >-
-          {% if batch_size_input is not defined %}
-            {{ target_host_count > 10 }}
-          {% elif batch_size_input.user_input | default('') == 'all' %}
-            false
-          {% else %}
-            true
-          {% endif %}
-      run_once: true
-      delegate_to: localhost
-      when: target_host_count > 1
+      when: selected_service == 'elasticsearch' and target_state == 'restarted'
       
     - name: Display batch configuration
       debug:
         msg: |
           Batch configuration:
-          - Total hosts: {{ target_host_count }}
-          - Hosts per batch: {{ final_batch_size if use_batching else 'All at once' }}
-          - Wait between batches: {{ final_wait_seconds if use_batching else 'N/A' }} seconds
+          - Total hosts: {{ target_host_count | int }}
+          - Hosts per batch: 1 (sequential node processing)
+          - Wait between batches: Waiting for GREEN cluster health
+          - Health polling: Yes (every 10s, no timeout)
       run_once: true
       delegate_to: localhost
-      when: target_host_count > 1
+      when: (target_host_count | int) > 1
 
 - name: Perform Elasticsearch health checks
   block:
@@ -162,13 +139,36 @@
       debug:
         msg: |
           Initial Elasticsearch cluster health:
-          - Status: {{ initial_health.json.status | default('unknown') }}
+          - Status: {{ initial_health.json.status | default('unknown') | upper }}
           - Nodes: {{ initial_health.json.number_of_nodes | default('unknown') }}
           - Data nodes: {{ initial_health.json.number_of_data_nodes | default('unknown') }}
           - Active shards: {{ initial_health.json.active_shards | default('unknown') }}
           - Relocating shards: {{ initial_health.json.relocating_shards | default('unknown') }}
           - Initializing shards: {{ initial_health.json.initializing_shards | default('unknown') }}
           - Unassigned shards: {{ initial_health.json.unassigned_shards | default('unknown') }}
+          
+          {% if initial_health.json.status != 'green' and target_state == 'restarted' %}
+          ⚠️ WARNING: Cluster is not GREEN. It's strongly recommended to have a GREEN cluster before restarting nodes.
+          {% endif %}
+      run_once: true
+      delegate_to: localhost
+      when: is_elasticsearch_operation and has_hot_nodes and initial_health is defined and initial_health.status == 200
+      
+    - name: Verify cluster is in GREEN status before restarting
+      block:
+        - name: Check if cluster is GREEN
+          fail:
+            msg: |
+              SAFETY CHECK: Cluster health is not GREEN
+              
+              Current status: {{ initial_health.json.status | upper }}
+              
+              For safety, this playbook requires a GREEN cluster status before starting node restarts.
+              Please resolve any cluster health issues before proceeding.
+              
+              You can check cluster status with:
+              curl -k -u elastic:password https://hostname:9200/_cluster/health
+          when: initial_health.json.status != 'green' and target_state == 'restarted'
       run_once: true
       delegate_to: localhost
       when: is_elasticsearch_operation and has_hot_nodes and initial_health is defined and initial_health.status == 200
@@ -176,19 +176,25 @@
     - name: Confirm if changes should proceed on the cluster
       pause:
         prompt: |
-          About to perform {{ target_state }} operation on {{ target_host_count }} Elasticsearch node(s).
+          About to perform {{ target_state }} operation on {{ target_host_count | int }} Elasticsearch node(s).
           
           {% if initial_health is defined and initial_health.status == 200 %}
-          Current cluster health is {{ initial_health.json.status }}.
+          Current cluster health is {{ initial_health.json.status | upper }}.
           {% else %}
           Unable to determine current cluster health.
           {% endif %}
+          
+          Restart Process:
+          1. Nodes will be restarted one at a time
+          2. After each node restart, the playbook will wait for GREEN cluster health
+          3. If the cluster doesn't return to GREEN, the playbook will wait indefinitely
+          4. The process will only move to the next node when the cluster is GREEN
           
           Do you want to proceed? (yes/no)
       register: es_proceed_confirm
       run_once: true
       delegate_to: localhost
-      when: is_elasticsearch_operation and target_host_count > 0
+      when: is_elasticsearch_operation and (target_host_count | int) > 0
       
     - name: Exit if not confirmed
       meta: end_play
@@ -198,6 +204,31 @@
 
 - name: Main utility tasks
   block:
+    # Initialize restart log for this run
+    - name: Ensure log directory exists
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+      when: (target_state == 'restarted' or (target_state == 'change_role' and restart_prompt is defined and restart_prompt.user_input | lower == 'yes')) and selected_service == 'elasticsearch'
+
+    - name: Backup existing restart log if it exists
+      shell: |
+        if [ -f "{{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt" ]; then
+          cp "{{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt" "{{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.{{ ansible_date_time.iso8601 | regex_replace('[^0-9]', '') }}.bak"
+        fi
+      delegate_to: localhost
+      run_once: true
+      when: (target_state == 'restarted' or (target_state == 'change_role' and restart_prompt is defined and restart_prompt.user_input | lower == 'yes')) and selected_service == 'elasticsearch'
+      
+    - name: Create initial restart log entry
+      shell: |
+        echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] RESTART OPERATION STARTED - Target hosts: {{ ansible_play_hosts | length }}{% if target_state == 'change_role' %} - Role Change Operation{% endif %}" > {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
+      delegate_to: localhost
+      run_once: true
+      when: (target_state == 'restarted' or (target_state == 'change_role' and restart_prompt is defined and restart_prompt.user_input | lower == 'yes')) and selected_service == 'elasticsearch'
     # Node role management
     - name: Change node role
       block:
@@ -269,6 +300,16 @@
           run_once: true
           when: target_state == 'change_role' and role_change_result is changed
           
+        - name: Log role change restart
+          shell: |
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] RESTART INITIATED FOR ROLE CHANGE: {{ inventory_hostname }} - Changed to {{ node_role_type }} role" >> {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
+          delegate_to: localhost
+          run_once: true
+          when: >
+            target_state == 'change_role' and 
+            role_change_result is changed and 
+            restart_prompt.user_input | lower == 'yes'
+
         - name: Restart elasticsearch if confirmed
           systemd:
             name: elasticsearch
@@ -280,11 +321,81 @@
             role_change_result is changed and 
             restart_prompt.user_input | lower == 'yes'
           
+        # Add delay to allow cluster to detect node state change
+        - name: Wait for service restart and cluster recognition
+          wait_for:
+            timeout: 40
+          when: >
+            target_state == 'change_role' and 
+            role_change_result is changed and 
+            restart_prompt.user_input | lower == 'yes'
+          
+        # Check cluster health after role change restart
+        - name: Check cluster health after role change
+          uri:
+            url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: post_role_change_health
+          delegate_to: localhost
+          run_once: true
+          when: >
+            target_state == 'change_role' and 
+            role_change_result is changed and 
+            restart_prompt.user_input | lower == 'yes' and
+            is_elasticsearch_operation and has_hot_nodes and elastic_password is defined
+          ignore_errors: yes
+          no_log: true
+          
+        # Wait for GREEN health after role change
+        - name: Poll cluster health until green (role change)
+          uri:
+            url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
+            method: GET
+            user: elastic
+            password: "{{ elastic_password }}"
+            force_basic_auth: yes
+            validate_certs: no
+            return_content: yes
+          register: role_change_health_check
+          until: role_change_health_check.json.status == 'green'
+          retries: 999999  # Effectively infinite retries - will never timeout
+          delay: 10        # Check every 10 seconds
+          delegate_to: localhost
+          run_once: true
+          when: >
+            target_state == 'change_role' and 
+            role_change_result is changed and 
+            restart_prompt.user_input | lower == 'yes' and
+            is_elasticsearch_operation and has_hot_nodes and elastic_password is defined and
+            post_role_change_health is defined and post_role_change_health.status == 200 and
+            post_role_change_health.json.status != 'green'
+          no_log: true
+          
+        # Log successful health check after role change
+        - name: Log GREEN health after role change
+          shell: |
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] GREEN HEALTH CONFIRMED AFTER ROLE CHANGE: {{ inventory_hostname }} - Status: GREEN, Nodes: {{ role_change_health_check.json.number_of_nodes | default(post_role_change_health.json.number_of_nodes) }}" >> {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
+          delegate_to: localhost
+          run_once: true
+          when: >
+            target_state == 'change_role' and 
+            role_change_result is changed and 
+            restart_prompt.user_input | lower == 'yes' and
+            is_elasticsearch_operation and has_hot_nodes and elastic_password is defined and
+            ((role_change_health_check is defined) or 
+             (post_role_change_health is defined and post_role_change_health.status == 200 and post_role_change_health.json.status == 'green'))
+
         - name: Update host info with restart status
           set_fact:
             local_host_info: "{{ local_host_info | combine({
               'restart_performed': restart_prompt.user_input | lower == 'yes',
-              'restart_success': restart_result is success
+              'restart_success': restart_result is success,
+              'green_health_confirmed': true if ((role_change_health_check is defined) or (post_role_change_health is defined and post_role_change_health.status == 200 and post_role_change_health.json.status == 'green')) else false
             }) }}"
           when: >
             target_state == 'change_role' and 
@@ -338,7 +449,7 @@
             all_hosts_info: "{{ all_hosts_info | default({}) | combine({inventory_hostname: local_host_info}) }}"
           run_once: true
           delegate_to: localhost
-          when: target_state != 'change_role' and target_host_count > 1
+          when: target_state != 'change_role' and (target_host_count | int) > 1
           
         - name: Group hosts by type for ordered operations
           set_fact:
@@ -350,7 +461,22 @@
               master_nodes: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('local_host_info.node_type', 'equalto', 'master') | map(attribute='local_host_info.original_hostname') | list }}"
           run_once: true
           delegate_to: localhost
-          when: target_state != 'change_role' and target_host_count > 1 and selected_service == 'elasticsearch'
+          when: target_state != 'change_role' and (target_host_count | int) > 1 and selected_service == 'elasticsearch'
+          
+        - name: Log node groups to restart log
+          copy:
+            dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt"
+            content: |
+              Node Groups for Processing:
+              - Data nodes ({{ host_groups.data_nodes | length }}): {{ host_groups.data_nodes | join(', ') }}
+              - Master nodes ({{ host_groups.master_nodes | length }}): {{ host_groups.master_nodes | join(', ') }}
+              - ML nodes ({{ host_groups.ml_nodes | length }}): {{ host_groups.ml_nodes | join(', ') }}
+              - Unknown nodes ({{ host_groups.unknown_nodes | length }}): {{ host_groups.unknown_nodes | join(', ') }}
+              
+            mode: a+
+          delegate_to: localhost
+          run_once: true
+          when: target_state == 'restarted' and (target_host_count | int) > 1 and selected_service == 'elasticsearch' and host_groups is defined
           
         - name: Create batches for each node type
           set_fact:
@@ -361,13 +487,15 @@
               'master_nodes': master_node_batches
             }) }}"
           vars:
-            unknown_node_batches: "{{ host_groups.unknown_nodes | batch(final_batch_size | int) | list }}"
-            data_node_batches: "{{ host_groups.data_nodes | batch(final_batch_size | int) | list }}"
-            ml_node_batches: "{{ host_groups.ml_nodes | batch(final_batch_size | int) | list }}"
-            master_node_batches: "{{ host_groups.master_nodes | batch(final_batch_size | int) | list }}"
+            # For our sequential one-at-a-time mode, we don't need to batch
+            # Each host is its own batch
+            unknown_node_batches: "{{ host_groups.unknown_nodes }}"
+            data_node_batches: "{{ host_groups.data_nodes }}"
+            ml_node_batches: "{{ host_groups.ml_nodes }}"
+            master_node_batches: "{{ host_groups.master_nodes }}"
           run_once: true
           delegate_to: localhost
-          when: target_state != 'change_role' and use_batching | bool and target_host_count > 1 and selected_service == 'elasticsearch'
+          when: target_state != 'change_role' and use_batching | bool and (target_host_count | int) > 1 and selected_service == 'elasticsearch'
           
         - name: Display batch plan
           debug:
@@ -379,11 +507,13 @@
               3. ML nodes: {{ host_groups.ml_nodes | length }} nodes in {{ batched_hosts.ml_nodes | length }} batches
               4. Master nodes: {{ host_groups.master_nodes | length }} nodes in {{ batched_hosts.master_nodes | length }} batches
               
-              Total: {{ target_host_count }} nodes
-              Wait time between batches: {{ final_wait_seconds }} seconds
+              Total: {{ target_host_count | int }} nodes
+              Batch size: {{ final_batch_size | int }} node(s) per batch
+              Static wait: {{ final_wait_seconds | int }} seconds
+              Health polling: Yes (every 10s, max 5 min)
           run_once: true
           delegate_to: localhost
-          when: target_state != 'change_role' and use_batching | bool and target_host_count > 1 and selected_service == 'elasticsearch' and batched_hosts is defined
+          when: target_state != 'change_role' and use_batching | bool and (target_host_count | int) > 1 and selected_service == 'elasticsearch' and batched_hosts is defined
       
         # Execution for non-batched operations (non-Elasticsearch or small clusters)
         - name: Execute standard service state change (no batching)
@@ -414,57 +544,49 @@
             - name: Process unknown node batches
               include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
               vars:
-                current_batch: "{{ item }}"
+                current_batch: "{{ item.1 }}"
                 node_type: "unknown"
-                batch_number: "{{ loop.index }}"
+                batch_number: "{{ item.0 + 1 }}"
                 total_batches: "{{ batched_hosts.unknown_nodes | length }}"
-              with_items: "{{ batched_hosts.unknown_nodes }}"
-              run_once: true
-              delegate_to: localhost
+              with_indexed_items: "{{ batched_hosts.unknown_nodes }}"
               when: batched_hosts.unknown_nodes | length > 0
               
             # Data nodes - Process in batches
             - name: Process data node batches
               include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
               vars:
-                current_batch: "{{ item }}"
+                current_batch: "{{ item.1 }}"
                 node_type: "data"
-                batch_number: "{{ loop.index }}"
+                batch_number: "{{ item.0 + 1 }}"
                 total_batches: "{{ batched_hosts.data_nodes | length }}"
-              with_items: "{{ batched_hosts.data_nodes }}"
-              run_once: true
-              delegate_to: localhost
+              with_indexed_items: "{{ batched_hosts.data_nodes }}"
               when: batched_hosts.data_nodes | length > 0
             
             # ML nodes - Process in batches  
             - name: Process ML node batches
               include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
               vars:
-                current_batch: "{{ item }}"
+                current_batch: "{{ item.1 }}"
                 node_type: "ml"
-                batch_number: "{{ loop.index }}"
+                batch_number: "{{ item.0 + 1 }}"
                 total_batches: "{{ batched_hosts.ml_nodes | length }}"
-              with_items: "{{ batched_hosts.ml_nodes }}"
-              run_once: true
-              delegate_to: localhost
+              with_indexed_items: "{{ batched_hosts.ml_nodes }}"
               when: batched_hosts.ml_nodes | length > 0
               
             # Master nodes - Process in batches (last)
             - name: Process master node batches
               include_tasks: "{{ playbook_dir }}/tools/process_node_batch.yml"
               vars:
-                current_batch: "{{ item }}"
+                current_batch: "{{ item.1 }}"
                 node_type: "master"
-                batch_number: "{{ loop.index }}"
+                batch_number: "{{ item.0 + 1 }}"
                 total_batches: "{{ batched_hosts.master_nodes | length }}"
-              with_items: "{{ batched_hosts.master_nodes }}"
-              run_once: true
-              delegate_to: localhost
+              with_indexed_items: "{{ batched_hosts.master_nodes }}"
               when: batched_hosts.master_nodes | length > 0
           when: >
             target_state != 'change_role' and 
             use_batching | bool and 
-            target_host_count > 1 and 
+            (target_host_count | int) > 1 and 
             selected_service == 'elasticsearch' and 
             batched_hosts is defined
 
@@ -524,6 +646,12 @@
     # Perform final health check for Elasticsearch
     - name: Final Elasticsearch health verification
       block:
+        - name: Log operation completion to file
+          shell: |
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] RESTART OPERATION COMPLETED - Processed {{ target_host_count | int }} hosts in {{ (ansible_date_time.epoch | int) - (ansible_date_time_start | default(ansible_date_time.epoch) | int) }} seconds" >> {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
+          delegate_to: localhost
+          run_once: true
+          when: (target_state == 'restarted' or (target_state == 'change_role' and restart_prompt is defined and restart_prompt.user_input | lower == 'yes')) and selected_service == 'elasticsearch'
         - name: Check final cluster health
           uri:
             url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
