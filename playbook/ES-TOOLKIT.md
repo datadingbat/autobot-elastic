@@ -57,7 +57,7 @@ This launches an interactive menu-driven interface.
 
 5. **Maintenance Operations**: Perform maintenance tasks
    - Run commands on nodes
-   - Manage service state (start/stop/restart)
+   - Manage service state (start/stop/restart/change node role)
    - Update Elasticsearch keystore
    - Tune performance settings
 
@@ -134,6 +134,31 @@ This allows adjusting:
 - Cache sizes
 - Indexing settings
 
+## Elasticsearch Restart Process
+
+The toolkit provides a sophisticated, safe approach to restarting Elasticsearch nodes:
+
+```
+[Main Menu] > 2. Change Service State > 3. Restart service > 1. Elasticsearch
+```
+
+Key features of the restart process:
+
+- **Sequential Restart**: Nodes are restarted one at a time to maintain cluster stability
+- **Cluster Health Verification**: Each node restart waits for GREEN health status before proceeding
+- **Configurable Wait Time**: Customize the wait time between service restart and health check
+- **Detailed Logging**: All restart operations are logged with precise timestamps
+- **Order-Based Processing**: Nodes are processed in a specific order (unknown → data → ML → master)
+- **Initial Safety Check**: Ensures cluster is GREEN before beginning any restarts
+- **Node Role Changing**: Support for changing node roles with the same safety mechanisms
+
+The restart log is stored at `~/.elasticsearch/restart_log.txt` and includes:
+- Timestamp when restart was initiated for each node
+- Timestamp when GREEN health was confirmed for each node
+- Node count and shard status at each step
+
+Previous restart logs are automatically backed up with timestamps before each operation.
+
 ## Troubleshooting
 
 - If configuration files are missing, the toolkit will regenerate defaults
@@ -141,6 +166,7 @@ This allows adjusting:
 - Use the "View Logs" option to check component logs for issues
 - Check `~/.elasticsearch/custom_configurations.yml` for current settings
 - Review the latest cluster summary report at `~/.elasticsearch/cluster_summary_latest.txt`
+- For restart issues, check the detailed restart log at `~/.elasticsearch/restart_log.txt`
 
 ## Cluster Summary Report
 
