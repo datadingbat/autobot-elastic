@@ -42,6 +42,14 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Node.js
+node_modules/
+package-lock.json
+package.json
+
+# Custom configuration files
+playbook/inventory.ini
+
 # Environment and secrets
 .env
 .env.local

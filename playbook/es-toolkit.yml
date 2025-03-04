@@ -16,6 +16,7 @@
       'summary': improved_summary
       'minio_server': minio_server_setup
       'minio_client': minio_client_setup
+      'remove_minio': remove_minio
     service_options:
       '1': elasticsearch
       '2': kibana
@@ -846,6 +847,11 @@
       when: >
         (selected_utility == '5' and service_choice.user_input == '5') or
         (selected_utility == '1' and service_choice.user_input == '6')
+        
+    - name: Set utility file for MinIO removal
+      set_fact:
+        utility_file: "{{ utility_paths['remove_minio'] }}"
+      when: selected_utility == '5' and service_choice.user_input == '5'
 
     - name: Set limit for cluster summary
       set_fact:
@@ -1151,6 +1157,8 @@
                     noninteractive: true
                     install_method: "{{ 'offline' if offline_installation is defined and offline_installation else 'online' }}"
                     minio_binary_path_default: "/home/ubuntu/minio"
+                    custom_access_key: "{{ custom_access_key | default(omit) }}"
+                    custom_secret_key: "{{ custom_secret_key | default(omit) }}"
                   when: utility_file == "minio_server_setup"
                   
                 - name: Set defaults for minio client setup
@@ -1159,6 +1167,8 @@
                     noninteractive: true
                     install_method: "{{ 'offline' if offline_installation is defined and offline_installation else 'online' }}"
                     minio_binary_path_default: "/home/ubuntu/mc"
+                    custom_access_key: "{{ custom_access_key | default(omit) }}"
+                    custom_secret_key: "{{ custom_secret_key | default(omit) }}"
                   when: utility_file == "minio_client_setup"
 
                 # For non-get_state utilities, show confirmation

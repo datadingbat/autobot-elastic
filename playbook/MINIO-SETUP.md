@@ -17,21 +17,18 @@ This document explains how to set up MinIO S3 storage for Elasticsearch snapshot
 This will install the MinIO server on a specified host.
 
 ```bash
-# Using the dedicated fix script (recommended for offline installation)
-ansible-playbook -i inventory.ini tools/fix_minio_server.yml
-
-# Using the toolkit menu
+# Using the toolkit menu (recommended)
 ansible-playbook es-toolkit.yml
 # Select option 10 (Setup MinIO Server)
 ```
+
+- You can provide custom credentials (access key and secret key) during installation
+- Default credentials if not specified: minioadmin / minioadmin
 
 ### 2. Setup MinIO Client
 This will install the MinIO client on target nodes and configure it to connect to the server.
 
 ```bash
-# Using the dedicated fix script (recommended)
-ansible-playbook -i inventory.ini tools/fix_minio_client.yml
-
 # Using the toolkit menu
 ansible-playbook es-toolkit.yml
 # Select option 11 (Setup MinIO Client)
@@ -41,7 +38,7 @@ ansible-playbook es-toolkit.yml
 
 ### MinIO Server
 - Default port: 9000 (API), 9001 (Console)
-- Default credentials: minioadmin / minioadmin
+- Default credentials: minioadmin / minioadmin (customizable during installation)
 - Default data directory: /minio/data
 
 ### MinIO Client
@@ -53,22 +50,32 @@ ansible-playbook es-toolkit.yml
 - MinIO API: http://SERVER_HOST:9000
 - MinIO Console: http://SERVER_HOST:9001
 
-## Using with Elasticsearch
-To use MinIO for Elasticsearch snapshots, follow these steps:
+## Post-Installation Steps
+
+After MinIO is installed, follow these steps to integrate with Elasticsearch:
 
 ### 1. Add Credentials to Elasticsearch Keystore
-First, add MinIO credentials to the Elasticsearch keystore on all nodes:
+Use the toolkit to add MinIO credentials to all Elasticsearch nodes:
 
 ```bash
-# Add access key to keystore
-/usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.access_key
-
-# Add secret key to keystore
-/usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.secret_key
+# Using the toolkit menu
+ansible-playbook es-toolkit.yml
+# Select option for "Add Keystore Values" (or similar)
 ```
 
-### 2. Register S3 Repository
-Then register the S3 repository with this command in Kibana Dev Tools:
+This will add the configured access key and secret key to the Elasticsearch keystore on all nodes.
+
+### 2. Restart Elasticsearch Nodes
+After adding credentials to the keystore, restart Elasticsearch nodes in the correct order:
+
+```bash
+# Using the toolkit menu
+ansible-playbook es-toolkit.yml
+# Select option for "Restart Services" (or similar)
+```
+
+### 3. Register S3 Repository
+Register the S3 repository with this command in Kibana Dev Tools:
 
 ```
 PUT _snapshot/minio_repository
@@ -76,20 +83,23 @@ PUT _snapshot/minio_repository
   "type": "s3",
   "settings": {
     "bucket": "elasticsearch-snapshots",
-    "endpoint": "SERVER_HOST.internal:9001",
-    "protocol": "http"
+    "endpoint": "SERVER_HOST:9000",
+    "protocol": "http",
+    "path_style_access": true
   }
 }
 ```
 
-Notes:
-- Replace `SERVER_HOST` with the actual hostname of your MinIO server
-- The `endpoint` should use the FQDN of your MinIO server if hostname resolution is available
-- Omit the `region` setting if you're not using a specific region configuration
-- The default port is now 9001
+**Important Notes:**
+- Replace `SERVER_HOST` with the actual hostname or IP of your MinIO server
+- The `path_style_access: true` parameter is required
+- Do not include spaces in the endpoint URL
+- Use port 9000 (API port) not 9001 (Console port)
+- You may need to run the repository creation command twice for it to take effect
 
 ## Troubleshooting
-- If the offline installation fails, check if the binary exists on the controller and is accessible
-- Use the IP address of the server host for MinIO client configuration if hostname resolution fails
+- Installation details are saved to `~/.elasticsearch/minio_installation.txt` for reference
 - Verify server is running with: `curl http://SERVER_HOST:9000 -v`
 - Check server logs with: `journalctl -u minio`
+- If repository creation fails, verify credentials in keystore and try again
+- If using custom credentials, ensure they match what was configured during installation

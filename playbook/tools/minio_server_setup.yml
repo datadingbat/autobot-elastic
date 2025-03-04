@@ -11,8 +11,8 @@
     installation_method: "{{ install_method | default('online') }}"
     minio_binary_path_default: "/home/ubuntu/minio"
     server_host_default: "{{ server_host_default | default('helper.elastic') }}"
-    minio_access_key: "minioadmin"
-    minio_secret_key: "minioadmin"
+    minio_access_key: "{{ custom_access_key | default('minioadmin') }}"
+    minio_secret_key: "{{ custom_secret_key | default('minioadmin') }}"
     minio_data_dir: "/minio/data"
     minio_port: "9000"
     minio_console_port: "9001"
@@ -161,33 +161,50 @@
     msg: "Using data directory: {{ minio_data_dir }}"
 
 # Prompt for Minio credentials
+- name: Prompt for credentials in interactive mode
+  pause:
+    prompt: |
+      Minio requires access and secret keys for authentication.
+      
+      Use default credentials (minioadmin/minioadmin)? [yes]:
+  register: default_creds_prompt
+  when: not non_interactive | bool and not (custom_access_key is defined and custom_access_key | length >= 3 and custom_secret_key is defined and custom_secret_key | length >= 8)
+
 - name: Prompt for access key in interactive mode
   pause:
-    prompt: "Enter the Minio access key (min 3 characters, default: minioadmin):"
+    prompt: "Enter the Minio access key (min 3 characters):"
     echo: yes
   register: access_key_input
-  when: not non_interactive | bool
+  when: not non_interactive | bool and default_creds_prompt.user_input | default('yes') | lower == 'no'
 
 - name: Prompt for secret key in interactive mode
   pause:
-    prompt: "Enter the Minio secret key (min 8 characters, default: minioadmin):"
+    prompt: "Enter the Minio secret key (min 8 characters):"
     echo: yes
   register: secret_key_input
-  when: not non_interactive | bool
+  when: not non_interactive | bool and default_creds_prompt.user_input | default('yes') | lower == 'no'
 
 - name: Set Minio credentials
   set_fact:
     minio_access_key: >-
       {% if non_interactive | bool %}
-      minioadmin
-      {% else %}
+      {{ custom_access_key | default('minioadmin') }}
+      {% elif custom_access_key is defined and custom_access_key | length >= 3 and default_creds_prompt is not defined %}
+      {{ custom_access_key }}
+      {% elif default_creds_prompt.user_input | default('yes') | lower == 'no' %}
       {{ access_key_input.user_input if access_key_input.user_input != '' and access_key_input.user_input | length >= 3 else 'minioadmin' }}
+      {% else %}
+      minioadmin
       {% endif %}
     minio_secret_key: >-
       {% if non_interactive | bool %}
-      minioadmin
-      {% else %}
+      {{ custom_secret_key | default('minioadmin') }}
+      {% elif custom_secret_key is defined and custom_secret_key | length >= 8 and default_creds_prompt is not defined %}
+      {{ custom_secret_key }}
+      {% elif default_creds_prompt.user_input | default('yes') | lower == 'no' %}
       {{ secret_key_input.user_input if secret_key_input.user_input != '' and secret_key_input.user_input | length >= 8 else 'minioadmin' }}
+      {% else %}
+      minioadmin
       {% endif %}
 
 - name: Debug credentials
