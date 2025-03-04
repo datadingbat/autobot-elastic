@@ -17,6 +17,7 @@
       'minio_server': minio_server_setup
       'minio_client': minio_client_setup
       'remove_minio': remove_minio
+      'test_minio': test_minio_connectivity
     service_options:
       '1': elasticsearch
       '2': kibana
@@ -791,6 +792,7 @@
           4. Filebeat
           5. Metricbeat
           6. MinIO (S3 storage for frozen tier)
+          7. Test MinIO S3 Connectivity (helps diagnose S3 repository issues)
           {% else %}
           Select the service to manage:
           1. Elasticsearch
@@ -805,11 +807,11 @@
 
     - name: Validate service selection
       fail:
-        msg: "Invalid service selection. Please enter a number between 1 and {{ '6' if selected_utility == '1' else '5' }}."
+        msg: "Invalid service selection. Please enter a number between 1 and {{ '7' if selected_utility == '1' else '5' }}."
       when: >
         selected_utility in ['1', '2', '5'] and 
         (
-          (selected_utility == '1' and service_choice.user_input not in ['1','2','3','4','5','6']) or
+          (selected_utility == '1' and service_choice.user_input not in ['1','2','3','4','5','6','7']) or
           (selected_utility != '1' and service_choice.user_input not in ['1','2','3','4','5'])
         )
 
@@ -847,6 +849,14 @@
       when: >
         (selected_utility == '5' and service_choice.user_input == '5') or
         (selected_utility == '1' and service_choice.user_input == '6')
+        
+    - name: Set selected service for MinIO S3 test
+      set_fact:
+        selected_service: "minio-test"
+        utility_file: "{{ utility_paths['test_minio'] }}"
+        skip_target_selection: true
+        limit: "localhost"
+      when: selected_utility == '1' and service_choice.user_input == '7'
         
     - name: Set utility file for MinIO removal
       set_fact:
@@ -979,6 +989,13 @@
 # Target selection prompt
     - name: Select target hosts
       block:
+        # Skip target selection if flag is set
+        - name: Skip target selection if specified
+          debug:
+            msg: "Skipping target selection as this utility manages its own test host selection"
+          when: skip_target_selection | default(false)
+        
+        # Proceed with normal target selection if not skipped
         # Monitor target (utility 8)
         - name: Prompt for monitor target
           pause:
@@ -1002,7 +1019,8 @@
           when: >
             selected_utility not in ['7','9'] and
             not (selected_utility == '3' and install_choice is defined and install_choice.user_input == '5') and
-            not (selected_service is defined and selected_service == 'cluster_summary')
+            not (selected_service is defined and selected_service == 'cluster_summary') and
+            not (skip_target_selection | default(false))
             
         # Backup target (utility 7)
         - name: Prompt for backup target selection
@@ -1323,6 +1341,7 @@
             selected_utility not in ['7','9'] and
             not (selected_utility == '3' and install_choice is defined and install_choice.user_input == '5') and
             not (selected_service is defined and selected_service == 'cluster_summary') and
+            not (skip_target_selection | default(false)) and
             standard_target_type is defined
 
           # when: >
@@ -1395,7 +1414,7 @@
         - name: Validate limit is set
           fail:
             msg: "Target selection failed - no limit was set"
-          when: limit is not defined
+          when: limit is not defined and not (skip_target_selection | default(false))
 
     # Store variables for next play
     - name: Set play variables

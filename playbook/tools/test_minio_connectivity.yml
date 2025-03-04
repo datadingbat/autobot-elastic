@@ -1,0 +1,1148 @@
+---
+# test_minio_connectivity.yml - Tests S3 connectivity to MinIO for Elasticsearch
+# This tool helps diagnose issues with S3 repository connection errors
+# Added in response to repository_verification_exception errors
+# Provides both basic (standard Linux tools) and advanced (MinIO client) test options
+
+# Required inputs:
+# - test_host (optional, defaults to localhost)
+# - minio_server_host (optional, will load from config if not provided)
+# - minio_port (optional, will load from config if not provided)
+# - minio_protocol (optional, will load from config if not provided)
+# - minio_access_key (optional, will load from config if not provided)
+# - minio_secret_key (optional, will load from config if not provided)
+# - minio_bucket_name (optional, will load from config if not provided)
+
+# Check if we have the test_host input
+- name: Set default test host if not provided
+  set_fact:
+    test_host: "{{ test_host | default('localhost') }}"
+    
+# Load MinIO configuration from files if available
+- name: Check for existing MinIO configuration
+  block:
+    - name: Check for minio_config.yml
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml"
+      register: minio_config_file
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Check for minio_client_config.yml as fallback
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml"
+      register: minio_client_config_file
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Load MinIO configuration if available
+      block:
+        # Use direct grep to extract values rather than YAML parsing
+        - name: Extract MinIO server host from config file
+          shell: "grep -A1 'server:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml | grep 'host:' | sed 's/.*host: *\"\\(.*\\)\".*/\\1/'"
+          register: minio_server_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          when: minio_config_file.stat.exists
+          
+        - name: Extract MinIO server port from config file
+          shell: "grep -A2 'server:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml | grep 'port:' | sed 's/.*port: *\\([0-9]*\\).*/\\1/'"
+          register: minio_port_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          when: minio_config_file.stat.exists
+          
+        - name: Extract MinIO protocol from config file
+          shell: "grep -A3 'server:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml | grep 'protocol:' | sed 's/.*protocol: *\"\\(.*\\)\".*/\\1/'"
+          register: minio_protocol_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          when: minio_config_file.stat.exists
+          
+        - name: Extract MinIO access key from config file
+          shell: "grep 'access_key:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml | sed 's/.*access_key: *\"\\(.*\\)\".*/\\1/'"
+          register: minio_access_key_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          when: minio_config_file.stat.exists
+          
+        - name: Extract MinIO secret key from config file
+          shell: "grep 'secret_key:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml | sed 's/.*secret_key: *\"\\(.*\\)\".*/\\1/'"
+          register: minio_secret_key_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          when: minio_config_file.stat.exists
+          
+        - name: Extract MinIO bucket from config file
+          shell: "grep 'bucket:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_config.yml | sed 's/.*bucket: *\"\\(.*\\)\".*/\\1/'"
+          register: minio_bucket_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          when: minio_config_file.stat.exists
+
+        - name: Set extracted values
+          set_fact:
+            minio_server_host: "{{ minio_server_host | default(minio_server_grep.stdout) if minio_server_grep.stdout is defined and minio_server_grep.stdout != '' else minio_server_host | default('localhost') }}"
+            minio_port: "{{ minio_port | default(minio_port_grep.stdout) if minio_port_grep.stdout is defined and minio_port_grep.stdout != '' else minio_port | default('9001') }}"
+            minio_protocol: "{{ minio_protocol | default(minio_protocol_grep.stdout) if minio_protocol_grep.stdout is defined and minio_protocol_grep.stdout != '' else minio_protocol | default('http') }}"
+            minio_access_key: "{{ minio_access_key | default(minio_access_key_grep.stdout) if minio_access_key_grep.stdout is defined and minio_access_key_grep.stdout != '' else minio_access_key | default('minioadmin') }}"
+            minio_secret_key: "{{ minio_secret_key | default(minio_secret_key_grep.stdout) if minio_secret_key_grep.stdout is defined and minio_secret_key_grep.stdout != '' else minio_secret_key | default('minioadmin') }}"
+            minio_bucket_name: "{{ minio_bucket_name | default(minio_bucket_grep.stdout) if minio_bucket_grep.stdout is defined and minio_bucket_grep.stdout != '' else minio_bucket_name | default('elasticsearch-snapshots') }}"
+          delegate_to: localhost
+          run_once: true
+          when: minio_config_file.stat.exists
+          
+        - name: Debug extracted MinIO configuration
+          debug:
+            msg: |
+              Extracted MinIO configuration:
+              Server host: {{ minio_server_host }}
+              Port: {{ minio_port }}
+              Protocol: {{ minio_protocol }}
+              Access key: {{ minio_access_key }}
+              Secret key: {{ minio_secret_key }}
+              Bucket: {{ minio_bucket_name }}
+          delegate_to: localhost
+          run_once: true
+          when: minio_config_file.stat.exists
+      when: minio_config_file.stat.exists
+          
+    - name: Load client configuration as fallback
+      block:
+        - name: Extract MinIO client server host from config file
+          shell: "grep -A1 'server:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml | grep 'host:' | sed 's/.*host: *\"\\(.*\\)\".*/\\1/'"
+          register: client_server_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          
+        - name: Extract MinIO client server port from config file
+          shell: "grep -A2 'server:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml | grep 'port:' | sed 's/.*port: *\\([0-9]*\\).*/\\1/'"
+          register: client_port_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          
+        - name: Extract MinIO client protocol from config file
+          shell: "grep -A3 'server:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml | grep 'protocol:' | sed 's/.*protocol: *\"\\(.*\\)\".*/\\1/'"
+          register: client_protocol_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          
+        - name: Extract MinIO client access key from config file
+          shell: "grep 'access_key:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml | sed 's/.*access_key: *\"\\(.*\\)\".*/\\1/'"
+          register: client_access_key_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          
+        - name: Extract MinIO client secret key from config file
+          shell: "grep 'secret_key:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml | sed 's/.*secret_key: *\"\\(.*\\)\".*/\\1/'"
+          register: client_secret_key_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+          
+        - name: Extract MinIO client bucket from config file
+          shell: "grep 'name:' {{ lookup('env', 'HOME') }}/.elasticsearch/minio_client_config.yml | grep -v 'keystore' | sed 's/.*name: *\"\\(.*\\)\".*/\\1/'"
+          register: client_bucket_grep
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+
+        - name: Set client extracted values
+          set_fact:
+            minio_server_host: "{{ minio_server_host | default(client_server_grep.stdout) if client_server_grep.stdout is defined and client_server_grep.stdout != '' else minio_server_host | default('localhost') }}"
+            minio_port: "{{ minio_port | default(client_port_grep.stdout) if client_port_grep.stdout is defined and client_port_grep.stdout != '' else minio_port | default('9001') }}"
+            minio_protocol: "{{ minio_protocol | default(client_protocol_grep.stdout) if client_protocol_grep.stdout is defined and client_protocol_grep.stdout != '' else minio_protocol | default('http') }}"
+            minio_access_key: "{{ minio_access_key | default(client_access_key_grep.stdout) if client_access_key_grep.stdout is defined and client_access_key_grep.stdout != '' else minio_access_key | default('minioadmin') }}"
+            minio_secret_key: "{{ minio_secret_key | default(client_secret_key_grep.stdout) if client_secret_key_grep.stdout is defined and client_secret_key_grep.stdout != '' else minio_secret_key | default('minioadmin') }}"
+            minio_bucket_name: "{{ minio_bucket_name | default(client_bucket_grep.stdout) if client_bucket_grep.stdout is defined and client_bucket_grep.stdout != '' else minio_bucket_name | default('elasticsearch-snapshots') }}"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Debug extracted client configuration
+          debug:
+            msg: |
+              Extracted MinIO client configuration:
+              Server host: {{ minio_server_host }}
+              Port: {{ minio_port }}
+              Protocol: {{ minio_protocol }}
+              Access key: {{ minio_access_key }}
+              Secret key: {{ minio_secret_key }}
+              Bucket: {{ minio_bucket_name }}
+          delegate_to: localhost
+          run_once: true
+      when: not minio_config_file.stat.exists and minio_client_config_file.stat.exists
+
+# Ensure defaults are set if no configuration was found
+- name: Set default MinIO config values if not already set
+  set_fact:
+    minio_server_host: "{{ minio_server_host | default('localhost') }}"
+    minio_port: "{{ minio_port | default('9001') }}"
+    minio_protocol: "{{ minio_protocol | default('http') }}"
+    minio_access_key: "{{ minio_access_key | default('minioadmin') }}"
+    minio_secret_key: "{{ minio_secret_key | default('minioadmin') }}"
+    minio_bucket_name: "{{ minio_bucket_name | default('elasticsearch-snapshots') }}"
+  delegate_to: localhost
+  run_once: true
+  when: not minio_config_file.stat.exists and not minio_client_config_file.stat.exists
+
+# Check if configuration exists and ask if user wants to use it
+- name: Check if any MinIO configuration was loaded
+  set_fact:
+    config_found: "{{ minio_config_file.stat.exists | default(false) or minio_client_config_file.stat.exists | default(false) }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Display extracted configuration and ask for confirmation
+  block:
+    - name: Display found configuration
+      debug:
+        msg: |
+          Found existing MinIO configuration:
+          Server: {{ minio_server_host }}
+          Port: {{ minio_port }}
+          Protocol: {{ minio_protocol }}
+          Bucket: {{ minio_bucket_name }}
+          Access key: {{ minio_access_key }}
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Prompt to use existing configuration
+      pause:
+        prompt: |
+          Do you want to use this existing configuration for the test?
+          Enter 'yes' to use the above settings
+          Enter 'no' to provide custom parameters for this test only
+      register: use_existing_config
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Set use existing config flag
+      set_fact:
+        use_found_config: "{{ use_existing_config.user_input | lower == 'yes' or use_existing_config.user_input | lower == 'y' }}"
+      delegate_to: localhost
+      run_once: true
+  when: config_found | bool
+
+# Prompt for information if needed or if user chose not to use existing config
+- name: Prompt for MinIO server details
+  block:
+    - name: Prompt for server hostname or IP
+      pause:
+        prompt: "Enter the hostname or IP address of the MinIO server (default: {{ minio_server_host }}):"
+      register: server_host_input
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Prompt for server port
+      pause:
+        prompt: "Enter the MinIO server port (default: {{ minio_port }}):"
+      register: server_port_input
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Prompt for protocol
+      pause:
+        prompt: |
+          Select the protocol for MinIO server:
+          1. HTTP {{ '(current)' if minio_protocol == 'http' else '' }}
+          2. HTTPS {{ '(current)' if minio_protocol == 'https' else '' }}
+          Enter the number of your choice:
+      register: protocol_choice
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Prompt for access key
+      pause:
+        prompt: "Enter the MinIO access key (default: {{ minio_access_key }}):"
+      register: access_key_input
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Prompt for secret key
+      pause:
+        prompt: "Enter the MinIO secret key (default: {{ minio_secret_key }}):"
+      register: secret_key_input
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Prompt for bucket name
+      pause:
+        prompt: "Enter the MinIO bucket name (default: {{ minio_bucket_name }}):"
+      register: bucket_name_input
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Set server details from prompts
+      set_fact:
+        minio_server_host: "{{ server_host_input.user_input if server_host_input.user_input|length > 0 else minio_server_host }}"
+        minio_port: "{{ server_port_input.user_input if server_port_input.user_input|length > 0 else minio_port }}"
+        minio_protocol: "{{ 'https' if protocol_choice.user_input == '2' else ('http' if protocol_choice.user_input == '1' else minio_protocol) }}"
+        minio_access_key: "{{ access_key_input.user_input if access_key_input.user_input|length > 0 else minio_access_key }}"
+        minio_secret_key: "{{ secret_key_input.user_input if secret_key_input.user_input|length > 0 else minio_secret_key }}"
+        minio_bucket_name: "{{ bucket_name_input.user_input if bucket_name_input.user_input|length > 0 else minio_bucket_name }}"
+      delegate_to: localhost
+      run_once: true
+  when: not config_found | default(false) or not use_found_config | default(false)
+
+# Prompt for test host selection if not using default
+- name: Prompt for test host type
+  pause:
+    prompt: |
+      Select node type to run the test from:
+      1. Master node (recommended for snapshot repository testing)
+      2. Hot node
+      3. Current host ({{ test_host }})
+      4. Custom host
+      Enter the number of your choice:
+  register: test_host_choice
+  delegate_to: localhost
+  run_once: true
+
+- name: Handle master node selection
+  block:
+    - name: Check if master_nodes group exists
+      fail:
+        msg: "No master_nodes group found in inventory. Please select a different test host."
+      when: groups['master_nodes'] is not defined or groups['master_nodes'] | length == 0
+      
+    - name: Get first master node
+      set_fact:
+        test_host: "{{ groups['master_nodes'][0] }}"
+  when: test_host_choice.user_input == '1'
+  delegate_to: localhost
+  run_once: true
+
+- name: Handle hot node selection
+  block:
+    - name: Check if hot_nodes group exists
+      fail:
+        msg: "No hot_nodes group found in inventory. Please select a different test host."
+      when: groups['hot_nodes'] is not defined or groups['hot_nodes'] | length == 0
+      
+    - name: Get first hot node
+      set_fact:
+        test_host: "{{ groups['hot_nodes'][0] }}"
+  when: test_host_choice.user_input == '2'
+  delegate_to: localhost
+  run_once: true
+
+- name: Prompt for custom host
+  pause:
+    prompt: "Enter the hostname or IP of the custom test host:"
+  register: custom_host_input
+  when: test_host_choice.user_input == '4'
+  delegate_to: localhost
+  run_once: true
+
+- name: Set custom test host
+  set_fact:
+    test_host: "{{ custom_host_input.user_input }}"
+  when: test_host_choice.user_input == '4' and custom_host_input.user_input|length > 0
+  delegate_to: localhost
+  run_once: true
+
+# Display test configuration
+- name: Display test configuration
+  debug:
+    msg: |
+      S3 Connectivity Test Configuration
+      --------------------------------
+      Test will run from: {{ test_host }}
+      MinIO Server: {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }}
+      Bucket: {{ minio_bucket_name }}
+      Credentials:
+        Access Key: {{ minio_access_key }}
+        Secret Key: {{ minio_secret_key }}
+  delegate_to: localhost
+  run_once: true
+
+# Prompt for test method
+- name: Prompt for test method
+  pause:
+    prompt: |
+      Select test method:
+      1. Basic (Standard Linux tools only, no additional software required)
+      2. Advanced (Includes MinIO client tests, requires 'mc' command or will install it)
+      Enter your choice (1/2):
+  register: test_method_choice
+  delegate_to: localhost
+  run_once: true
+  
+- name: Set test method
+  set_fact:
+    use_basic_test: "{{ test_method_choice.user_input == '1' }}"
+    use_advanced_test: "{{ test_method_choice.user_input != '1' }}"
+  delegate_to: localhost
+  run_once: true
+
+# Advanced testing section (with MinIO client and Python boto3)
+- name: Run advanced tests with MinIO client and Python boto3
+  block:
+    # Check if MinIO client is installed on test host
+    - name: Check if MinIO client is installed on test host
+      stat:
+        path: /usr/local/bin/mc
+      register: mc_check
+      delegate_to: "{{ test_host }}"
+    
+    - name: Check if Python boto3 is available on test host
+      shell: "python3 -c 'import boto3; print(\"boto3 available\")' || echo 'boto3 not available'"
+      register: boto3_check
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+    
+    - name: Display Python boto3 availability
+      debug:
+        msg: "Python boto3 {{ 'is available' if 'boto3 available' in boto3_check.stdout else 'is not available' }} on {{ test_host }}"
+      delegate_to: localhost
+      run_once: true
+    
+    # Install MinIO client if needed
+    - name: Install MinIO client if needed
+      block:
+        - name: Display installation message
+          debug:
+            msg: "Installing MinIO client on {{ test_host }} for connectivity tests"
+        
+        # Quick installation of MinIO client if needed
+        - name: Install MinIO client
+          block:
+            - name: Create directory for Minio client
+              file:
+                path: /usr/local/bin
+                state: directory
+                mode: '0755'
+              become: yes
+              
+            - name: Install Minio client
+              get_url:
+                url: "https://dl.min.io/client/mc/release/linux-amd64/mc"
+                dest: /usr/local/bin/mc
+                mode: '0755'
+              become: yes
+              
+            - name: Verify Minio client installation
+              command: /usr/local/bin/mc --version
+              register: mc_version
+              changed_when: false
+              
+            # The version check is sufficient to confirm installation
+          delegate_to: "{{ test_host }}"
+      when: not mc_check.stat.exists
+      delegate_to: "{{ test_host }}"
+    
+    # Run MinIO client tests if available
+    - name: Run MinIO client tests
+      block:
+        # Configure MinIO client on test host
+        - name: Configure MinIO client
+          shell: |
+            /usr/local/bin/mc config host add minio {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }} {{ minio_access_key }} {{ minio_secret_key }}
+          register: mc_config
+          changed_when: true
+          become: yes
+          delegate_to: "{{ test_host }}"
+        
+        # Run a test file creation
+        - name: Create test object with MinIO client
+          block:
+            - name: Generate unique test file
+              shell: |
+                echo "S3 connectivity test from {{ test_host }} at $(date)" > /tmp/s3-test-file.txt
+              delegate_to: "{{ test_host }}"
+              
+            - name: Upload test file to MinIO
+              shell: |
+                /usr/local/bin/mc cp /tmp/s3-test-file.txt minio/{{ minio_bucket_name }}/s3-test-file-{{ ansible_date_time.epoch }}.txt
+              register: upload_result
+              become: yes
+              delegate_to: "{{ test_host }}"
+              
+            - name: Check if upload was successful
+              debug:
+                msg: "File upload test: {{ 'SUCCESS' if upload_result.rc == 0 else 'FAILED' }}"
+              delegate_to: "{{ test_host }}"
+              
+            - name: Delete test file from local filesystem
+              file:
+                path: /tmp/s3-test-file.txt
+                state: absent
+              delegate_to: "{{ test_host }}"
+          rescue:
+            - name: Record file upload failure
+              set_fact:
+                mc_upload_failed: true
+                mc_upload_error: "{{ ansible_failed_result }}"
+              delegate_to: localhost
+              run_once: true
+        
+        # Test MinIO admin capabilities
+        - name: Test MinIO admin info
+          shell: "/usr/local/bin/mc admin info minio || echo 'Admin info failed'"
+          register: admin_test
+          ignore_errors: yes
+          become: yes
+          delegate_to: "{{ test_host }}"
+          
+        - name: List buckets with MinIO client
+          shell: "/usr/local/bin/mc ls minio || echo 'Listing buckets failed'"
+          register: bucket_list
+          ignore_errors: yes
+          become: yes
+          delegate_to: "{{ test_host }}"
+        
+        # Set facts for MinIO client test results
+        - name: Set MinIO client test results
+          set_fact:
+            mc_installed: "{{ mc_check.stat.exists | default(false) }}"
+            mc_config_success: "{{ mc_config.rc == 0 if mc_config is defined else false }}"
+            admin_info_success: "{{ 'Admin info failed' not in admin_test.stdout if admin_test is defined else false }}"
+            bucket_listing_success: "{{ 'Listing buckets failed' not in bucket_list.stdout if bucket_list is defined else false }}"
+            mc_upload_test_success: "{{ not (mc_upload_failed | default(false)) }}"
+          delegate_to: localhost
+          run_once: true
+      when: mc_check.stat.exists or not mc_check.stat.exists
+      ignore_errors: yes
+    
+    # Run Python boto3 tests with automatic installation if possible
+    - name: Run Python boto3 tests
+      block:
+        # First check for Python and pip
+        - name: Check Python availability
+          shell: "which python3 || which python || echo 'python not available'"
+          register: python_check
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          
+        - name: Display Python availability
+          debug:
+            msg: "Python path: {{ python_check.stdout }}"
+          delegate_to: localhost
+          run_once: true
+          
+        - name: Check if pip is available
+          shell: "which pip3 || which pip || echo 'pip not available'"
+          register: pip_check
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          
+        - name: Display pip availability
+          debug:
+            msg: "Pip path: {{ pip_check.stdout }}"
+          delegate_to: localhost
+          run_once: true
+        
+        # Try to install pip if not available but Python is available
+        - name: Check if apt-get is available (Debian/Ubuntu)
+          shell: "which apt-get || echo 'apt-get not available'"
+          register: apt_check
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          when: "python_check.stdout != 'python not available' and pip_check.stdout == 'pip not available'"
+        
+        - name: Check if yum is available (RedHat/CentOS)
+          shell: "which yum || echo 'yum not available'"
+          register: yum_check
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          when: "python_check.stdout != 'python not available' and pip_check.stdout == 'pip not available' and apt_check.stdout == 'apt-get not available'"
+        
+        - name: Attempt to install pip on Debian/Ubuntu
+          shell: "sudo apt-get update && sudo apt-get install -y python3-pip"
+          register: pip_install
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          become: yes
+          when: "python_check.stdout != 'python not available' and pip_check.stdout == 'pip not available' and apt_check is defined and apt_check.stdout != 'apt-get not available'"
+        
+        - name: Attempt to install pip on RedHat/CentOS
+          shell: "sudo yum install -y python3-pip"
+          register: pip_install_yum
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          become: yes
+          when: >
+            python_check.stdout != 'python not available' and 
+            pip_check.stdout == 'pip not available' and 
+            apt_check.stdout == 'apt-get not available' and
+            yum_check is defined and 
+            yum_check.stdout != 'yum not available'
+        
+        # Check if pip installation was successful
+        - name: Check if pip is now available after installation attempt
+          shell: "which pip3 || which pip || echo 'pip not available'"
+          register: pip_check_after_install
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          when: "pip_install is defined or pip_install_yum is defined"
+        
+        - name: Display pip installation result
+          debug:
+            msg: "Pip installation result: {{ 'SUCCESS - ' + pip_check_after_install.stdout if pip_check_after_install is defined and pip_check_after_install.stdout != 'pip not available' else 'FAILED - pip could not be installed' }}"
+          delegate_to: localhost
+          run_once: true
+          when: "pip_install is defined or pip_install_yum is defined"
+          
+        # Attempt to install boto3 if Python and pip are available
+        - name: Try installing boto3 using pip (will continue on failure)
+          shell: |
+            # Determine the pip command
+            {% if pip_check_after_install is defined and pip_check_after_install.stdout != 'pip not available' %}
+              PIP_CMD="{{ pip_check_after_install.stdout }}"
+            {% elif pip_check.stdout != 'pip not available' %}
+              PIP_CMD="{{ pip_check.stdout }}"
+            {% else %}
+              echo "Pip not available, can't install boto3"
+              exit 0
+            {% endif %}
+            
+            # Check if boto3 is already installed
+            python3 -c "import boto3; print('boto3 already installed')" 2>/dev/null && echo "boto3 already installed" && exit 0
+            
+            # Install boto3
+            echo "Installing boto3..."
+            $PIP_CMD install --user boto3 || sudo $PIP_CMD install boto3 || echo "Failed to install boto3"
+            exit 0
+          register: boto3_install
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          become: yes
+          when: >
+            python_check.stdout != 'python not available' and
+            ((pip_check_after_install is defined and pip_check_after_install.stdout != 'pip not available') or 
+             (pip_check.stdout != 'pip not available'))
+        
+        # Verify if boto3 is available
+        - name: Check if boto3 is available
+          shell: "python3 -c 'import boto3; print(\"boto3 available\")' || echo 'boto3 not available'"
+          register: boto3_check_after_install
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          when: "'python not available' not in python_check.stdout"
+          
+        - name: Display boto3 installation result
+          debug:
+            msg: "{{ 'Successfully installed boto3' if boto3_check_after_install is defined and 'boto3 available' in boto3_check_after_install.stdout else 'Could not install boto3 - continuing with basic tests only' }}"
+          delegate_to: localhost
+          run_once: true
+          when: "'python not available' not in python_check.stdout"
+            
+        # Create Python S3 test script - modified to try both detection methods
+        - name: Create Python boto3 test script
+          copy:
+            dest: /tmp/s3_boto3_test.py
+            mode: '0755'
+            content: |
+              #!/usr/bin/env python3
+              import sys
+              import subprocess
+              import os
+              import site
+              from pathlib import Path
+              
+              print("Testing S3 connectivity to MinIO server...")
+              
+              # Add user site-packages to path
+              user_site = site.getusersitepackages()
+              if user_site not in sys.path:
+                  sys.path.insert(0, user_site)
+              
+              # Also add ~/.local/lib/python3.x/site-packages
+              home = str(Path.home())
+              for py_ver in range(6, 12):  # Try Python 3.6 to 3.11
+                  local_path = f"{home}/.local/lib/python3.{py_ver}/site-packages"
+                  if os.path.exists(local_path) and local_path not in sys.path:
+                      sys.path.insert(0, local_path)
+              
+              # Try to import boto3
+              try:
+                  import boto3
+                  from botocore.client import Config
+                  print(f"Using boto3 version: {boto3.__version__}")
+              except ImportError:
+                  print("boto3 not available, attempting to install...")
+                  try:
+                      # Try to install boto3
+                      subprocess.check_call("pip3 install --user boto3".split())
+                      
+                      # Update path after installation
+                      user_site = site.getusersitepackages()
+                      if user_site not in sys.path:
+                          sys.path.insert(0, user_site)
+                      
+                      # Try import again
+                      try:
+                          import boto3
+                          from botocore.client import Config
+                          print(f"Successfully installed boto3 version: {boto3.__version__}")
+                      except ImportError:
+                          print("ERROR: Could not import boto3 after installation")
+                          sys.exit(1)
+                  except Exception as e:
+                      print(f"ERROR: Could not install boto3: {str(e)}")
+                      sys.exit(1)
+              
+              # Credentials and settings from the CLI
+              access_key = '{{ minio_access_key }}'
+              secret_key = '{{ minio_secret_key }}'
+              endpoint = '{{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }}'
+              bucket = '{{ minio_bucket_name }}'
+              
+              print(f"Testing S3 connectivity to {endpoint}")
+              print(f"Using bucket: {bucket}")
+              
+              # Create an S3 client configured for MinIO
+              try:
+                  s3_client = boto3.client(
+                      's3',
+                      endpoint_url=endpoint,
+                      aws_access_key_id=access_key,
+                      aws_secret_access_key=secret_key,
+                      config=Config(signature_version='s3v4'),
+                  )
+                  print(f"Successfully created S3 client for endpoint: {endpoint}")
+              except Exception as e:
+                  print(f"Error creating S3 client: {str(e)}")
+                  sys.exit(1)
+              
+              # Test bucket access
+              try:
+                  # Try to list objects in the bucket
+                  response = s3_client.list_objects_v2(Bucket=bucket)
+                  print(f"Successfully connected to bucket: {bucket}")
+                  
+                  # List objects if any
+                  objects = response.get('Contents', [])
+                  if objects:
+                      print("Objects in bucket:")
+                      for obj in objects:
+                          print(f" - {obj['Key']}")
+                  else:
+                      print("Bucket is empty")
+                      
+                  # Create a test object
+                  test_key = f"boto3-test-object-{boto3.__version__}"
+                  s3_client.put_object(
+                      Bucket=bucket,
+                      Key=test_key,
+                      Body=f"S3 boto3 connectivity test at {endpoint}"
+                  )
+                  print(f"Successfully created test object: {test_key}")
+                  
+                  # Delete the test object
+                  s3_client.delete_object(
+                      Bucket=bucket,
+                      Key=test_key
+                  )
+                  print(f"Successfully deleted test object: {test_key}")
+                  
+                  print("RESULT: All S3 operations completed successfully!")
+                  sys.exit(0)
+              except Exception as e:
+                  print(f"Error accessing bucket: {str(e)}")
+                  sys.exit(1)
+          delegate_to: "{{ test_host }}"
+          # When this runs regardless of boto3 check, the script itself will handle boto3 presence or lack thereof
+          when: "python_check.stdout != 'python not available'"
+          
+        # Run the Python test (script now handles boto3 presence/installation)
+        - name: Run Python boto3 test script
+          shell: "{% if 'python3' in python_check.stdout %}python3{% else %}python{% endif %} /tmp/s3_boto3_test.py"
+          register: boto3_test
+          ignore_errors: yes
+          delegate_to: "{{ test_host }}"
+          when: "python_check.stdout != 'python not available'"
+          
+        # Display the result
+        - name: Display Python boto3 test results
+          debug:
+            msg: "{{ boto3_test.stdout_lines | default(['Test failed to run or boto3 not available']) }}"
+          delegate_to: localhost
+          run_once: true
+          when: "boto3_test is defined and boto3_test.stdout is defined"
+          
+        # Clean up
+        - name: Remove Python test script
+          file:
+            path: /tmp/s3_boto3_test.py
+            state: absent
+          delegate_to: "{{ test_host }}"
+          ignore_errors: yes
+          
+        # Set facts for boto3 test results
+        - name: Set boto3 test results
+          set_fact:
+            boto3_available: "{{ boto3_check_after_install is defined and 'boto3 available' in boto3_check_after_install.stdout }}"
+            boto3_test_success: "{{ boto3_test is defined and boto3_test.stdout is defined and 'All S3 operations completed successfully' in boto3_test.stdout }}"
+            boto3_test_output: "{{ 'Test succeeded' if (boto3_test is defined and boto3_test.stdout is defined and 'All S3 operations completed successfully' in boto3_test.stdout) else 'Test failed or boto3 not available' }}"
+          delegate_to: localhost
+          run_once: true
+      ignore_errors: yes
+    
+    # Set overall advanced test results
+    - name: Set overall advanced test results
+      set_fact:
+        mc_test_ran: "{{ mc_installed | default(false) }}"
+        boto3_test_ran: "{{ boto3_available | default(false) }}"
+        overall_mc_success: "{{ mc_config_success | default(false) and bucket_listing_success | default(false) and mc_upload_test_success | default(false) }}"
+        overall_boto3_success: "{{ boto3_test_success | default(false) }}"
+        any_advanced_test_succeeded: "{{ (mc_config_success | default(false) and bucket_listing_success | default(false)) or boto3_test_success | default(false) }}"
+      delegate_to: localhost
+      run_once: true
+  when: use_advanced_test | bool
+
+# Run basic network connectivity tests (always run regardless of test method)
+- name: Run basic network connectivity tests
+  block:
+    - name: Check DNS resolution
+      shell: "host {{ minio_server_host }} || nslookup {{ minio_server_host }} || echo 'DNS resolution failed'"
+      register: dns_test
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      
+    - name: Check TCP connectivity with timeout
+      shell: "timeout 5 bash -c '</dev/tcp/{{ minio_server_host }}/{{ minio_port }}' && echo 'TCP connection successful' || echo 'TCP connection failed'"
+      register: tcp_test
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      
+    - name: Check for curl availability
+      shell: "which curl || echo 'curl not available'"
+      register: curl_check
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      
+    - name: Check for wget availability
+      shell: "which wget || echo 'wget not available'"
+      register: wget_check
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      when: "'curl not available' in curl_check.stdout"
+      
+    - name: Check HTTP connectivity with curl
+      shell: "curl -s -o /dev/null -w '%{http_code}' {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }} || echo 'HTTP connection failed'"
+      register: http_test
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      when: "'curl not available' not in curl_check.stdout"
+      
+    - name: Check HTTP connectivity with wget
+      shell: "wget -q -O /dev/null --server-response {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }} 2>&1 | grep 'HTTP/' | awk '{print $2}' || echo 'HTTP connection failed'"
+      register: http_test_wget
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      when: "'curl not available' in curl_check.stdout and wget_check is defined and 'wget not available' not in wget_check.stdout"
+      
+    - name: Check S3-specific HTTP capability with curl
+      shell: |
+        curl -s -o /dev/null -I \
+        -H "Host: {{ minio_server_host }}:{{ minio_port }}" \
+        -H "Content-Type: application/json" \
+        -H "X-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+        -H "X-Amz-Date: $(date -u +%Y%m%dT%H%M%SZ)" \
+        {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }}/{{ minio_bucket_name }}/ \
+        -w '%{http_code}'
+      register: s3_curl_test
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      when: "'curl not available' not in curl_check.stdout"
+      
+    - name: Check for netcat availability
+      shell: "which nc || echo 'netcat not available'"
+      register: nc_check
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      
+    - name: Test port with netcat if available
+      shell: "nc -zv {{ minio_server_host }} {{ minio_port }} 2>&1 || echo 'Netcat port check failed'"
+      register: nc_test
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      when: "'netcat not available' not in nc_check.stdout"
+      
+    - name: Check latency with ping
+      shell: "ping -c 3 {{ minio_server_host }} || echo 'Ping failed'"
+      register: ping_test
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+  always:
+    - name: Record basic network test results
+      set_fact:
+        network_test_results:
+          dns_resolution: "{{ dns_test.stdout if dns_test is defined else 'Test skipped' }}"
+          tcp_connection: "{{ tcp_test.stdout if tcp_test is defined else 'Test skipped' }}"
+          http_connection: "{{ http_test.stdout if http_test is defined else (http_test_wget.stdout if http_test_wget is defined else 'Test skipped') }}"
+          netcat_port_check: "{{ nc_test.stdout if nc_test is defined else 'Test skipped' }}"
+          ping_test: "{{ ping_test.stdout if ping_test is defined else 'Test skipped' }}"
+          s3_curl_test: "{{ s3_curl_test.stdout if s3_curl_test is defined else 'Test skipped' }}"
+      delegate_to: localhost
+      run_once: true
+
+# Check Elasticsearch keystore configuration
+- name: Check Elasticsearch keystore configuration
+  block:
+    - name: Check if Elasticsearch is installed
+      stat:
+        path: /usr/share/elasticsearch/bin/elasticsearch-keystore
+      register: es_keystore_check
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      
+    - name: List keystore entries if available
+      shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-keystore list | grep -E 's3\.client\.default\.(access_key|secret_key)' || echo "S3 credentials not found in keystore"
+      register: keystore_list
+      ignore_errors: yes
+      become: yes
+      delegate_to: "{{ test_host }}"
+      when: es_keystore_check.stat.exists | default(false)
+  always:
+    - name: Record keystore results
+      set_fact:
+        keystore_results:
+          elasticsearch_installed: "{{ es_keystore_check.stat.exists | default(false) if es_keystore_check is defined else false }}"
+          s3_credentials_configured: "{{ ('s3.client.default.access_key' in keystore_list.stdout and 's3.client.default.secret_key' in keystore_list.stdout) if (keystore_list is defined and es_keystore_check.stat.exists | default(false)) else false }}"
+          keystore_output: "{{ keystore_list.stdout if (keystore_list is defined and es_keystore_check.stat.exists | default(false)) else 'Elasticsearch not installed or keystore not accessible' }}"
+      delegate_to: localhost
+      run_once: true
+
+# Additional debugging tools
+- name: Perform additional debugging steps
+  block:
+    - name: Check firewall status
+      shell: "systemctl status firewalld ufw iptables || echo 'No firewall service found'"
+      register: firewall_status
+      ignore_errors: yes
+      become: yes
+      delegate_to: "{{ test_host }}"
+      
+    # Note: This test doesn't make sense in this context since we're checking the test host, not the MinIO server
+    # Keeping it but changing the message to be more clear in the report
+    - name: Check ports (diagnostic only)
+      shell: "echo 'This host is not running MinIO server - checking from {{ test_host }} to {{ minio_server_host }}:{{ minio_port }}'"
+      register: listening_ports
+      ignore_errors: yes
+      delegate_to: "{{ test_host }}"
+      
+    - name: Check route to MinIO server
+      shell: "traceroute -n {{ minio_server_host }} || echo 'Traceroute not available or failed'"
+      register: traceroute
+      ignore_errors: yes
+      become: yes
+      delegate_to: "{{ test_host }}"
+  always:
+    - name: Record additional debugging results
+      set_fact:
+        debug_results:
+          firewall_status: "{{ firewall_status.stdout if firewall_status is defined else 'Test skipped' }}"
+          listening_ports: "{{ listening_ports.stdout if listening_ports is defined else 'Test skipped' }}"
+          route_trace: "{{ traceroute.stdout if traceroute is defined else 'Test skipped' }}"
+      delegate_to: localhost
+      run_once: true
+
+# Create test file for Elasticsearch S3 snapshot repository setup
+- name: Create S3 repository test file
+  copy:
+    content: |
+      # S3 Repository Test Configuration
+      # Generated by es-toolkit test_minio_connectivity tool on {{ ansible_date_time.iso8601 }}
+      
+      # 1. Add credentials to Elasticsearch keystore:
+      /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.access_key
+      # Then enter: {{ minio_access_key }}
+      
+      /usr/share/elasticsearch/bin/elasticsearch-keystore add s3.client.default.secret_key
+      # Then enter: {{ minio_secret_key }}
+      
+      # 2. Restart Elasticsearch to apply keystore changes:
+      systemctl restart elasticsearch
+      
+      # 3. Create S3 repository in Kibana Dev Tools:
+      PUT _snapshot/minio_repository
+      {
+        "type": "s3",
+        "settings": {
+          "bucket": "{{ minio_bucket_name }}",
+          "endpoint": "{{ minio_server_host }}:{{ minio_port }}",
+          "protocol": "{{ minio_protocol }}",
+          "path_style_access": true
+        }
+      }
+    dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_s3_test_results.txt"
+    mode: '0600'
+  delegate_to: localhost
+  run_once: true
+
+# Set HTTP success variable
+- name: Set HTTP success variable
+  set_fact:
+    http_success: >-
+      {{ network_test_results.http_connection == '200' or
+         network_test_results.http_connection == '403' or
+         (network_test_results.http_connection | string | regex_search('\\b[2-4]\\d\\d\\b') is defined) }}
+  delegate_to: localhost
+  run_once: true
+
+# Generate comprehensive test report
+- name: Generate connectivity test report
+  copy:
+    content: |
+      MINIO S3 CONNECTIVITY TEST REPORT
+      ================================
+      
+      Test Configuration
+      -----------------
+      Test run from: {{ test_host }}
+      MinIO Server: {{ minio_protocol }}://{{ minio_server_host }}:{{ minio_port }}
+      Bucket: {{ minio_bucket_name }}
+      Test mode: {{ 'Basic (Standard Linux tools)' if use_basic_test else 'Advanced (Including MinIO client)' }}
+      Test timestamp: {{ ansible_date_time.iso8601 }}
+      
+      Basic Connectivity Tests
+      ----------------------
+      DNS Resolution: {{ 'SUCCESS' if 'DNS resolution failed' not in network_test_results.dns_resolution else 'FAILED' }}
+      TCP Connection: {{ 'SUCCESS' if 'TCP connection successful' in network_test_results.tcp_connection else 'FAILED' }}
+      HTTP Connection: {{ 'SUCCESS' if http_success else 'FAILED' }}
+      Ping: {{ 'SUCCESS' if 'Ping failed' not in network_test_results.ping_test else 'FAILED' }}
+      
+      {% if network_test_results.netcat_port_check is defined and 'Test skipped' not in network_test_results.netcat_port_check %}
+      Netcat Port Test: {{ 'SUCCESS' if 'succeeded' in network_test_results.netcat_port_check or 'open' in network_test_results.netcat_port_check else 'FAILED' }}
+      {% endif %}
+      
+      {% if use_advanced_test %}
+      Advanced S3 Tests
+      ----------------
+      {% if mc_test_ran | default(false) %}
+      MinIO Client Tests:
+      - Client Installation: {{ 'INSTALLED' if mc_installed | default(false) else 'INSTALLED FOR TEST' }}
+      - Client Configuration: {{ 'SUCCESS' if mc_config_success | default(false) else 'FAILED' }}
+      - Admin Info Access: {{ 'SUCCESS' if admin_info_success | default(false) else 'FAILED' }}
+      - Bucket Listing: {{ 'SUCCESS' if bucket_listing_success | default(false) else 'FAILED' }}
+      - File Upload Test: {{ 'SUCCESS' if mc_upload_test_success | default(false) else 'FAILED' }}
+      {% else %}
+      MinIO Client Tests: SKIPPED (mc tool not available)
+      {% endif %}
+      
+      {% if boto3_test_ran | default(false) %}
+      Python boto3 Tests:
+      - boto3 Availability: {{ 'AVAILABLE' if boto3_available | default(false) else 'NOT AVAILABLE' }}
+      - S3 Connection Test: {{ 'SUCCESS' if boto3_test_success | default(false) else 'FAILED' }}
+      - Test Details: {{ boto3_test_output | default('Not available') | truncate(100) }}
+      {% else %}
+      Python boto3 Tests: SKIPPED (boto3 not available)
+      {% endif %}
+      {% endif %}
+      
+      Elasticsearch Integration
+      -----------------------
+      Elasticsearch Installed: {{ 'YES' if keystore_results.elasticsearch_installed else 'NO' }}
+      S3 Credentials in Keystore: {{ 'YES' if keystore_results.s3_credentials_configured else 'NO' }}
+      
+      Diagnostic Information
+      -------------------
+      Firewall Status on {{ test_host }}: {{ 'No firewall detected' if 'No firewall service found' in debug_results.firewall_status else 'Firewall may be active' }}
+      Connection: {{ test_host }} → {{ minio_server_host }}:{{ minio_port }}
+      
+      Summary
+      -------
+      {% set connectivity_success = ('TCP connection successful' in network_test_results.tcp_connection) %}
+      
+      {% if use_advanced_test %}
+      Network Connectivity: {{ 'SUCCESS' if connectivity_success else 'FAILED' }}
+      HTTP Accessibility: {{ 'SUCCESS' if http_success else 'FAILED' }}
+      
+      {% if mc_test_ran | default(false) %}
+      MinIO Client Tests: {{ 'SUCCESS' if overall_mc_success | default(false) else 'FAILED' }}
+      {% endif %}
+      
+      {% if boto3_test_ran | default(false) %}
+      Python boto3 Tests: {{ 'SUCCESS' if overall_boto3_success | default(false) else 'FAILED' }}
+      {% endif %}
+      
+      Overall Status: {{ 'SUCCESS' if (connectivity_success and http_success and any_advanced_test_succeeded | default(false)) else 'ISSUES DETECTED' }}
+      {% else %}
+      Network Connectivity: {{ 'SUCCESS' if connectivity_success else 'FAILED' }}
+      HTTP Accessibility: {{ 'SUCCESS' if http_success else 'FAILED' }}
+      
+      Overall Status: {{ 'SUCCESS' if connectivity_success and http_success else 'ISSUES DETECTED' }}
+      {% endif %}
+      
+      Recommended Actions
+      -------------------
+      {%- set has_issues = false %}
+      {%- if not connectivity_success %}
+      {%- set has_issues = true %}
+      - Check network connectivity between {{ test_host }} and {{ minio_server_host }}
+      - Verify that port {{ minio_port }} is open in any firewalls
+      - Confirm that the MinIO server is running on {{ minio_server_host }}
+      {%- endif %}
+      
+      {%- if use_advanced_test and mc_test_ran | default(false) and connectivity_success and not (mc_config_success | default(false)) %}
+      {%- set has_issues = true %}
+      - MinIO client connection failed - verify credentials and URL
+      {%- endif %}
+      
+      {%- if use_advanced_test and mc_test_ran | default(false) and connectivity_success and mc_config_success | default(false) and not (bucket_listing_success | default(false)) %}
+      {%- set has_issues = true %}
+      - MinIO client can connect but can't list buckets - check server permissions
+      {%- endif %}
+      
+      {%- if use_advanced_test and mc_test_ran | default(false) and connectivity_success and mc_config_success | default(false) and bucket_listing_success | default(false) and not (mc_upload_test_success | default(false)) %}
+      {%- set has_issues = true %}
+      - MinIO client can list buckets but upload failed - check bucket permissions
+      {%- endif %}
+      
+      {%- if use_advanced_test and boto3_test_ran | default(false) and not (boto3_test_success | default(false)) %}
+      {%- set has_issues = true %}
+      - Python boto3 connection failed - check error details in test output
+      {%- endif %}
+      
+      {%- if use_advanced_test and not mc_test_ran | default(false) and not boto3_test_ran | default(false) %}
+      {%- set has_issues = true %}
+      - Neither MinIO client nor boto3 were available - consider installing one of them for better testing
+      {%- endif %}
+      
+      {%- if connectivity_success and keystore_results.elasticsearch_installed and not keystore_results.s3_credentials_configured %}
+      {%- set has_issues = true %}
+      - Add S3 credentials to the Elasticsearch keystore on all master nodes
+      {%- endif %}
+      
+      {%- if not use_advanced_test and connectivity_success %}
+      {%- set has_issues = true %}
+      - Consider running the Advanced test to verify S3 bucket operations
+      {%- endif %}
+      
+      {%- if not has_issues %}
+      No issues detected. MinIO S3 connectivity is working properly.
+      {%- endif %}
+      
+      Next Steps
+      ---------
+      A complete S3 repository configuration has been saved to:
+      {{ lookup('env', 'HOME') }}/.elasticsearch/minio_s3_test_results.txt
+      
+      This file contains the commands needed to:
+      1. Add S3 credentials to the Elasticsearch keystore
+      2. Restart Elasticsearch to apply changes
+      3. Create the S3 repository in Kibana Dev Tools
+    dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/minio_connectivity_report.txt"
+    mode: '0600'
+  delegate_to: localhost
+  run_once: true
+
+# Display test report
+- name: Display connectivity test report
+  debug:
+    msg: "{{ lookup('file', lookup('env', 'HOME') + '/.elasticsearch/minio_connectivity_report.txt') | split('\n') }}"
+  delegate_to: localhost
+  run_once: true
