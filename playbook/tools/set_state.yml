@@ -173,6 +173,45 @@
       delegate_to: localhost
       when: is_elasticsearch_operation and has_hot_nodes and initial_health is defined and initial_health.status == 200
       
+    - name: Provide strong warning if cluster health is RED
+      pause:
+        prompt: |
+          ⚠️ URGENT WARNING: CLUSTER HEALTH IS RED ⚠️
+          
+          The cluster is currently in a RED health state.
+          
+          *** PROCEEDING IS STRONGLY DISCOURAGED ***
+          
+          RED status indicates that primary shards are not allocated, which:
+          - Means some data may be unavailable
+          - Significantly increases the risk of data loss during operations
+          - May lead to further cluster instability
+          
+          RECOMMENDED ACTION:
+          1. Cancel this operation (answer "no" below)
+          2. Resolve the RED cluster status first
+          3. Use 'Get Service State' to verify cluster health is GREEN
+          4. Try this operation again when the cluster is stable
+          
+          Are you absolutely certain you want to proceed? (yes/no):
+      register: red_health_override
+      run_once: true
+      delegate_to: localhost
+      when: >
+        is_elasticsearch_operation and 
+        initial_health is defined and 
+        initial_health.status == 200 and
+        initial_health.json.status == 'red'
+        
+    - name: Exit if RED health override not confirmed
+      meta: end_play
+      when: >
+        is_elasticsearch_operation and 
+        red_health_override is defined and 
+        red_health_override.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
     - name: Confirm if changes should proceed on the cluster
       pause:
         prompt: |
@@ -180,6 +219,11 @@
           
           {% if initial_health is defined and initial_health.status == 200 %}
           Current cluster health is {{ initial_health.json.status | upper }}.
+          {% if initial_health.json.status == 'yellow' %}
+          
+          ⚠️ WARNING: Cluster health is YELLOW. It's strongly recommended to have a GREEN cluster
+          before making changes, especially for restart and role change operations.
+          {% endif %}
           {% else %}
           Unable to determine current cluster health.
           {% endif %}
@@ -269,6 +313,73 @@
               ml: "[ ml, remote_cluster_client ]"
           when: target_state == 'change_role'
           
+        # Determine if the node needs repurposing
+        - name: Determine if node needs repurposing
+          set_fact:
+            current_is_data_node: >-
+              {%- if 'data' in current_node_roles or 'data_hot' in current_node_roles or 'data_warm' in current_node_roles or 'data_cold' in current_node_roles or 'data_frozen' in current_node_roles -%}
+              true
+              {%- else -%}
+              false
+              {%- endif -%}
+            target_is_data_node: >-
+              {%- if 'data' in new_node_roles or 'data_hot' in new_node_roles or 'data_warm' in new_node_roles or 'data_cold' in new_node_roles or 'data_frozen' in new_node_roles -%}
+              true
+              {%- else -%}
+              false
+              {%- endif -%}
+            need_repurpose: >-
+              {%- if 'data' in current_node_roles or 'data_hot' in current_node_roles or 'data_warm' in current_node_roles or 'data_cold' in current_node_roles or 'data_frozen' in current_node_roles -%}
+              {%- if 'data' not in new_node_roles and 'data_hot' not in new_node_roles and 'data_warm' not in new_node_roles and 'data_cold' not in new_node_roles and 'data_frozen' not in new_node_roles -%}
+              true
+              {%- else -%}
+              false
+              {%- endif -%}
+              {%- else -%}
+              false
+              {%- endif -%}
+          when: target_state == 'change_role' and local_host_info.initial_state != 'not installed'
+
+        # Handle repurpose warning if needed
+        - name: Warn about data loss on repurposing
+          pause:
+            prompt: |
+              ⚠️ WARNING: CRITICAL DATA LOSS RISK ⚠️
+              
+              You are changing node {{ inventory_hostname }} from a data node role to a non-data node role ({{ node_role_type }}).
+              
+              *** ALL DATA ON THE TARGET NODE WILL BE PERMANENTLY DELETED ***
+              
+              This requires node repurposing after the configuration change.
+              
+              Current role: {{ current_node_roles }}
+              New role: {{ new_node_roles }}
+              
+              This operation cannot be undone and requires manual steps after this playbook completes:
+              1. You must stop each node
+              2. Run the elasticsearch-node repurpose command
+              3. Start the node
+              4. Wait for cluster GREEN health before proceeding to the next node
+              
+              The role configuration will be updated now, but YOU WILL NEED TO MANUALLY
+              PERFORM THE REPURPOSE STEPS LATER per the instructions in the final report.
+              
+              Do you want to proceed with updating the configuration? (yes/no):
+          register: repurpose_prompt
+          delegate_to: localhost
+          run_once: true
+          when: target_state == 'change_role' and local_host_info.initial_state != 'not installed' and need_repurpose | bool
+          
+        # Exit if repurpose not confirmed
+        - name: Exit if repurpose not confirmed
+          meta: end_play
+          when: >
+            target_state == 'change_role' and 
+            need_repurpose | bool and 
+            repurpose_prompt is defined and 
+            repurpose_prompt.user_input | lower != 'yes'
+          
+        # Update elasticsearch.yml with new node roles
         - name: Update elasticsearch.yml with new node roles
           replace:
             path: /etc/elasticsearch/elasticsearch.yml
@@ -284,123 +395,39 @@
               'action_taken': 'change_role to ' + node_role_type,
               'new_roles': new_node_roles,
               'success': role_change_result is changed,
-              'restart_required': true
+              'restart_required': true,
+              'need_repurpose': need_repurpose | bool,
+              'manual_restart_required': true,
+              'manual_repurpose_required': need_repurpose | bool
             }) }}"
           when: target_state == 'change_role' and local_host_info.initial_state != 'not installed'
           
-        - name: Prompt to restart elasticsearch after role change
-          pause:
-            prompt: |
-              Node role has been changed to {{ node_role_type }} ({{ new_node_roles }}).
-              Elasticsearch must be restarted for changes to take effect.
-              
-              Do you want to restart Elasticsearch now? (yes/no):
-          register: restart_prompt
-          delegate_to: localhost
-          run_once: true
+        - name: Set restart information
+          set_fact:
+            restart_prompt:
+              user_input: "no"  # Set default to no restart
           when: target_state == 'change_role' and role_change_result is changed
           
-        - name: Log role change restart
-          shell: |
-            echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] RESTART INITIATED FOR ROLE CHANGE: {{ inventory_hostname }} - Changed to {{ node_role_type }} role" >> {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
-          delegate_to: localhost
-          run_once: true
-          when: >
-            target_state == 'change_role' and 
-            role_change_result is changed and 
-            restart_prompt.user_input | lower == 'yes'
-
-        - name: Restart elasticsearch if confirmed
-          systemd:
-            name: elasticsearch
-            state: restarted
-          become: yes
-          register: restart_result
-          when: >
-            target_state == 'change_role' and 
-            role_change_result is changed and 
-            restart_prompt.user_input | lower == 'yes'
-          
-        # Add delay to allow cluster to detect node state change
-        - name: Wait for service restart and cluster recognition
-          wait_for:
-            timeout: 40
-          when: >
-            target_state == 'change_role' and 
-            role_change_result is changed and 
-            restart_prompt.user_input | lower == 'yes'
-          
-        # Check cluster health after role change restart
-        - name: Check cluster health after role change
-          uri:
-            url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
-            method: GET
-            user: elastic
-            password: "{{ elastic_password }}"
-            force_basic_auth: yes
-            validate_certs: no
-            return_content: yes
-          register: post_role_change_health
-          delegate_to: localhost
-          run_once: true
-          when: >
-            target_state == 'change_role' and 
-            role_change_result is changed and 
-            restart_prompt.user_input | lower == 'yes' and
-            is_elasticsearch_operation and has_hot_nodes and elastic_password is defined
-          ignore_errors: yes
-          no_log: true
-          
-        # Wait for GREEN health after role change
-        - name: Poll cluster health until green (role change)
-          uri:
-            url: "https://{{ hostvars[groups['hot_nodes'][0]]['ansible_host'] }}:9200/_cluster/health"
-            method: GET
-            user: elastic
-            password: "{{ elastic_password }}"
-            force_basic_auth: yes
-            validate_certs: no
-            return_content: yes
-          register: role_change_health_check
-          until: role_change_health_check.json.status == 'green'
-          retries: 999999  # Effectively infinite retries - will never timeout
-          delay: 10        # Check every 10 seconds
-          delegate_to: localhost
-          run_once: true
-          when: >
-            target_state == 'change_role' and 
-            role_change_result is changed and 
-            restart_prompt.user_input | lower == 'yes' and
-            is_elasticsearch_operation and has_hot_nodes and elastic_password is defined and
-            post_role_change_health is defined and post_role_change_health.status == 200 and
-            post_role_change_health.json.status != 'green'
-          no_log: true
-          
-        # Log successful health check after role change
-        - name: Log GREEN health after role change
-          shell: |
-            echo "[$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')] GREEN HEALTH CONFIRMED AFTER ROLE CHANGE: {{ inventory_hostname }} - Status: GREEN, Nodes: {{ role_change_health_check.json.number_of_nodes | default(post_role_change_health.json.number_of_nodes) }}" >> {{ lookup('env', 'HOME') }}/.elasticsearch/restart_log.txt
-          delegate_to: localhost
-          run_once: true
-          when: >
-            target_state == 'change_role' and 
-            role_change_result is changed and 
-            restart_prompt.user_input | lower == 'yes' and
-            is_elasticsearch_operation and has_hot_nodes and elastic_password is defined and
-            ((role_change_health_check is defined) or 
-             (post_role_change_health is defined and post_role_change_health.status == 200 and post_role_change_health.json.status == 'green'))
-
-        - name: Update host info with restart status
-          set_fact:
-            local_host_info: "{{ local_host_info | combine({
-              'restart_performed': restart_prompt.user_input | lower == 'yes',
-              'restart_success': restart_result is success,
-              'green_health_confirmed': true if ((role_change_health_check is defined) or (post_role_change_health is defined and post_role_change_health.status == 200 and post_role_change_health.json.status == 'green')) else false
-            }) }}"
-          when: >
-            target_state == 'change_role' and 
-            role_change_result is changed and 
-            restart_prompt.user_input | lower == 'yes'
+        - name: Display role change success
+          debug:
+            msg: |
+              ✅ Node role configuration has been updated successfully:
+              
+              Host: {{ inventory_hostname }}
+              Previous role: {{ local_host_info.initial_state }}
+              New role: {{ new_node_roles }}
+              
+              IMPORTANT NEXT STEPS:
+              {% if need_repurpose | bool %}
+              - This node requires REPURPOSING before restarting
+              - You will need to MANUALLY run repurpose steps (see final report)
+              {% else %}
+              - This node requires a restart to apply the new configuration
+              - Use the ES-Toolkit restart utility to safely restart nodes
+              {% endif %}
+              
+              The configuration has been updated but NO SERVICES HAVE BEEN RESTARTED.
+          when: target_state == 'change_role' and role_change_result is changed
       when: target_state == 'change_role'
 
     # Service state management
@@ -780,12 +807,47 @@
               Requested Change: Change node role to {{ node_role_type }}
               Previous Roles: {{ local_host_info.initial_state }}
               New Roles: {{ local_host_info.new_roles | default('N/A') }}
-              Change Successful: {{ local_host_info.success }}
-              Restart Required: {{ local_host_info.restart_required | default(false) }}
-              {% if local_host_info.restart_performed is defined %}
-              Restart Performed: {{ local_host_info.restart_performed }}
-              Restart Successful: {{ local_host_info.restart_success | default(false) }}
+              Configuration Change Successful: {{ local_host_info.success }}
+              
+              IMPORTANT NEXT STEPS:
+              =====================
+              {% if local_host_info.need_repurpose is defined and local_host_info.need_repurpose %}
+              *** NODE REPURPOSE REQUIRED ***
+              This node requires repurposing because you're changing from a data node to a non-data node.
+              ALL DATA ON THE NODE WILL BE DELETED during repurpose.
+              
+              Follow these steps for EACH node, ONE AT A TIME:
+              1. Stop Elasticsearch service on the node:
+                 sudo systemctl stop elasticsearch
+                 
+              2. Run the repurpose command and confirm when prompted:
+                 sudo /usr/share/elasticsearch/bin/elasticsearch-node repurpose
+                 
+              3. Start Elasticsearch service:
+                 sudo systemctl start elasticsearch
+                 
+              4. Check cluster health (repeat until GREEN):
+                 curl -k -u elastic:<password> https://<hot-node>:9200/_cluster/health
+                 
+              5. Wait for GREEN health before proceeding to the next node
+              
+              IMPORTANT: Process one node at a time and verify cluster health returns to GREEN
+              before moving to the next node to prevent data loss and ensure cluster stability.
+              {% else %}
+              *** NODE RESTART REQUIRED ***
+              Configuration has been updated but nodes need to be restarted to apply the changes.
+              
+              Use the ES-Toolkit Restart Utility:
+              1. Run the main es-toolkit.yml playbook
+              2. Select option 2 (Change Service State)
+              3. Select Elasticsearch
+              4. Select option 3 (Restart service)
+              5. Follow the prompts to safely restart the nodes
+              
+              The toolkit will restart nodes one at a time, waiting for cluster health
+              to return to GREEN before proceeding to the next node.
               {% endif %}
+              
               {% if local_host_info.initial_state == 'not installed' %}
               Details: Elasticsearch is not installed on this host
               {% endif %}
@@ -804,6 +866,37 @@
             msg: "{{ combined_status.stdout_lines }}"
           run_once: true
           delegate_to: localhost
+          
+        # Add a special summary for node role changes with repurpose requirements
+        - name: Display repurpose warning and instructions
+          debug:
+            msg: |
+              =================================================================
+                             ⚠️ NODE REPURPOSE REQUIRED ⚠️
+              =================================================================
+              
+              You have changed node roles from data-holding roles to non-data roles.
+              The nodes now need to be manually repurposed ONE AT A TIME.
+              
+              THIS WILL DELETE ALL DATA ON THE TARGET NODES
+              
+              Follow these manual steps:
+              1. For each node, one at a time:
+                 a. Stop Elasticsearch: sudo systemctl stop elasticsearch
+                 b. Run repurpose: sudo /usr/share/elasticsearch/bin/elasticsearch-node repurpose
+                 c. Start Elasticsearch: sudo systemctl start elasticsearch
+                 d. Wait for cluster health to become GREEN before proceeding to the next node
+                 
+              Waiting for GREEN health between each node is CRITICAL to prevent data loss.
+              
+              Refer to the complete instructions in the status report above.
+              =================================================================
+          run_once: true
+          delegate_to: localhost
+          when: >
+            target_state == 'change_role' and
+            hostvars | dict2items | selectattr('value.local_host_info.need_repurpose', 'defined') | 
+            selectattr('value.local_host_info.need_repurpose') | list | length > 0
       rescue:
         - name: Handle report generation failure
           debug:

@@ -1195,6 +1195,8 @@
                     prompt: |
                       {% if selected_utility == '3' %}
                       WARNING: This will install {{ selected_service }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
+                      {% elif selected_utility == '2' and target_state == 'change_role' %}
+                      WARNING: This will change {{ selected_service }} nodes to {{ node_role_type }} role on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
                       {% elif selected_utility == '2' %}
                       WARNING: This will change {{ selected_service }} state to {{ target_state }} on {{ groups[host_group_input.user_input] | length }} hosts in group '{{ host_group_input.user_input }}'.
                       {% elif selected_utility == '5' %}

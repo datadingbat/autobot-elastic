@@ -221,13 +221,49 @@
   delegate_to: localhost
   when: is_elasticsearch_operation and has_hot_nodes and elastic_password is defined
   
-# Check for serious cluster issues is now handled in the polling block above
-- name: Legacy check for serious cluster issues
+# Check for serious cluster issues
+- name: Check for serious cluster issues
   block:
-    - name: Validate cluster is operational
-      fail:
-        msg: "CRITICAL: Cluster health is RED. Rolling restart has been halted to prevent data loss. Please check the cluster status manually before resuming."
+    - name: Provide strong warning if cluster health becomes RED
+      pause:
+        prompt: |
+          ⚠️ CRITICAL WARNING: CLUSTER HEALTH IS RED ⚠️
+          
+          After processing node {{ current_batch }}, the cluster has entered a RED health state.
+          
+          *** CONTINUING IS STRONGLY DISCOURAGED ***
+          
+          RED status indicates that primary shards are not allocated, which:
+          - Means some data is currently unavailable
+          - Creates a high risk of permanent data loss if you continue
+          - May indicate a serious issue that needs immediate attention
+          
+          RECOMMENDED ACTIONS:
+          1. Cancel this operation (answer "no" below)
+          2. Check the cluster status: curl -k -u elastic:<password> https://<hostname>:9200/_cluster/health
+          3. Investigate and resolve the RED status before continuing
+          4. Use the ES-Toolkit "Get Service State" option to verify cluster health is GREEN
+          
+          Are you absolutely certain you want to continue? (yes/no):
+      register: red_health_override
       when: post_batch_health.json.status == 'red' and health_check is not defined
+      
+    - name: Exit if RED health override not confirmed
+      meta: end_play
+      when: red_health_override is defined and red_health_override.user_input | lower != 'yes'
+    
+    - name: Warn about YELLOW cluster status
+      debug:
+        msg: |
+          ⚠️ WARNING: CLUSTER HEALTH IS YELLOW ⚠️
+          
+          The cluster is currently in a YELLOW health state after processing node {{ current_batch }}.
+          
+          This typically indicates that some replica shards are not allocated. While not critical,
+          it's recommended to investigate the cause of the YELLOW status before proceeding.
+          
+          The operation will continue, but please monitor cluster health closely.
+      when: post_batch_health.json.status == 'yellow' and health_check is not defined
   run_once: true
   delegate_to: localhost
   when: is_elasticsearch_operation and post_batch_health is defined and post_batch_health.status == 200 and not (batch_number < total_batches and is_elasticsearch_operation and has_hot_nodes and elastic_password is defined)
