@@ -25,6 +25,7 @@
       '4': metricbeat
       '5': monitoring
       '6': minio
+      '7': trained_models
     menu_to_utility_map:
       '1': 'get_state'
       '2': 'set_state'
@@ -48,6 +49,7 @@
       '4': add_metricbeat
       '5': add_monitoring
       '6': minio_setup
+      '7': install_trained_models
     upgrade_modes:
       '1': 'automatic'
       '2': 'managed'
@@ -199,7 +201,7 @@
               ```yaml
               # Installation settings
               installation_method: "apt"
-              component_version: "8.15.4"
+              component_version: "8.17.3"
 
               # Security settings
               es_cert_pass: "3mhkIsdG/ptCq0ZB"
@@ -644,16 +646,17 @@
           4. Metricbeat (Sends cluster metrics to monitoring instance)
           5. Monitoring Instance (Standalone Elasticsearch)
           6. MinIO (S3-compatible storage for frozen tier)
+          7. Trained Models (Install ML models to master nodes)
           Enter the number of your choice:
       register: install_choice
       when: selected_utility == '3'
 
     - name: Validate install choice
       fail:
-        msg: "Invalid installation choice. Please enter a number between 1 and 6."
+        msg: "Invalid installation choice. Please enter a number between 1 and 7."
       when: >
         selected_utility == '3' and 
-        install_choice.user_input not in ['1','2','3','4','5','6']
+        install_choice.user_input not in ['1','2','3','4','5','6','7']
 
     - name: Override utility file for installation
       set_fact:
@@ -673,18 +676,24 @@
           2. Manual .deb package
           Enter the number of your choice:
       register: method_choice
-      when: selected_utility in ['3', '4']
+      when: >
+        (selected_utility in ['3', '4']) and 
+        not (selected_utility == '3' and install_choice.user_input == '7')
 
     - name: Set the appropriate variable name
       set_fact:
         "{% if selected_utility == '4' %}upgrade_method_choice{% else %}install_method_choice{% endif %}": "{{ method_choice.user_input }}"
-      when: selected_utility in ['3', '4']
+      when: >
+        (selected_utility in ['3', '4']) and 
+        not (selected_utility == '3' and install_choice.user_input == '7')
 
     - name: Validate installation/upgrade method
       fail:
         msg: "Invalid method selection. Please enter 1 or 2."
       when: >
-        selected_utility in ['3', '4'] and method_choice.user_input not in ['1','2']
+        selected_utility in ['3', '4'] and 
+        not (selected_utility == '3' and install_choice.user_input == '7') and 
+        method_choice.user_input not in ['1','2']
 
     - name: Handle APT options
       block:
@@ -700,8 +709,9 @@
             component_version: "{{ version_choice.user_input }}"
             installation_method: "apt"
       when: >
-        (selected_utility == '3' and install_method_choice == '1') or
-        (selected_utility == '4' and upgrade_method_choice == '1')
+        ((selected_utility == '3' and install_method_choice == '1') or
+         (selected_utility == '4' and upgrade_method_choice == '1')) and
+        not (selected_utility == '3' and install_choice.user_input == '7')
 
     - name: Handle manual package
       block:
@@ -717,20 +727,25 @@
             deb_package_path: "{{ package_path.user_input }}"
             installation_method: "local"
       when: >
-        (selected_utility == '3' and install_method_choice == '2') or
-        (selected_utility == '4' and upgrade_method_choice == '2')
+        ((selected_utility == '3' and install_method_choice == '2') or
+         (selected_utility == '4' and upgrade_method_choice == '2')) and
+        not (selected_utility == '3' and install_choice.user_input == '7')
 
     - name: Prompt to start service after installation
       pause:
         prompt: |
           Do you want to start the service after installation? (yes/no):
       register: start_service_prompt
-      when: selected_utility == '3'
+      when: >
+        selected_utility == '3' and 
+        install_choice.user_input != '7'
 
     - name: Set start_service variable
       set_fact:
         start_service: "{{ start_service_prompt.user_input | lower == 'yes' }}"
-      when: selected_utility == '3'
+      when: >
+        selected_utility == '3' and 
+        install_choice.user_input != '7'
 
     # Handle Upgrade Service selections
     - name: Prompt for service to upgrade
@@ -849,6 +864,19 @@
       when: >
         (selected_utility == '5' and service_choice.user_input == '5') or
         (selected_utility == '1' and service_choice.user_input == '6')
+        
+    - name: Set selected service for Trained Models
+      set_fact:
+        selected_service: "trained_models"
+        skip_target_selection: true
+      when: selected_utility == '3' and install_choice.user_input == '7'
+      
+    # Target selection for trained models will be handled in the install_trained_models.yml
+    # We just need to set a default limit for now
+    - name: Set master_nodes as limit for trained models
+      set_fact:
+        limit: "master_nodes"
+      when: selected_utility == '3' and install_choice.user_input == '7'
         
     - name: Set selected service for MinIO S3 test
       set_fact:
@@ -1220,7 +1248,7 @@
                           ======================={{ '=' * host_group_input.user_input | length }}
                           Total Hosts: {{ groups[host_group_input.user_input] | length }}
 
-                          {% if selected_utility in ['3', '4'] %}
+                          {% if selected_utility in ['3', '4'] and not (selected_utility == '3' and install_choice.user_input == '7') %}
                           Installation Details:
                           -------------------
                           Component: {{ selected_service }}
@@ -1475,10 +1503,20 @@
       
 # Second play to execute the selected utility
 - name: Execute Selected Utility
-  # Use standard host targeting
+  # Simplify host targeting to match deploy_cluster.yml approach
   hosts: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
   gather_facts: "{{ hostvars['localhost']['selected_play_vars']['utility_file'] != 'get_state_play' }}"
   pre_tasks:
+    - name: Debug play targeting
+      debug:
+        msg:
+          - "Executing utility on host: {{ inventory_hostname }}"
+          - "All play hosts: {{ ansible_play_hosts | join(', ') }}"
+          - "All play batch: {{ ansible_play_batch | join(', ') }}"
+          - "Groups from inventory: {{ groups.keys() | list | join(', ') }}"
+          - "Original limit passed: {{ hostvars['localhost']['selected_play_vars']['limit'] | default('not set') }}"
+          - "Hosts in frozen_nodes: {{ groups['frozen_nodes'] | join(', ') }}"
+
     - name: Setup global variables for all hosts
       set_fact:
         selected_service: "{{ hostvars['localhost']['selected_play_vars']['selected_service'] | default(omit) }}"
@@ -1493,9 +1531,27 @@
         restart_wait_seconds: "{{ hostvars['localhost']['selected_play_vars']['restart_wait_seconds'] | default(30) }}"
         ansible_limit: "{{ hostvars['localhost']['selected_play_vars']['limit'] | default('localhost') }}"
       run_once: false
-  vars:
-    serial: "{{ '1' if hostvars['localhost']['selected_play_vars']['utility_file'] == 'upgrade_component' else '0' }}"
+  # No serial parameter to ensure parallel execution
   tasks:
+    - name: Debug play hosts information
+      debug:
+        msg:
+          - "Current host: {{ inventory_hostname }}"
+          - "Selected play vars - limit: {{ hostvars['localhost']['selected_play_vars']['limit'] | default('not set') }}" 
+          - "Ansible play hosts: {{ ansible_play_hosts | join(', ') }}"
+          - "Utility file: {{ hostvars['localhost']['selected_play_vars']['utility_file'] }}"
+      
+    - name: Set information about all hosts in target
+      set_fact:
+        all_target_hosts: "{{ groups[hostvars['localhost']['selected_play_vars']['limit']] }}"
+      when: hostvars['localhost']['selected_play_vars']['limit'] in groups
+      run_once: true
+      delegate_to: localhost
+
+    - name: Debug which utility will be included
+      debug:
+        msg: "About to include utility: tools/{{ hostvars['localhost']['selected_play_vars']['utility_file'] }}.yml"
+        
     - name: Include selected utility
       include_tasks: "tools/{{ hostvars['localhost']['selected_play_vars']['utility_file'] }}.yml"
       run_once: false

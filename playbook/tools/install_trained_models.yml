@@ -1,0 +1,443 @@
+---
+# Install Trained Models for Elasticsearch
+- name: Capture current host
+  set_fact:
+    current_host: "{{ inventory_hostname }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: Setup Variables
+  block:
+    # Prompt for model files directory
+    - name: Prompt for model files directory
+      pause:
+        prompt: |
+          Enter the path to the directory containing the model files:
+          Example: /home/ubuntu/elser_files/
+      register: model_dir_input
+      run_once: true
+      delegate_to: localhost
+
+    # Validate directory exists
+    - name: Check if model directory exists
+      stat:
+        path: "{{ model_dir_input.user_input }}"
+      register: model_dir_check
+      run_once: true
+      delegate_to: localhost
+
+    - name: Fail if model directory doesn't exist
+      fail:
+        msg: "Model directory not found: {{ model_dir_input.user_input }}"
+      when: not model_dir_check.stat.exists or not model_dir_check.stat.isdir
+      run_once: true
+      delegate_to: localhost
+
+    # Find all model files in the source directory
+    - name: Find model files
+      find:
+        paths: "{{ model_dir_input.user_input }}"
+        patterns: "*"
+        file_type: file
+      register: found_model_files
+      run_once: true
+      delegate_to: localhost
+
+    # Prompt for master node group
+    - name: Prompt for master node group
+      pause:
+        prompt: |
+          Enter the host group for the master nodes:
+          Default: master_nodes
+          Press Enter to use default, or type 'view' to see all available groups:
+      register: master_group_input
+      run_once: true
+      delegate_to: localhost
+      
+    # Show inventory groups if requested
+    - name: Show inventory groups if requested
+      block:
+        - name: Get available groups
+          set_fact:
+            available_groups: "{{ groups | dict2items | map(attribute='key') | select('ne', 'all') | select('ne', 'ungrouped') | list | sort }}"
+          run_once: true
+          delegate_to: localhost
+          
+        - name: Display available groups
+          debug:
+            msg: |
+              Available host groups:
+              {% for group in available_groups %}
+              - {{ group }} ({{ groups[group] | length }} hosts)
+                {% for host in groups[group] | sort %}
+                  - {{ host }}{% if hostvars[host].ansible_host is defined %} ({{ hostvars[host].ansible_host }}){% endif %}
+                {% endfor %}
+              {% endfor %}
+          run_once: true
+          delegate_to: localhost
+        
+        - name: Prompt for master node group after viewing inventory
+          pause:
+            prompt: |
+              Enter the host group for the master nodes:
+              Default: master_nodes
+              Press Enter to use default:
+          register: master_group_input_after_view
+          run_once: true
+          delegate_to: localhost
+          
+        - name: Set final master group input
+          set_fact:
+            master_group_input: "{{ master_group_input_after_view }}"
+          run_once: true
+          delegate_to: localhost
+      when: master_group_input.user_input is defined and master_group_input.user_input | lower == 'view'
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set master node group with explicit handling for empty input
+      set_fact:
+        master_node_group: "{% if master_group_input.user_input is defined and master_group_input.user_input|trim != '' %}{{ master_group_input.user_input }}{% else %}master_nodes{% endif %}"
+      run_once: true
+      delegate_to: localhost
+        
+    - name: Debug master node group
+      debug:
+        msg: "Selected master node group: '{{ master_node_group }}'"
+      run_once: true
+      delegate_to: localhost
+
+    # Validate master node group exists
+    - name: Check if master node group exists
+      fail:
+        msg: "Master node group '{{ master_node_group }}' not found in inventory"
+      when: master_node_group not in groups
+      run_once: true
+      delegate_to: localhost
+
+    # Generate pre-installation report
+    - name: Create pre-installation report
+      copy:
+        content: |
+          Trained Models Installation Pre-Deployment Report
+          ================================================
+          Installation Details:
+          --------------------
+          Model Files Directory: {{ model_dir_input.user_input }}
+          
+          Files to be installed:
+          {% for file in found_model_files.files %}
+          - {{ file.path | basename }} ({{ (file.size / 1024 / 1024) | round(2) }} MB)
+          {% endfor %}
+          
+          Target Configuration:
+          -------------------
+          Target Host Group: {{ master_node_group }}
+          Target Nodes:
+          {% for node in groups[master_node_group] %}
+          - {{ node }}
+          {% endfor %}
+          
+          Installation Paths:
+          -----------------
+          - Models Directory: /etc/elasticsearch/models/
+          - Configuration: /etc/elasticsearch/elasticsearch.yml
+            Added setting: xpack.ml.model_repository: file://etc/elasticsearch/models/
+          
+          Note: After installation, you will need to restart Elasticsearch on the target nodes
+          for the model repository configuration to take effect.
+          
+          Do you want to proceed with installation? (yes/no):
+        dest: "/tmp/models_preinstall_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display pre-installation report
+      debug:
+        msg: "{{ lookup('file', '/tmp/models_preinstall_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Prompt for installation confirmation
+      pause:
+        prompt: |
+          The above report shows the details of the models to be installed.
+          Do you want to proceed with installation? (yes/no):
+      register: install_confirmation
+      run_once: true
+      delegate_to: localhost
+
+    - name: Exit if not confirmed
+      meta: end_play
+      when: install_confirmation.user_input | lower != 'yes'
+      run_once: true
+      delegate_to: localhost
+
+  tags: setup
+
+- name: Install Trained Models
+  block:
+    # Create models directory if it doesn't exist
+    - name: Create models directory
+      file:
+        path: /etc/elasticsearch/models
+        state: directory
+        mode: '0755'
+        owner: elasticsearch
+        group: elasticsearch
+      become: true
+      when: inventory_hostname in groups[master_node_group]
+      register: models_dir_created
+
+    # Copy model files to the master nodes
+    - name: Copy model files to master nodes
+      copy:
+        src: "{{ item.path }}"
+        dest: "/etc/elasticsearch/models/"
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0644'
+      with_items: "{{ found_model_files.files }}"
+      become: true
+      when: inventory_hostname in groups[master_node_group]
+      register: model_files_copied
+
+    # Update elasticsearch.yml to set model repository
+    - name: Check if model repository already configured
+      command: grep -q "^xpack.ml.model_repository" /etc/elasticsearch/elasticsearch.yml
+      register: grep_result
+      failed_when: false
+      changed_when: false
+      become: true
+      when: inventory_hostname in groups[master_node_group]
+
+    - name: Add model repository configuration to elasticsearch.yml
+      lineinfile:
+        path: /etc/elasticsearch/elasticsearch.yml
+        line: "xpack.ml.model_repository: file://etc/elasticsearch/models/"
+        state: present
+      become: true
+      when: inventory_hostname in groups[master_node_group] and grep_result.rc != 0
+      register: config_updated
+
+    # Ensure correct ownership for the models directory and contents
+    - name: Set correct ownership for models directory
+      file:
+        path: /etc/elasticsearch/models
+        state: directory
+        recurse: yes
+        owner: elasticsearch
+        group: elasticsearch
+      become: true
+      when: inventory_hostname in groups[master_node_group]
+      register: ownership_updated
+
+    # Collect installation status for each host
+    - name: Collect installation status
+      set_fact:
+        host_install_info:
+          hostname: "{{ inventory_hostname }}"
+          in_target_group: "{{ inventory_hostname in groups[master_node_group] }}"
+          models_dir_created: "{{ models_dir_created.changed | default(false) }}"
+          files_copied: "{{ model_files_copied.changed | default(false) }}"
+          config_updated: "{{ config_updated.changed | default(false) }}"
+          requires_restart: "{{ (models_dir_created.changed | default(false)) or (model_files_copied.changed | default(false)) or (config_updated.changed | default(false)) or (ownership_updated.changed | default(false)) }}"
+
+  tags: install
+
+- name: Generate Operation Report
+  block:
+    # Generate timestamp for log files
+    - name: Generate timestamp for log files
+      set_fact:
+        timestamp_string: "{{ ansible_date_time.year }}{{ ansible_date_time.month }}{{ ansible_date_time.day }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}"
+        log_date: "{{ ansible_date_time.iso8601 }}"
+      delegate_to: localhost
+      run_once: true
+      
+    # Collect all host information
+    - name: Collect all host installation information
+      set_fact:
+        all_hosts_status: "{{ all_hosts_status | default([]) + [hostvars[item].host_install_info] }}"
+      loop: "{{ ansible_play_hosts }}"
+      delegate_to: localhost
+      run_once: true
+      
+    # Ensure operations logs directory structure exists
+    - name: Ensure operations logs directory structure exists
+      file:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/logs/operations"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+    
+    # Create operations log with timestamp in filename
+    - name: Create operations log with timestamp in filename
+      copy:
+        content: |
+          ---
+          # Trained Models Installation Operations Log
+          # Generated by autobot-elastic toolkit
+          # Date: {{ log_date }}
+          
+          operation: "install_trained_models"
+          timestamp: "{{ log_date }}"
+          configuration:
+            source_directory: "{{ model_dir_input.user_input }}"
+            target_host_group: "{{ master_node_group }}"
+            model_files:
+              {% for file in found_model_files.files %}
+              - name: "{{ file.path | basename }}"
+                size: "{{ (file.size / 1024 / 1024) | round(2) }} MB"
+              {% endfor %}
+          
+          hosts:
+          {% for host_info in all_hosts_status %}
+            - hostname: "{{ host_info.hostname }}"
+              status: "{{ 'success' if host_info.in_target_group else 'skipped (not in target group)' }}"
+              requires_restart: "{{ host_info.requires_restart }}"
+              changes:
+                models_dir_created: "{{ host_info.models_dir_created }}"
+                files_copied: "{{ host_info.files_copied }}"
+                config_updated: "{{ host_info.config_updated }}"
+          {% endfor %}
+          
+          summary:
+            total_hosts: {{ ansible_play_hosts | length }}
+            target_hosts: {{ all_hosts_status | selectattr('in_target_group', 'true') | list | length }}
+            modified_hosts: {{ all_hosts_status | selectattr('in_target_group', 'true') | selectattr('requires_restart', 'true') | list | length }}
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/logs/operations/operations_install_trained_models_{{ timestamp_string }}.yml"
+      delegate_to: localhost
+      run_once: true
+      
+    # Create a "latest" symlink to the most recent log
+    - name: Create symlink to latest operations log
+      file:
+        src: "{{ lookup('env', 'HOME') }}/.elasticsearch/logs/operations/operations_install_trained_models_{{ timestamp_string }}.yml"
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/logs/operations/latest_install_trained_models.yml"
+        state: link
+      delegate_to: localhost
+      run_once: true
+      
+    # Update the comprehensive operations log
+    - name: Ensure operations master log exists
+      stat:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+      register: operations_log_file
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Create operations master log if it doesn't exist
+      copy:
+        content: |
+          ---
+          # Elasticsearch Operations Log
+          # Generated by autobot-elastic toolkit
+          
+          operations:
+            - timestamp: "{{ log_date }}"
+              operation: "install_trained_models"
+              logfile: "logs/operations/operations_install_trained_models_{{ timestamp_string }}.yml"
+              hosts: 
+                - count: {{ ansible_play_hosts | length }}
+                - target: {{ all_hosts_status | selectattr('in_target_group', 'true') | list | length }}
+                - modified: {{ all_hosts_status | selectattr('in_target_group', 'true') | selectattr('requires_restart', 'true') | list | length }}
+        dest: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+      when: not operations_log_file.stat.exists
+      delegate_to: localhost
+      run_once: true
+      
+    - name: Add operation to master log
+      blockinfile:
+        path: "{{ lookup('env', 'HOME') }}/.elasticsearch/operations_log.yml"
+        marker: "# -- OPERATION {{ ansible_date_time.epoch }} --"
+        insertafter: "operations:"
+        block: |2
+            - timestamp: "{{ log_date }}"
+              operation: "install_trained_models"
+              logfile: "logs/operations/operations_install_trained_models_{{ timestamp_string }}.yml"
+              hosts: 
+                - count: {{ ansible_play_hosts | length }}
+                - target: {{ all_hosts_status | selectattr('in_target_group', 'true') | list | length }}
+                - modified: {{ all_hosts_status | selectattr('in_target_group', 'true') | selectattr('requires_restart', 'true') | list | length }}
+      when: operations_log_file.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    # Create post-installation report
+    - name: Create post-installation report
+      copy:
+        content: |
+          Trained Models Installation Post-Deployment Report
+          =================================================
+          Installation Summary:
+          -------------------
+          Total Hosts: {{ ansible_play_hosts | length }}
+          Target Hosts: {{ all_hosts_status | selectattr('in_target_group', 'true') | list | length }}
+          Hosts Requiring Restart: {{ all_hosts_status | selectattr('in_target_group', 'true') | selectattr('requires_restart', 'true') | list | length }}
+          
+          Model Files Installed:
+          --------------------
+          {% for file in found_model_files.files %}
+          - {{ file.path | basename }} ({{ (file.size / 1024 / 1024) | round(2) }} MB)
+          {% endfor %}
+          
+          Target Hosts Status:
+          ------------------
+          {% for host_info in all_hosts_status if host_info.in_target_group %}
+          - {{ host_info.hostname }}:
+            Models Directory Created: {{ "Yes" if host_info.models_dir_created else "Already existed" }}
+            Files Copied: {{ "Yes" if host_info.files_copied else "No" }}
+            Config Updated: {{ "Yes" if host_info.config_updated else "Already configured" }}
+            Requires Restart: {{ "Yes" if host_info.requires_restart else "No" }}
+          {% endfor %}
+          
+          Skipped Hosts:
+          -------------
+          {% for host_info in all_hosts_status if not host_info.in_target_group %}
+          - {{ host_info.hostname }} (not in target group)
+          {% endfor %}
+          
+          IMPORTANT: Next Steps
+          ------------------
+          The following steps are required to complete the model installation:
+          
+          1. Restart Elasticsearch on all target nodes to apply the configuration:
+             sudo systemctl restart elasticsearch
+          
+          2. To verify the model is available, use the following API call after the service restarts:
+             curl -k -u elastic:PASSWORD https://[host]:9200/_ml/trained_models
+          
+          3. You may also need to deploy the trained model using:
+             curl -k -u elastic:PASSWORD -X POST "https://[host]:9200/_ml/trained_models/[model-id]/deployment"
+          
+          Operations Tracking:
+          ------------------
+          - Operation recorded in: ~/.elasticsearch/logs/operations/operations_install_trained_models_{{ timestamp_string }}.yml
+          - Latest operation always at: ~/.elasticsearch/logs/operations/latest_install_trained_models.yml
+          - Operations index in: ~/.elasticsearch/operations_log.yml
+        dest: "/tmp/models_install_report.txt"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Display post-installation report
+      debug:
+        msg: "{{ lookup('file', '/tmp/models_install_report.txt') | split('\n') }}"
+      run_once: true
+      delegate_to: localhost
+  
+  always:
+    # Cleanup temporary files
+    - name: Cleanup temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/models_preinstall_report.txt"
+        - "/tmp/models_install_report.txt"
+      run_once: true
+      delegate_to: localhost
+      ignore_errors: yes
+  
+  tags: summary
